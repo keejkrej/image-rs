@@ -4,15 +4,18 @@
   "version": "0.1.0",
   "identifier": "com.image.rs",
   "build": {
-    "frontendDist": "ui"
+    "beforeDevCommand": "npm --prefix web run dev -- --host 127.0.0.1 --port 1420",
+    "beforeBuildCommand": "npm --prefix web run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "web/dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "label": "main",
         "title": "image-rs Control",
-        "url": "launcher.html",
+        "url": "index.html?window=launcher",
         "width": 460,
         "height": 420,
         "minWidth": 400,
@@ -23,7 +26,7 @@
       {
         "label": "viewer-template",
         "title": "image-rs Viewer",
-        "url": "viewer.html",
+        "url": "index.html?window=viewer",
         "width": 1200,
         "height": 860,
         "resizable": true,

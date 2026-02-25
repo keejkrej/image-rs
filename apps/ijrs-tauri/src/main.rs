@@ -276,10 +276,21 @@ struct ViewerFrame {
     width: usize,
     height: usize,
     png_data_url: String,
+    pixels_u8: Vec<u8>,
     histogram: Vec<u32>,
     min: f32,
     max: f32,
     values: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ViewerFrameBuffer {
+    width: usize,
+    height: usize,
+    pixels_u8: Vec<u8>,
+    histogram: Vec<u32>,
+    min: f32,
+    max: f32,
 }
 
 #[tauri::command]
@@ -324,6 +335,65 @@ async fn viewer_frame(
     request: ViewerFrameRequest,
 ) -> Result<ViewerFrame, String> {
     compute_viewer_frame(state.inner(), window.label(), &request, None).await
+}
+
+#[tauri::command]
+async fn viewer_frame_buffer(
+    state: State<'_, UiState>,
+    window: Window,
+    request: ViewerFrameRequest,
+) -> Result<ViewerFrameBuffer, String> {
+    let frame = compute_viewer_frame(state.inner(), window.label(), &request, None).await?;
+    Ok(ViewerFrameBuffer {
+        width: frame.width,
+        height: frame.height,
+        pixels_u8: frame.pixels_u8,
+        histogram: frame.histogram,
+        min: frame.min,
+        max: frame.max,
+    })
+}
+
+#[tauri::command]
+fn cycle_window(
+    state: State<'_, UiState>,
+    app: AppHandle,
+    window: Window,
+    direction: i32,
+) -> String {
+    let mut labels = if let Ok(map) = state.label_to_path.lock() {
+        map.keys().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    labels.sort_by_key(|label| viewer_sort_key(label));
+    if labels.is_empty() {
+        if let Some(launcher) = app.get_webview_window(LAUNCHER_LABEL) {
+            focus_window(&launcher);
+            return LAUNCHER_LABEL.to_string();
+        }
+        return window.label().to_string();
+    }
+
+    let current = window.label().to_string();
+    let offset = if direction < 0 { -1 } else { 1 };
+    let target_index = labels
+        .iter()
+        .position(|label| label == &current)
+        .map(|index| {
+            let len = labels.len() as isize;
+            let raw = index as isize + offset;
+            raw.rem_euclid(len) as usize
+        })
+        .unwrap_or_else(|| if direction < 0 { labels.len() - 1 } else { 0 });
+    let target = labels[target_index].clone();
+
+    if let Some(next_window) = app.get_webview_window(&target) {
+        focus_window(&next_window);
+    }
+
+    target
 }
 
 #[tauri::command]
@@ -856,14 +926,16 @@ fn canonical_json(value: &Value) -> Value {
 
 fn build_frame(dataset: &DatasetF32, request: &ViewerFrameRequest) -> Result<ViewerFrame, String> {
     let slice = extract_slice(dataset, request.z, request.t, request.channel)?;
+    let pixels_u8 = to_u8_samples(&slice.values);
     let (min, max) = min_max(&slice.values);
     let histogram = histogram(&slice.values);
-    let encoded = encode_slice_png(&slice)?;
+    let encoded = encode_slice_png(slice.width, slice.height, &pixels_u8)?;
 
     Ok(ViewerFrame {
         width: slice.width,
         height: slice.height,
         png_data_url: format!("data:image/png;base64,{}", BASE64_STANDARD.encode(encoded)),
+        pixels_u8,
         histogram,
         min,
         max,
@@ -953,13 +1025,16 @@ fn open_or_focus_viewer(
             .unwrap_or("Image")
     );
 
-    let window =
-        WebviewWindowBuilder::new(app, label.clone(), WebviewUrl::App("viewer.html".into()))
-            .title(title)
-            .inner_size(1200.0, 860.0)
-            .resizable(true)
-            .build()
-            .map_err(|error| format!("failed to create viewer window: {error}"))?;
+    let window = WebviewWindowBuilder::new(
+        app,
+        label.clone(),
+        WebviewUrl::App("index.html?window=viewer".into()),
+    )
+    .title(title)
+    .inner_size(1200.0, 860.0)
+    .resizable(true)
+    .build()
+    .map_err(|error| format!("failed to create viewer window: {error}"))?;
 
     {
         let mut path_to_label = state
@@ -1100,10 +1175,9 @@ fn extract_slice(
     })
 }
 
-fn encode_slice_png(slice: &SliceImage) -> Result<Vec<u8>, String> {
-    let bytes = to_u8_samples(&slice.values);
+fn encode_slice_png(width: usize, height: usize, pixels: &[u8]) -> Result<Vec<u8>, String> {
     let image =
-        ImageBuffer::<Luma<u8>, Vec<u8>>::from_vec(slice.width as u32, slice.height as u32, bytes)
+        ImageBuffer::<Luma<u8>, Vec<u8>>::from_vec(width as u32, height as u32, pixels.to_vec())
             .ok_or_else(|| "failed to build PNG buffer".to_string())?;
     let mut encoded = Vec::new();
     let mut cursor = Cursor::new(&mut encoded);
@@ -1158,13 +1232,15 @@ fn histogram(values: &[f32]) -> Vec<u32> {
 fn is_supported_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "tif" | "tiff"
-            )
-        })
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "tif" | "tiff"))
         .unwrap_or(false)
+}
+
+fn viewer_sort_key(label: &str) -> u64 {
+    label
+        .strip_prefix(VIEWER_PREFIX)
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -1221,8 +1297,10 @@ fn main() {
             viewer_context,
             viewer_init,
             viewer_frame,
+            viewer_frame_buffer,
             viewer_start_op,
             viewer_cancel_op,
+            cycle_window,
             list_preview_ops,
             inspect_image,
             render_slice,

@@ -1,0 +1,188 @@
+[
+  {
+    "id": "file",
+    "label": "File",
+    "items": [
+      { "type": "item", "id": "file.new", "label": "New...", "shortcut": "Ctrl+N" },
+      { "type": "item", "id": "file.open", "label": "Open...", "shortcut": "Ctrl+O" },
+      {
+        "type": "submenu",
+        "id": "file.open_recent",
+        "label": "Open Recent",
+        "items": [
+          { "type": "item", "id": "file.open_recent.none", "label": "(empty)", "enabled": false }
+        ]
+      },
+      { "type": "separator" },
+      {
+        "type": "submenu",
+        "id": "file.import",
+        "label": "Import",
+        "items": [
+          { "type": "item", "id": "file.import.image", "label": "Image Sequence..." },
+          { "type": "item", "id": "file.import.raw", "label": "Raw..." },
+          { "type": "item", "id": "file.import.url", "label": "URL..." }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "file.export",
+        "label": "Export",
+        "items": [
+          { "type": "item", "id": "file.export.image", "label": "Image..." },
+          { "type": "item", "id": "file.export.results", "label": "Results..." }
+        ]
+      },
+      { "type": "separator" },
+      { "type": "item", "id": "file.save", "label": "Save", "shortcut": "Ctrl+S" },
+      { "type": "item", "id": "file.save_as", "label": "Save As..." },
+      { "type": "item", "id": "file.revert", "label": "Revert" },
+      { "type": "separator" },
+      { "type": "item", "id": "file.close", "label": "Close", "shortcut": "Ctrl+W" },
+      { "type": "item", "id": "file.quit", "label": "Quit", "shortcut": "Alt+F4" }
+    ]
+  },
+  {
+    "id": "edit",
+    "label": "Edit",
+    "items": [
+      { "type": "item", "id": "edit.undo", "label": "Undo", "shortcut": "Ctrl+Z" },
+      { "type": "item", "id": "edit.redo", "label": "Redo", "shortcut": "Ctrl+Shift+Z" },
+      { "type": "separator" },
+      { "type": "item", "id": "edit.cut", "label": "Cut", "shortcut": "Ctrl+X" },
+      { "type": "item", "id": "edit.copy", "label": "Copy", "shortcut": "Ctrl+C" },
+      { "type": "item", "id": "edit.paste", "label": "Paste", "shortcut": "Ctrl+V" },
+      { "type": "separator" },
+      {
+        "type": "submenu",
+        "id": "edit.options",
+        "label": "Options",
+        "items": [
+          { "type": "item", "id": "edit.options.appearance", "label": "Appearance..." },
+          { "type": "item", "id": "edit.options.memory", "label": "Memory & Threads..." }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "image",
+    "label": "Image",
+    "items": [
+      {
+        "type": "submenu",
+        "id": "image.type",
+        "label": "Type",
+        "items": [
+          { "type": "item", "id": "image.type.8bit", "label": "8-bit" },
+          { "type": "item", "id": "image.type.16bit", "label": "16-bit" },
+          { "type": "item", "id": "image.type.32bit", "label": "32-bit" },
+          { "type": "item", "id": "image.type.rgb", "label": "RGB Color" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.adjust",
+        "label": "Adjust",
+        "items": [
+          { "type": "item", "id": "image.adjust.brightness", "label": "Brightness/Contrast..." },
+          { "type": "item", "id": "image.adjust.threshold", "label": "Threshold..." },
+          { "type": "item", "id": "image.adjust.size", "label": "Size..." },
+          { "type": "item", "id": "image.adjust.canvas", "label": "Canvas Size..." }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.stacks",
+        "label": "Stacks",
+        "items": [
+          { "type": "item", "id": "image.stacks.next", "label": "Next Slice", "shortcut": ">" },
+          { "type": "item", "id": "image.stacks.previous", "label": "Previous Slice", "shortcut": "<" },
+          { "type": "item", "id": "image.stacks.set", "label": "Set Slice..." }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.zoom",
+        "label": "Zoom",
+        "items": [
+          { "type": "item", "id": "image.zoom.in", "label": "In", "shortcut": "+" },
+          { "type": "item", "id": "image.zoom.out", "label": "Out", "shortcut": "-" },
+          { "type": "item", "id": "image.zoom.reset", "label": "100%", "shortcut": "0" },
+          { "type": "item", "id": "image.zoom.to_selection", "label": "To Selection" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "process",
+    "label": "Process",
+    "items": [
+      { "type": "item", "id": "process.gaussian", "label": "Gaussian Blur..." },
+      { "type": "item", "id": "process.smooth", "label": "Smooth" },
+      { "type": "item", "id": "process.sharpen", "label": "Sharpen" },
+      { "type": "item", "id": "process.find_edges", "label": "Find Edges" },
+      {
+        "type": "submenu",
+        "id": "process.binary",
+        "label": "Binary",
+        "items": [
+          { "type": "item", "id": "process.binary.make", "label": "Make Binary" },
+          { "type": "item", "id": "process.binary.erode", "label": "Erode" },
+          { "type": "item", "id": "process.binary.dilate", "label": "Dilate" }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "analyze",
+    "label": "Analyze",
+    "items": [
+      { "type": "item", "id": "analyze.measure", "label": "Measure", "shortcut": "M" },
+      { "type": "item", "id": "analyze.set_measurements", "label": "Set Measurements..." },
+      { "type": "item", "id": "analyze.analyze_particles", "label": "Analyze Particles..." },
+      { "type": "item", "id": "analyze.histogram", "label": "Histogram" },
+      { "type": "item", "id": "analyze.plot_profile", "label": "Plot Profile" },
+      { "type": "separator" },
+      { "type": "item", "id": "analyze.tools.roi_manager", "label": "ROI Manager..." },
+      { "type": "item", "id": "analyze.tools.results", "label": "Results" }
+    ]
+  },
+  {
+    "id": "plugins",
+    "label": "Plugins",
+    "items": [
+      {
+        "type": "submenu",
+        "id": "plugins.macros",
+        "label": "Macros",
+        "items": [
+          { "type": "item", "id": "plugins.macros.run", "label": "Run..." },
+          { "type": "item", "id": "plugins.macros.record", "label": "Record..." },
+          { "type": "item", "id": "plugins.macros.install", "label": "Install..." }
+        ]
+      },
+      { "type": "item", "id": "plugins.commands.find", "label": "Command Finder...", "shortcut": "L" },
+      { "type": "item", "id": "plugins.utilities.startup", "label": "Startup Macros..." }
+    ]
+  },
+  {
+    "id": "window",
+    "label": "Window",
+    "items": [
+      { "type": "item", "id": "window.next", "label": "Next Window", "shortcut": "Tab" },
+      { "type": "item", "id": "window.previous", "label": "Previous Window", "shortcut": "Shift+Tab" },
+      { "type": "separator" },
+      { "type": "item", "id": "window.tile", "label": "Tile" },
+      { "type": "item", "id": "window.cascade", "label": "Cascade" }
+    ]
+  },
+  {
+    "id": "help",
+    "label": "Help",
+    "items": [
+      { "type": "item", "id": "help.about", "label": "About ImageJ-rs" },
+      { "type": "item", "id": "help.docs", "label": "Documentation" },
+      { "type": "item", "id": "help.shortcuts", "label": "Keyboard Shortcuts" }
+    ]
+  }
+]
