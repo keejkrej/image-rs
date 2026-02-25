@@ -15,7 +15,7 @@ ijrs-ops = { path = "../../crates/ijrs-ops" }
 ndarray.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2.10" }
+tauri = { version = "2.10", features = [] }
 
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }

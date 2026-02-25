@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.image.rs",
   "build": {
-    "beforeDevCommand": "npm --prefix web run dev -- --host 127.0.0.1 --port 1420",
-    "beforeBuildCommand": "npm --prefix web run build",
+    "beforeDevCommand": "bun run --cwd web dev --host 127.0.0.1 --port 1420 || bun run --cwd ../web dev --host 127.0.0.1 --port 1420 || bun run --cwd apps/ijrs-tauri/web dev --host 127.0.0.1 --port 1420",
+    "beforeBuildCommand": "bun run --cwd web build || bun run --cwd ../web build || bun run --cwd apps/ijrs-tauri/web build",
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "web/dist"
   },
