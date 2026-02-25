@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ijrs-tauri",
+  "version": "0.1.0",
+  "identifier": "com.image.rs",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "image-rs Control",
+        "url": "launcher.html",
+        "width": 460,
+        "height": 420,
+        "minWidth": 400,
+        "minHeight": 320,
+        "center": true,
+        "resizable": true
+      },
+      {
+        "label": "viewer-template",
+        "title": "image-rs Viewer",
+        "url": "viewer.html",
+        "width": 1200,
+        "height": 860,
+        "resizable": true,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

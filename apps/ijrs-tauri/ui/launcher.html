@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>image-rs Control</title>
+    <link rel="stylesheet" href="launcher.css" />
+  </head>
+  <body>
+    <main class="control-window">
+      <header class="menu-bar">
+        <button id="menu-file" type="button">File</button>
+        <button id="menu-window" type="button">Window</button>
+        <button id="menu-help" type="button">Help</button>
+      </header>
+
+      <section class="identity">
+        <h1>image-rs</h1>
+        <p>Drop TIFF, PNG, or JPEG files here to open image windows.</p>
+      </section>
+
+      <section class="drop-zone" aria-label="drop images here">
+        <strong>Drop Images Here</strong>
+        <span>Duplicate files focus the existing viewer window.</span>
+      </section>
+
+      <section class="open-row">
+        <input id="path-input" type="text" placeholder="C:\path\to\image.tif" />
+        <button id="open-button" type="button">Open</button>
+      </section>
+
+      <section class="status-panel">
+        <p id="summary-line">Waiting for image input.</p>
+        <ul id="result-list"></ul>
+      </section>
+    </main>
+
+    <script src="tauri-api.js"></script>
+    <script src="launcher.js"></script>
+  </body>
+</html>

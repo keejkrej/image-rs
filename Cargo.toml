@@ -1,0 +1,39 @@
+[workspace]
+members = [
+  "crates/ijrs-core",
+  "crates/ijrs-io",
+  "crates/ijrs-ops",
+  "crates/ijrs-pipeline",
+  "crates/ijrs-app",
+  "crates/ijrs-cli",
+  "apps/ijrs-tauri",
+]
+default-members = [
+  "crates/ijrs-core",
+  "crates/ijrs-io",
+  "crates/ijrs-ops",
+  "crates/ijrs-pipeline",
+  "crates/ijrs-app",
+  "crates/ijrs-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+authors = ["image-rs contributors"]
+repository = "https://github.com/keejkrej/image-rs"
+
+[workspace.dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+image = "0.25"
+ndarray = { version = "0.16", features = ["rayon"] }
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+tiff = "0.10"
+tempfile = "3.14"

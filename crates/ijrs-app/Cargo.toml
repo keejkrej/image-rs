@@ -1,0 +1,15 @@
+[package]
+name = "ijrs-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ijrs-core = { path = "../ijrs-core" }
+ijrs-io = { path = "../ijrs-io" }
+ijrs-ops = { path = "../ijrs-ops" }
+ijrs-pipeline = { path = "../ijrs-pipeline" }
+serde_json.workspace = true
+thiserror.workspace = true

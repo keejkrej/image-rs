@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability for launcher and viewer windows.","local":true,"windows":["main","viewer-*"],"permissions":["core:default","core:window:allow-create","core:webview:allow-create-webview-window"]}}

@@ -1,0 +1,146 @@
+:root {
+  --window-bg: #f0f0f0;
+  --panel-bg: #ffffff;
+  --text: #1f1f1f;
+  --muted: #5f5f5f;
+  --border: #c2c2c2;
+  --menu-bg: #e6e6e6;
+  --accent: #2f6fdf;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Segoe UI", "Tahoma", "Verdana", sans-serif;
+  color: var(--text);
+  background: linear-gradient(180deg, #efefef, #dadada);
+  padding: 10px;
+}
+
+.control-window {
+  height: calc(100vh - 20px);
+  border: 1px solid #9f9f9f;
+  background: var(--window-bg);
+  display: grid;
+  grid-template-rows: auto auto auto auto 1fr;
+}
+
+.menu-bar {
+  background: var(--menu-bg);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+}
+
+.menu-bar button {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 3px 9px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.menu-bar button:hover {
+  border-color: #9f9f9f;
+  background: #f9f9f9;
+}
+
+.identity {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.identity h1 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.identity p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.drop-zone {
+  margin: 10px;
+  border: 1px dashed #8f8f8f;
+  background: var(--panel-bg);
+  min-height: 92px;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  gap: 3px;
+  padding: 10px;
+}
+
+.drop-zone strong {
+  font-size: 0.95rem;
+}
+
+.drop-zone span {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.open-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  padding: 0 10px 10px;
+}
+
+input,
+button {
+  font: inherit;
+}
+
+.open-row input {
+  border: 1px solid #9f9f9f;
+  background: #fff;
+  padding: 7px 8px;
+}
+
+.open-row button {
+  border: 1px solid #8a8a8a;
+  background: linear-gradient(#fcfcfc, #dfdfdf);
+  padding: 7px 12px;
+  cursor: pointer;
+}
+
+.open-row button:hover {
+  border-color: #6f6f6f;
+}
+
+.status-panel {
+  margin: 0 10px 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+#summary-line {
+  margin: 0;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.83rem;
+  color: #2f2f2f;
+}
+
+#result-list {
+  margin: 0;
+  padding: 8px 8px 8px 22px;
+  overflow: auto;
+  font-size: 0.82rem;
+}
+
+#result-list li {
+  margin-bottom: 4px;
+  word-break: break-word;
+}

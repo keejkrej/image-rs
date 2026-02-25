@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>image-rs Viewer</title>
+    <link rel="stylesheet" href="viewer.css" />
+  </head>
+  <body>
+    <main class="viewer-window">
+      <header class="menu-bar">
+        <button id="menu-file" type="button">File</button>
+        <button id="menu-process" type="button">Process</button>
+        <button id="menu-analyze" type="button">Analyze</button>
+        <button id="menu-window" type="button">Window</button>
+        <button id="menu-help" type="button">Help</button>
+        <button id="toggle-drawer" class="drawer-toggle" type="button">Panels</button>
+      </header>
+
+      <header class="title-row">
+        <h1 id="window-title">Image</h1>
+        <p id="source-path">Loading...</p>
+      </header>
+
+      <section class="viewport-row">
+        <div class="canvas-wrap">
+          <canvas id="image-canvas"></canvas>
+        </div>
+
+        <aside id="drawer" class="drawer">
+          <section class="panel">
+            <h2>Slice</h2>
+            <div class="control-row">
+              <label for="z-slider">Z</label>
+              <input id="z-slider" type="range" min="0" max="0" value="0" />
+              <span id="z-value">0</span>
+            </div>
+            <div class="control-row">
+              <label for="t-slider">T</label>
+              <input id="t-slider" type="range" min="0" max="0" value="0" />
+              <span id="t-value">0</span>
+            </div>
+            <div class="control-row">
+              <label for="channel-slider">C</label>
+              <input id="channel-slider" type="range" min="0" max="0" value="0" />
+              <span id="channel-value">0</span>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h2>Histogram</h2>
+            <canvas id="histogram" width="300" height="160"></canvas>
+          </section>
+
+          <section class="panel">
+            <h2>Actions</h2>
+            <div class="button-row">
+              <button id="open-process-dialog" type="button">Process...</button>
+              <button id="reset-view" type="button">Reset View</button>
+            </div>
+            <div class="export-row">
+              <input id="export-path" type="text" placeholder="C:\path\to\output.tif" />
+              <button id="export-button" type="button">Export</button>
+            </div>
+            <pre id="meta"></pre>
+          </section>
+        </aside>
+      </section>
+
+      <footer id="status-bar">Status</footer>
+    </main>
+
+    <dialog id="process-dialog">
+      <form method="dialog" class="process-form">
+        <h2>Process</h2>
+        <label for="process-op">Operation</label>
+        <select id="process-op">
+          <option value="gaussian.blur">gaussian.blur</option>
+          <option value="threshold.fixed">threshold.fixed</option>
+          <option value="threshold.otsu">threshold.otsu</option>
+        </select>
+
+        <label for="process-params">Parameters (JSON)</label>
+        <textarea id="process-params" rows="4">{"sigma":1.0}</textarea>
+
+        <p id="process-status">Idle.</p>
+
+        <div class="dialog-actions">
+          <button id="preview-op" type="button">Preview</button>
+          <button id="apply-op" type="button">Apply</button>
+          <button id="cancel-op" type="button">Cancel Job</button>
+          <button id="close-dialog" type="button">Close</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="tauri-api.js"></script>
+    <script src="viewer.js"></script>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "ijrs-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+ijrs-app = { path = "../../crates/ijrs-app" }
+ijrs-core = { path = "../../crates/ijrs-core" }
+ijrs-ops = { path = "../../crates/ijrs-ops" }
+ndarray.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.10" }
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }

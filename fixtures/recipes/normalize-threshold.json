@@ -1,0 +1,15 @@
+{
+  "name": "normalize-threshold",
+  "operations": [
+    {
+      "op": "intensity.normalize",
+      "params": {}
+    },
+    {
+      "op": "threshold.fixed",
+      "params": {
+        "threshold": 0.5
+      }
+    }
+  ]
+}
