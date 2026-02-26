@@ -1,0 +1,19 @@
+[package]
+name = "image-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "image"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+image-runtime = { path = "../runtime" }
+image-model = { path = "../model" }
+image-workflow = { path = "../workflow" }
+serde.workspace = true
+serde_json.workspace = true

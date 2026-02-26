@@ -1,20 +1,20 @@
 [workspace]
 members = [
-  "crates/ijrs-core",
-  "crates/ijrs-io",
-  "crates/ijrs-ops",
-  "crates/ijrs-pipeline",
-  "crates/ijrs-app",
-  "crates/ijrs-cli",
-  "apps/ijrs-tauri",
+  "src/image-rs/model",
+  "src/image-rs/formats",
+  "src/image-rs/commands",
+  "src/image-rs/workflow",
+  "src/image-rs/runtime",
+  "src/image-rs/cli",
+  "src/image-rs/ui",
 ]
 default-members = [
-  "crates/ijrs-core",
-  "crates/ijrs-io",
-  "crates/ijrs-ops",
-  "crates/ijrs-pipeline",
-  "crates/ijrs-app",
-  "crates/ijrs-cli",
+  "src/image-rs/model",
+  "src/image-rs/formats",
+  "src/image-rs/commands",
+  "src/image-rs/workflow",
+  "src/image-rs/runtime",
+  "src/image-rs/cli",
 ]
 resolver = "2"
 

@@ -798,9 +798,9 @@ checksum = "bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b"
 
 [[package]]
 name = "dispatch2"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89a09f22a6c6069a18470eb92d2298acf25463f14256d24778e1230d789a2aec"
+checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.11.0",
  "objc2",
@@ -1771,93 +1771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ijrs-app"
-version = "0.1.0"
-dependencies = [
- "ijrs-core",
- "ijrs-io",
- "ijrs-ops",
- "ijrs-pipeline",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ijrs-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "ijrs-app",
- "ijrs-core",
- "ijrs-pipeline",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ijrs-core"
-version = "0.1.0"
-dependencies = [
- "ndarray",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ijrs-io"
-version = "0.1.0"
-dependencies = [
- "ijrs-core",
- "image",
- "ndarray",
- "tempfile",
- "thiserror 2.0.18",
- "tiff",
-]
-
-[[package]]
-name = "ijrs-ops"
-version = "0.1.0"
-dependencies = [
- "ijrs-core",
- "ndarray",
- "rayon",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ijrs-pipeline"
-version = "0.1.0"
-dependencies = [
- "ijrs-core",
- "ijrs-ops",
- "ndarray",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "ijrs-tauri"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "ijrs-app",
- "ijrs-core",
- "ijrs-ops",
- "image",
- "ndarray",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
 name = "image"
 version = "0.25.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1882,6 +1795,80 @@ dependencies = [
 ]
 
 [[package]]
+name = "image-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "image-model",
+ "image-runtime",
+ "image-workflow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "image-commands"
+version = "0.1.0"
+dependencies = [
+ "image-model",
+ "ndarray",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "image-formats"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "image-model",
+ "ndarray",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tiff",
+]
+
+[[package]]
+name = "image-model"
+version = "0.1.0"
+dependencies = [
+ "ndarray",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "image-runtime"
+version = "0.1.0"
+dependencies = [
+ "image-commands",
+ "image-formats",
+ "image-model",
+ "image-workflow",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "image-ui"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "image",
+ "image-commands",
+ "image-model",
+ "image-runtime",
+ "ndarray",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "image-webp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1889,6 +1876,19 @@ checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
 dependencies = [
  "byteorder-lite",
  "quick-error",
+]
+
+[[package]]
+name = "image-workflow"
+version = "0.1.0"
+dependencies = [
+ "image-commands",
+ "image-model",
+ "ndarray",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2493,9 +2493,9 @@ dependencies = [
 
 [[package]]
 name = "objc2"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7c2599ce0ec54857b29ce62166b0ed9b4f6f1a70ccc9a71165b6154caca8c05"
+checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
 dependencies = [
  "objc2-encode",
  "objc2-exception-helper",
@@ -3465,9 +3465,9 @@ dependencies = [
 
 [[package]]
 name = "rgb"
-version = "0.8.52"
+version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c6a884d2998352bb4daf0183589aec883f16a6da1f4dde84d8e2e9a5409a1ce"
+checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rustc_version"
@@ -5661,18 +5661,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.39"
+version = "0.8.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db6d35d663eadb6c932438e763b262fe1a70987f9ae936e60158176d710cae4a"
+checksum = "a789c6e490b576db9f7e6b6d661bcc9799f7c0ac8352f56ea20193b2681532e5"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.39"
+version = "0.8.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4122cd3169e94605190e77839c9a40d40ed048d305bfdc146e7df40ab0f3e517"
+checksum = "f65c489a7071a749c849713807783f70672b28094011623e200cb86dcb835953"
 dependencies = [
  "proc-macro2",
  "quote",

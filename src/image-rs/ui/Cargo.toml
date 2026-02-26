@@ -1,0 +1,21 @@
+[package]
+name = "image-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+image-runtime = { path = "../runtime" }
+image-model = { path = "../model" }
+image-commands = { path = "../commands" }
+ndarray.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.10", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
