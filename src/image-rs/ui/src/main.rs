@@ -30,7 +30,7 @@ const VIEWER_PREFIX: &str = "viewer-";
 const SOURCE_COMMITTED: &str = "committed";
 const SOURCE_PREVIEW_PREFIX: &str = "preview:";
 const VIEWER_DEFAULT_SIZE: [f32; 2] = [980.0, 980.0];
-const LAUNCHER_WINDOW_SIZE: [f32; 2] = [840.0, 148.0];
+const LAUNCHER_MIN_WINDOW_SIZE: [f32; 2] = [600.0, 200.0];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MenuManifestTopLevel {
@@ -3432,10 +3432,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("image-rs Control")
-            .with_inner_size(LAUNCHER_WINDOW_SIZE)
-            .with_min_inner_size(LAUNCHER_WINDOW_SIZE)
-            .with_max_inner_size(LAUNCHER_WINDOW_SIZE)
-            .with_resizable(false),
+            .with_inner_size(LAUNCHER_MIN_WINDOW_SIZE)
+            .with_min_inner_size(LAUNCHER_MIN_WINDOW_SIZE)
+            .with_resizable(true),
         ..Default::default()
     };
 
