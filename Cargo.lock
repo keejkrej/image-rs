@@ -2300,6 +2300,7 @@ dependencies = [
 [[package]]
 name = "morpholib-rs"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/morpholib-rs#fbf81a5948b29fd1318f6c2838597022c468923d"
 
 [[package]]
 name = "moxcms"
