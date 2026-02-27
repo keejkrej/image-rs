@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
     mpsc::{self, Receiver, Sender},
 };
+use std::time::Duration;
 
 use eframe::egui;
 use image::load_from_memory;
@@ -84,19 +85,22 @@ struct ViewerSession {
     path: PathBuf,
     base_dataset: Arc<DatasetF32>,
     committed_dataset: Arc<DatasetF32>,
+    committed_summary: ImageSummary,
     active_preview: Option<String>,
     preview_cache: HashMap<String, Arc<DatasetF32>>,
-    frame_cache: HashMap<FrameKey, ViewerFrameBuffer>,
+    frame_cache: HashMap<FrameKey, Arc<ViewerFrameBuffer>>,
     generation: u64,
     active_job: Option<ActiveJob>,
 }
 
 impl ViewerSession {
     fn new(path: PathBuf, dataset: Arc<DatasetF32>) -> Self {
+        let committed_summary = summarize_dataset(dataset.as_ref(), &path);
         Self {
             path,
             base_dataset: dataset.clone(),
             committed_dataset: dataset,
+            committed_summary,
             active_preview: None,
             preview_cache: HashMap::new(),
             frame_cache: HashMap::new(),
@@ -131,6 +135,7 @@ impl ViewerSession {
     }
 
     fn commit_dataset(&mut self, dataset: Arc<DatasetF32>) {
+        self.committed_summary = summarize_dataset(dataset.as_ref(), &self.path);
         self.committed_dataset = dataset;
         self.active_preview = None;
         self.preview_cache.clear();
@@ -207,7 +212,7 @@ struct JobTicket {
     job_id: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 struct ImageSummary {
     shape: Vec<usize>,
     axes: Vec<String>,
@@ -391,7 +396,7 @@ struct ViewerUiState {
     status_message: String,
     hover: Option<HoverInfo>,
     pinned: Option<HoverInfo>,
-    frame: Option<ViewerFrameBuffer>,
+    frame: Option<Arc<ViewerFrameBuffer>>,
     texture: Option<egui::TextureHandle>,
     last_request: Option<ViewerFrameRequest>,
     last_generation: u64,
@@ -485,6 +490,30 @@ struct ImageUiApp {
     should_quit: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RepaintDecisionInputs {
+    worker_state_changed: bool,
+    has_pending_actions: bool,
+    has_focus_or_close_command: bool,
+    has_pointer_activity: bool,
+    has_scroll_activity: bool,
+    has_input_events: bool,
+    has_active_jobs: bool,
+}
+
+fn should_request_repaint_now(inputs: RepaintDecisionInputs) -> bool {
+    inputs.worker_state_changed
+        || inputs.has_pending_actions
+        || inputs.has_focus_or_close_command
+        || inputs.has_pointer_activity
+        || inputs.has_scroll_activity
+        || inputs.has_input_events
+}
+
+fn should_request_periodic_repaint(inputs: RepaintDecisionInputs) -> bool {
+    !should_request_repaint_now(inputs) && inputs.has_active_jobs
+}
+
 impl ImageUiApp {
     fn new(cc: &eframe::CreationContext<'_>, startup_input: Option<PathBuf>) -> Self {
         let menus: Vec<MenuManifestTopLevel> =
@@ -571,7 +600,15 @@ impl ImageUiApp {
         );
     }
 
-    fn poll_worker_events(&mut self) {
+    fn has_active_jobs(&self) -> bool {
+        self.state
+            .label_to_session
+            .values()
+            .any(|session| session.active_job.is_some())
+    }
+
+    fn poll_worker_events(&mut self) -> bool {
+        let mut state_changed = false;
         while let Ok(event) = self.worker_rx.try_recv() {
             match event {
                 WorkerEvent::OpFinished {
@@ -588,6 +625,7 @@ impl ImageUiApp {
                         if !session.is_active_job(job_id, generation) {
                             continue;
                         }
+                        state_changed = true;
 
                         match result {
                             Ok(dataset) => {
@@ -621,7 +659,10 @@ impl ImageUiApp {
                 }
             }
         }
-        self.refresh_launcher_status();
+        if state_changed {
+            self.refresh_launcher_status();
+        }
+        state_changed
     }
 
     fn open_paths(&mut self, paths: Vec<PathBuf>) -> OpenResult {
@@ -1624,7 +1665,7 @@ impl ImageUiApp {
 
 impl eframe::App for ImageUiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_worker_events();
+        let worker_state_changed = self.poll_worker_events();
 
         let mut actions = Vec::new();
         self.draw_launcher(ctx, &mut actions);
@@ -1669,7 +1710,11 @@ impl eframe::App for ImageUiApp {
             }
         }
 
+        let has_pending_actions = !actions.is_empty();
         self.apply_actions(actions);
+
+        let has_focus_or_close_command =
+            self.focus_launcher || self.focus_viewer_label.is_some() || self.should_quit;
         self.maybe_focus_windows(ctx);
         self.refresh_launcher_status();
 
@@ -1678,7 +1723,24 @@ impl eframe::App for ImageUiApp {
             self.should_quit = false;
         }
 
-        ctx.request_repaint();
+        let has_active_jobs = self.has_active_jobs();
+        let repaint_inputs = ctx.input(|input| RepaintDecisionInputs {
+            worker_state_changed,
+            has_pending_actions,
+            has_focus_or_close_command,
+            has_pointer_activity: input.pointer.any_down()
+                || input.pointer.delta() != egui::Vec2::ZERO,
+            has_scroll_activity: input.raw_scroll_delta != egui::Vec2::ZERO
+                || input.smooth_scroll_delta != egui::Vec2::ZERO,
+            has_input_events: !input.events.is_empty(),
+            has_active_jobs,
+        });
+
+        if should_request_repaint_now(repaint_inputs) {
+            ctx.request_repaint();
+        } else if should_request_periodic_repaint(repaint_inputs) {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 }
 
@@ -2103,7 +2165,7 @@ fn compute_viewer_frame(
     window_label: &str,
     request: &ViewerFrameRequest,
     preview_override: Option<&PreviewRequest>,
-) -> Result<ViewerFrameBuffer, String> {
+) -> Result<Arc<ViewerFrameBuffer>, String> {
     let (source_kind, dataset) = dataset_for_window(state, window_label, preview_override)?;
     let frame_key = FrameKey {
         source_kind: source_kind.clone(),
@@ -2120,7 +2182,7 @@ fn compute_viewer_frame(
         return Ok(frame);
     }
 
-    let frame = build_frame(dataset.as_ref(), request)?;
+    let frame = Arc::new(build_frame(dataset.as_ref(), request)?);
 
     if let Some(session) = state.label_to_session.get_mut(window_label) {
         let can_store = preview_override.is_some() || session.current_source_kind() == source_kind;
@@ -2204,7 +2266,7 @@ fn summary_for_window(
         .ok_or_else(|| format!("no viewer session for `{window_label}`"))?;
 
     let _baseline_shape = session.base_dataset.shape();
-    let summary = summarize_dataset(session.committed_dataset.as_ref(), &session.path);
+    let summary = session.committed_summary.clone();
     Ok((session.path.clone(), summary))
 }
 
@@ -2473,14 +2535,28 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use image_model::{DatasetF32, PixelType};
+    use ndarray::Array;
     use serde_json::json;
 
     use super::{
-        HoverInfo, LauncherStatusModel, ProgressState, ToolId, ViewerTelemetry, canonical_json,
-        format_launcher_status, preview_cache_key, tool_from_command_id, tool_shortcut_command,
-        viewer_sort_key,
+        HoverInfo, LauncherStatusModel, ProgressState, RepaintDecisionInputs, ToolId, UiState,
+        ViewerFrameRequest, ViewerSession, ViewerTelemetry, canonical_json, compute_viewer_frame,
+        format_launcher_status, preview_cache_key, should_request_periodic_repaint,
+        should_request_repaint_now, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
     };
+
+    fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
+        let data = Array::from_shape_vec((2, 2), values.to_vec())
+            .expect("shape")
+            .into_dyn();
+        Arc::new(DatasetF32::from_data_with_default_metadata(
+            data,
+            PixelType::F32,
+        ))
+    }
 
     #[test]
     fn canonical_json_sorts_object_keys_recursively() {
@@ -2626,5 +2702,48 @@ mod tests {
         assert!(text.contains("X:5 Y:6"));
         assert!(text.contains("200%"));
         assert!(text.contains("gaussian.blur (apply)"));
+    }
+
+    #[test]
+    fn viewer_session_summary_updates_on_commit() {
+        let path = PathBuf::from("/tmp/summary-update.tif");
+        let mut session = ViewerSession::new(path.clone(), dataset_2x2([0.0, 1.0, 2.0, 3.0]));
+
+        assert_eq!(session.committed_summary.min, 0.0);
+        assert_eq!(session.committed_summary.max, 3.0);
+        let summary_before_preview = session.committed_summary.clone();
+
+        session.set_active_preview(Some("preview-1".to_string()));
+        assert_eq!(session.committed_summary, summary_before_preview);
+
+        session.commit_dataset(dataset_2x2([10.0, 11.0, 12.0, 13.0]));
+        assert_eq!(session.committed_summary.min, 10.0);
+        assert_eq!(session.committed_summary.max, 13.0);
+        assert_eq!(session.committed_summary.source, path.display().to_string());
+    }
+
+    #[test]
+    fn compute_viewer_frame_reuses_arc_from_cache() {
+        let mut state = UiState::new(None);
+        let label = "viewer-1".to_string();
+        let session = ViewerSession::new(
+            PathBuf::from("/tmp/frame-cache.tif"),
+            dataset_2x2([0.0, 1.0, 2.0, 3.0]),
+        );
+        state.label_to_session.insert(label.clone(), session);
+
+        let request = ViewerFrameRequest::default();
+        let first = compute_viewer_frame(&mut state, &label, &request, None).expect("first frame");
+        let second =
+            compute_viewer_frame(&mut state, &label, &request, None).expect("cached second frame");
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn repaint_policy_idle_does_not_request_repaint() {
+        let inputs = RepaintDecisionInputs::default();
+        assert!(!should_request_repaint_now(inputs));
+        assert!(!should_request_periodic_repaint(inputs));
     }
 }
