@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+morpholib = ["image-commands/morpholib"]
+thunderstorm = ["image-commands/thunderstorm"]
+
 [dependencies]
 image-model = { path = "../model" }
 image-formats = { path = "../formats" }

@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+morpholib = ["image-runtime/morpholib"]
+thunderstorm = ["image-runtime/thunderstorm"]
+
 [[bin]]
 name = "image"
 path = "src/main.rs"

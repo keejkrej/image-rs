@@ -2,9 +2,12 @@ mod components;
 mod gaussian;
 mod intensity;
 mod measurements;
+#[cfg(feature = "morpholib")]
 mod morpholibj;
 mod morphology;
 mod threshold;
+#[cfg(feature = "thunderstorm")]
+mod thunderstorm;
 mod util;
 
 use std::collections::HashMap;
@@ -19,12 +22,18 @@ pub use components::ComponentsLabelOp;
 pub use gaussian::GaussianBlurOp;
 pub use intensity::{IntensityNormalizeOp, IntensityWindowOp};
 pub use measurements::MeasurementsSummaryOp;
+#[cfg(feature = "morpholib")]
 pub use morpholibj::{
     MorpholibjChamferDistanceOp, MorpholibjReconstructByDilationOp,
     MorpholibjReconstructByErosionOp,
 };
 pub use morphology::{MorphologyCloseOp, MorphologyDilateOp, MorphologyErodeOp, MorphologyOpenOp};
 pub use threshold::{ThresholdFixedOp, ThresholdOtsuOp};
+#[cfg(feature = "thunderstorm")]
+pub use thunderstorm::{
+    ThunderstormGaussianFilterOp, ThunderstormLsqGaussianFitOp, ThunderstormNonMaxSuppressionOp,
+    ThunderstormPipelineLocalizeOp,
+};
 
 pub type Result<T> = std::result::Result<T, OpsError>;
 
@@ -104,9 +113,20 @@ fn registry() -> &'static Registry {
         register(&mut map, MorphologyOpenOp);
         register(&mut map, MorphologyCloseOp);
         register(&mut map, ComponentsLabelOp);
+        #[cfg(feature = "morpholib")]
         register(&mut map, MorpholibjChamferDistanceOp);
+        #[cfg(feature = "morpholib")]
         register(&mut map, MorpholibjReconstructByDilationOp);
+        #[cfg(feature = "morpholib")]
         register(&mut map, MorpholibjReconstructByErosionOp);
+        #[cfg(feature = "thunderstorm")]
+        register(&mut map, ThunderstormGaussianFilterOp);
+        #[cfg(feature = "thunderstorm")]
+        register(&mut map, ThunderstormNonMaxSuppressionOp);
+        #[cfg(feature = "thunderstorm")]
+        register(&mut map, ThunderstormLsqGaussianFitOp);
+        #[cfg(feature = "thunderstorm")]
+        register(&mut map, ThunderstormPipelineLocalizeOp);
         register(&mut map, MeasurementsSummaryOp);
         map
     })
@@ -221,7 +241,10 @@ mod tests {
         assert!(names.contains(&"gaussian.blur".to_string()));
         assert!(names.contains(&"components.label".to_string()));
         assert!(names.contains(&"measurements.summary".to_string()));
+        #[cfg(feature = "morpholib")]
         assert!(names.contains(&"morpholibj.distance.chamfer".to_string()));
+        #[cfg(feature = "thunderstorm")]
+        assert!(names.contains(&"thunderstorm.pipeline.localize".to_string()));
     }
 
     #[test]

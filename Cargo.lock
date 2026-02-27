@@ -1930,6 +1930,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "thunderstorm-rs",
 ]
 
 [[package]]
@@ -3735,6 +3736,67 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "thunderstorm-core"
+version = "0.1.0"
+source = "git+https://github.com/keejkrej/thunderstorm-rs.git?rev=b796f81#b796f810672f0822173da5f8cccfb5a2c5ba9e4d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "thunderstorm-detectors"
+version = "0.1.0"
+source = "git+https://github.com/keejkrej/thunderstorm-rs.git?rev=b796f81#b796f810672f0822173da5f8cccfb5a2c5ba9e4d"
+dependencies = [
+ "serde_json",
+ "thunderstorm-core",
+]
+
+[[package]]
+name = "thunderstorm-filters"
+version = "0.1.0"
+source = "git+https://github.com/keejkrej/thunderstorm-rs.git?rev=b796f81#b796f810672f0822173da5f8cccfb5a2c5ba9e4d"
+dependencies = [
+ "serde_json",
+ "thunderstorm-core",
+]
+
+[[package]]
+name = "thunderstorm-fitters"
+version = "0.1.0"
+source = "git+https://github.com/keejkrej/thunderstorm-rs.git?rev=b796f81#b796f810672f0822173da5f8cccfb5a2c5ba9e4d"
+dependencies = [
+ "serde_json",
+ "thunderstorm-core",
+]
+
+[[package]]
+name = "thunderstorm-pipeline"
+version = "0.1.0"
+source = "git+https://github.com/keejkrej/thunderstorm-rs.git?rev=b796f81#b796f810672f0822173da5f8cccfb5a2c5ba9e4d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thunderstorm-core",
+ "thunderstorm-detectors",
+ "thunderstorm-filters",
+ "thunderstorm-fitters",
+]
+
+[[package]]
+name = "thunderstorm-rs"
+version = "0.1.0"
+source = "git+https://github.com/keejkrej/thunderstorm-rs.git?rev=b796f81#b796f810672f0822173da5f8cccfb5a2c5ba9e4d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thunderstorm-core",
+ "thunderstorm-pipeline",
 ]
 
 [[package]]

@@ -6,9 +6,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+morpholib = ["dep:morpholib-rs"]
+thunderstorm = ["dep:thunderstorm-rs"]
+
 [dependencies]
 image-model = { path = "../model" }
-morpholib-rs = { git = "https://github.com/keejkrej/morpholib-rs" }
+morpholib-rs = { git = "https://github.com/keejkrej/morpholib-rs", optional = true }
+thunderstorm-rs = { git = "https://github.com/keejkrej/thunderstorm-rs.git", rev = "b796f81", optional = true }
 ndarray.workspace = true
 rayon.workspace = true
 serde.workspace = true

@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+morpholib = ["image-runtime/morpholib", "image-commands/morpholib"]
+thunderstorm = ["image-runtime/thunderstorm", "image-commands/thunderstorm"]
+
 [dependencies]
 eframe = { version = "0.31" }
 image-runtime = { path = "../runtime" }
