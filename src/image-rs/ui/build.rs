@@ -1,3 +1,3 @@
 fn main() {
-    tauri_build::build()
+    // No build-time code generation is required for the native egui UI.
 }
