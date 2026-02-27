@@ -322,7 +322,6 @@ struct ViewerUiState {
     pan: egui::Vec2,
     transform: ViewerTransformState,
     rois: interaction::roi::RoiStore,
-    show_inspector: bool,
     status_message: String,
     tool_message: Option<String>,
     hover: Option<HoverInfo>,
@@ -350,7 +349,6 @@ impl ViewerUiState {
             pan: egui::vec2(0.0, 0.0),
             transform: ViewerTransformState::default(),
             rois: interaction::roi::RoiStore::default(),
-            show_inspector: false,
             status_message: "Ready.".to_string(),
             tool_message: None,
             hover: None,
@@ -1890,79 +1888,7 @@ impl ImageUiApp {
                 viewer.channel = viewer.channel.min(summary.channels.saturating_sub(1));
             }
 
-            if viewer.show_inspector {
-                egui::SidePanel::right(format!("viewer-inspector-{label}"))
-                    .resizable(true)
-                    .default_width(300.0)
-                    .show(ctx, |ui| {
-                        ui.heading("Inspector");
-                        if let Some(path) = self.state.label_to_path.get(label) {
-                            ui.label(path.display().to_string());
-                        }
-                        ui.separator();
-
-                        if let Some(summary) = &summary {
-                            let max_z = summary.z_slices.saturating_sub(1);
-                            let max_t = summary.times.saturating_sub(1);
-                            let max_c = summary.channels.saturating_sub(1);
-
-                            ui.label("Slice");
-                            ui.add(
-                                egui::Slider::new(&mut viewer.z, 0..=max_z)
-                                    .text("Z")
-                                    .clamping(egui::SliderClamping::Always),
-                            );
-                            ui.add(
-                                egui::Slider::new(&mut viewer.t, 0..=max_t)
-                                    .text("T")
-                                    .clamping(egui::SliderClamping::Always),
-                            );
-                            ui.add(
-                                egui::Slider::new(&mut viewer.channel, 0..=max_c)
-                                    .text("C")
-                                    .clamping(egui::SliderClamping::Always),
-                            );
-
-                            ui.separator();
-                            ui.label("Metadata");
-                            ui.monospace(
-                                serde_json::to_string_pretty(summary)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            );
-                        }
-
-                        ui.separator();
-                        ui.label("Histogram");
-                        let size = egui::vec2(ui.available_width().max(1.0), 140.0);
-                        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                        if let Some(frame) = &viewer.frame {
-                            draw_histogram(ui.painter(), rect, &frame.histogram);
-                        } else {
-                            ui.painter().rect_stroke(
-                                rect,
-                                0.0,
-                                egui::Stroke::new(1.0, egui::Color32::GRAY),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-                    });
-            }
-
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(if viewer.show_inspector {
-                            "Hide Panel"
-                        } else {
-                            "Show Panel"
-                        })
-                        .clicked()
-                    {
-                        viewer.show_inspector = !viewer.show_inspector;
-                    }
-                });
-                ui.separator();
-
                 let frame = viewer.frame.clone();
                 let texture_id = viewer.texture.as_ref().map(|texture| texture.id());
                 let available = ui.available_size();
