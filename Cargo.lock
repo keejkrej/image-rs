@@ -1908,78 +1908,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "image-cli"
+name = "image-rs"
 version = "0.1.0"
 dependencies = [
  "clap",
- "image-model",
- "image-runtime",
- "image-workflow",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "image-commands"
-version = "0.1.0"
-dependencies = [
- "image-model",
+ "eframe",
+ "image",
  "morpholib-rs",
  "ndarray",
  "rayon",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "thunderstorm-rs",
-]
-
-[[package]]
-name = "image-formats"
-version = "0.1.0"
-dependencies = [
- "image",
- "image-model",
- "ndarray",
- "tempfile",
- "thiserror 2.0.18",
- "tiff",
-]
-
-[[package]]
-name = "image-model"
-version = "0.1.0"
-dependencies = [
- "ndarray",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "image-runtime"
-version = "0.1.0"
-dependencies = [
- "image-commands",
- "image-formats",
- "image-model",
- "image-workflow",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "image-ui"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "image",
- "image-commands",
- "image-model",
- "image-runtime",
- "ndarray",
  "rfd",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "thunderstorm-rs",
+ "tiff",
 ]
 
 [[package]]
@@ -1990,19 +1935,6 @@ checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
 dependencies = [
  "byteorder-lite",
  "quick-error",
-]
-
-[[package]]
-name = "image-workflow"
-version = "0.1.0"
-dependencies = [
- "image-commands",
- "image-model",
- "ndarray",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
 ]
 
 [[package]]

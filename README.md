@@ -2,11 +2,11 @@
 
 Rust-first core rewrite inspired by ImageJ2, with a native egui desktop UI and deterministic CLI pipelines.
 
-## Workspace
+## Architecture
 
-- Core crates: `image-model`, `image-formats`, `image-commands`, `image-workflow`, `image-runtime`
-- CLI binary: `image` (from `image-cli`)
-- Desktop UI crate/binary: `image-ui`
+- Single package: `image-rs`
+- Single binary: `image`
+- Internal modules: `cli`, `ui`, `model`, `formats`, `commands`, `workflow`, `runtime`
 
 ## What currently works
 
@@ -19,22 +19,22 @@ Rust-first core rewrite inspired by ImageJ2, with a native egui desktop UI and d
 ## Quick start
 
 ```bash
-cargo test --workspace
-cargo run -p image-cli -- ops list
+cargo test
+cargo run -- ops list
 ```
 
 Basic CLI examples:
 
 ```bash
-cargo run -p image-cli -- info ./input.tiff
-cargo run -p image-cli -- convert ./input.png ./output.tiff
-cargo run -p image-cli -- view ./input.tiff
+cargo run -- info ./input.tiff
+cargo run -- convert ./input.png ./output.tiff
+cargo run -- view ./input.tiff
 ```
 
 Run a pipeline (recipe path is JSON or YAML):
 
 ```bash
-cargo run -p image-cli -- run \
+cargo run -- run \
   --input ./input.tiff \
   --recipe ./pipeline.json \
   --output ./output.tiff \
@@ -72,6 +72,7 @@ Current constraints:
 
 ## UI launcher notes
 
+- Run `image` with no arguments to launch the native UI.
 - Native launcher shell: menu bar, ImageJ-style tool icon strip, and status row.
 - Launcher window is resizable and starts at minimum size (`600x200`, 3:1).
 - Use `File > Open...` (native file dialog) or drag-and-drop TIFF files (`.tif`/`.tiff`) onto the launcher.

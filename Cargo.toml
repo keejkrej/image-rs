@@ -1,39 +1,34 @@
-[workspace]
-members = [
-  "src/image-rs/model",
-  "src/image-rs/formats",
-  "src/image-rs/commands",
-  "src/image-rs/workflow",
-  "src/image-rs/runtime",
-  "src/image-rs/cli",
-  "src/image-rs/ui",
-]
-default-members = [
-  "src/image-rs/model",
-  "src/image-rs/formats",
-  "src/image-rs/commands",
-  "src/image-rs/workflow",
-  "src/image-rs/runtime",
-  "src/image-rs/cli",
-]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "image-rs"
 version = "0.1.0"
 edition = "2024"
 license = "BSD-2-Clause"
 authors = ["image-rs contributors"]
 repository = "https://github.com/keejkrej/image-rs"
 
-[workspace.dependencies]
-base64 = "0.22"
+[features]
+default = []
+morpholib = ["dep:morpholib-rs"]
+thunderstorm = ["dep:thunderstorm-rs"]
+
+[[bin]]
+name = "image"
+path = "src/main.rs"
+
+[dependencies]
 clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.31" }
 image = "0.25"
+morpholib-rs = { git = "https://github.com/keejkrej/morpholib-rs", optional = true }
 ndarray = { version = "0.16", features = ["rayon"] }
 rayon = "1.11"
+rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 thiserror = "2.0"
+thunderstorm-rs = { git = "https://github.com/keejkrej/thunderstorm-rs.git", rev = "b796f81", optional = true }
 tiff = "0.10"
+
+[dev-dependencies]
 tempfile = "3.14"
