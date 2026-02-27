@@ -834,9 +834,7 @@ impl ImageUiApp {
             return Some(command_registry::CommandExecuteResult::ok(message));
         }
 
-        let Some(viewer) = self.viewers_ui.get_mut(window_label) else {
-            return None;
-        };
+        let viewer = self.viewers_ui.get_mut(window_label)?;
 
         match command_id {
             "image.zoom.in" => {
@@ -1486,11 +1484,11 @@ impl ImageUiApp {
 
                     if response.hovered() && selected_tool == ToolId::Zoom {
                         let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.raw_scroll_delta.y);
-                        if scroll.abs() > f32::EPSILON {
-                            if let Some(pointer) = response.hover_pos() {
-                                let zoom_factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
-                                zoom_about_pointer(viewer, rect, pointer, zoom_factor);
-                            }
+                        if scroll.abs() > f32::EPSILON
+                            && let Some(pointer) = response.hover_pos()
+                        {
+                            let zoom_factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
+                            zoom_about_pointer(viewer, rect, pointer, zoom_factor);
                         }
                     }
 
