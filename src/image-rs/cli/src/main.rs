@@ -40,7 +40,7 @@ enum Commands {
         #[command(subcommand)]
         command: OpsCommand,
     },
-    /// Launches the Tauri control window and opens an initial viewer for this image.
+    /// Launches the native control window and opens an initial viewer for this image.
     /// The control window remains open as the drag-and-drop entry point.
     View {
         input: PathBuf,
@@ -160,14 +160,14 @@ fn run() -> Result<(), String> {
             }
         },
         Commands::View { input } => {
-            launch_tauri_viewer(&input)?;
+            launch_native_viewer(&input)?;
         }
     }
 
     Ok(())
 }
 
-fn launch_tauri_viewer(input: &PathBuf) -> Result<(), String> {
+fn launch_native_viewer(input: &PathBuf) -> Result<(), String> {
     let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let binary_name = if cfg!(windows) {
         "image-ui.exe"
