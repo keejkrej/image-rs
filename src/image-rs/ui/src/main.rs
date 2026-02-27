@@ -256,7 +256,6 @@ struct ViewerFrameBuffer {
     width: usize,
     height: usize,
     pixels_u8: Vec<u8>,
-    histogram: Vec<u32>,
     min: f32,
     max: f32,
 }
@@ -1824,11 +1823,7 @@ impl ImageUiApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Drop TIFF images here or use File > Open...");
-            });
+        egui::CentralPanel::default().show(ctx, |_ui| {
         });
 
         egui::TopBottomPanel::bottom("launcher-status").show(ctx, |ui| {
@@ -3152,13 +3147,11 @@ fn build_frame(
     let slice = extract_slice(dataset, request.z, request.t, request.channel)?;
     let pixels_u8 = to_u8_samples(&slice.values);
     let (min, max) = min_max(&slice.values);
-    let histogram = histogram(&slice.values);
 
     Ok(ViewerFrameBuffer {
         width: slice.width,
         height: slice.height,
         pixels_u8,
-        histogram,
         min,
         max,
     })
@@ -3267,43 +3260,6 @@ fn min_max(values: &[f32]) -> (f32, f32) {
         max = max.max(value);
     }
     (min, max)
-}
-
-fn histogram(values: &[f32]) -> Vec<u32> {
-    let (min, max) = min_max(values);
-    let span = (max - min).max(f32::EPSILON);
-    let mut bins = vec![0_u32; 256];
-    for value in values {
-        let normalized = ((*value - min) / span).clamp(0.0, 1.0);
-        let index = (normalized * 255.0).round() as usize;
-        bins[index] += 1;
-    }
-    bins
-}
-
-fn draw_histogram(painter: &egui::Painter, rect: egui::Rect, histogram: &[u32]) {
-    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
-    if histogram.is_empty() {
-        return;
-    }
-
-    let max = histogram.iter().copied().max().unwrap_or(1) as f32;
-    let bar_width = rect.width() / histogram.len() as f32;
-
-    for (index, value) in histogram.iter().enumerate() {
-        let ratio = (*value as f32 / max).clamp(0.0, 1.0);
-        let height = ratio * (rect.height() - 2.0);
-        let x0 = rect.left() + index as f32 * bar_width;
-        let x1 = x0 + bar_width.max(1.0);
-        let y1 = rect.bottom();
-        let y0 = y1 - height;
-
-        painter.rect_filled(
-            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
-            0.0,
-            egui::Color32::from_gray(90),
-        );
-    }
 }
 
 fn to_color_image(frame: &ViewerFrameBuffer) -> egui::ColorImage {

@@ -191,6 +191,7 @@ pub(crate) fn get_optional_usize(params: &Value, key: &str, default: usize) -> u
         .unwrap_or(default)
 }
 
+#[cfg(feature = "morpholib")]
 pub(crate) fn get_optional_bool(params: &Value, key: &str, default: bool) -> bool {
     params.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
