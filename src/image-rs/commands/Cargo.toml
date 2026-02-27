@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 image-model = { path = "../model" }
+morpholib-rs = { path = "/Users/jack/workspace/morpholib-rs" }
 ndarray.workspace = true
 rayon.workspace = true
 serde.workspace = true

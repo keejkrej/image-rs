@@ -1924,6 +1924,7 @@ name = "image-commands"
 version = "0.1.0"
 dependencies = [
  "image-model",
+ "morpholib-rs",
  "ndarray",
  "rayon",
  "serde",
@@ -2295,6 +2296,10 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "morpholib-rs"
+version = "0.1.0"
 
 [[package]]
 name = "moxcms"

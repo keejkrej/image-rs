@@ -2,6 +2,7 @@ mod components;
 mod gaussian;
 mod intensity;
 mod measurements;
+mod morpholibj;
 mod morphology;
 mod threshold;
 mod util;
@@ -18,6 +19,10 @@ pub use components::ComponentsLabelOp;
 pub use gaussian::GaussianBlurOp;
 pub use intensity::{IntensityNormalizeOp, IntensityWindowOp};
 pub use measurements::MeasurementsSummaryOp;
+pub use morpholibj::{
+    MorpholibjChamferDistanceOp, MorpholibjReconstructByDilationOp,
+    MorpholibjReconstructByErosionOp,
+};
 pub use morphology::{MorphologyCloseOp, MorphologyDilateOp, MorphologyErodeOp, MorphologyOpenOp};
 pub use threshold::{ThresholdFixedOp, ThresholdOtsuOp};
 
@@ -99,6 +104,9 @@ fn registry() -> &'static Registry {
         register(&mut map, MorphologyOpenOp);
         register(&mut map, MorphologyCloseOp);
         register(&mut map, ComponentsLabelOp);
+        register(&mut map, MorpholibjChamferDistanceOp);
+        register(&mut map, MorpholibjReconstructByDilationOp);
+        register(&mut map, MorpholibjReconstructByErosionOp);
         register(&mut map, MeasurementsSummaryOp);
         map
     })
@@ -163,6 +171,10 @@ pub(crate) fn get_optional_usize(params: &Value, key: &str, default: usize) -> u
         .unwrap_or(default)
 }
 
+pub(crate) fn get_optional_bool(params: &Value, key: &str, default: bool) -> bool {
+    params.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
 pub(crate) fn spatial_axes(dataset: &DatasetF32) -> Vec<usize> {
     dataset
         .metadata
@@ -209,6 +221,7 @@ mod tests {
         assert!(names.contains(&"gaussian.blur".to_string()));
         assert!(names.contains(&"components.label".to_string()));
         assert!(names.contains(&"measurements.summary".to_string()));
+        assert!(names.contains(&"morpholibj.distance.chamfer".to_string()));
     }
 
     #[test]
