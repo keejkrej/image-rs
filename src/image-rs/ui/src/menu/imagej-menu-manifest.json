@@ -107,8 +107,12 @@
         "items": [
           { "type": "item", "id": "image.zoom.in", "label": "In", "shortcut": "+" },
           { "type": "item", "id": "image.zoom.out", "label": "Out", "shortcut": "-" },
-          { "type": "item", "id": "image.zoom.reset", "label": "100%", "shortcut": "0" },
-          { "type": "item", "id": "image.zoom.to_selection", "label": "To Selection" }
+          { "type": "item", "id": "image.zoom.original", "label": "Original Scale", "shortcut": "0" },
+          { "type": "item", "id": "image.zoom.view100", "label": "View 100%", "shortcut": "5" },
+          { "type": "item", "id": "image.zoom.to_selection", "label": "To Selection" },
+          { "type": "item", "id": "image.zoom.scale_to_fit", "label": "Scale to Fit" },
+          { "type": "item", "id": "image.zoom.set", "label": "Set..." },
+          { "type": "item", "id": "image.zoom.maximize", "label": "Maximize" }
         ]
       }
     ]

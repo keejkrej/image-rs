@@ -212,7 +212,15 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Cycles active image windows in reverse order."),
         ),
-        "image.zoom.in" | "image.zoom.out" | "image.zoom.reset" => CommandMetadata::with(
+        "image.zoom.in"
+        | "image.zoom.out"
+        | "image.zoom.reset"
+        | "image.zoom.original"
+        | "image.zoom.view100"
+        | "image.zoom.to_selection"
+        | "image.zoom.scale_to_fit"
+        | "image.zoom.set"
+        | "image.zoom.maximize" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             true,
@@ -225,6 +233,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
         | "launcher.tool.poly"
         | "launcher.tool.free"
         | "launcher.tool.line"
+        | "launcher.tool.angle"
         | "launcher.tool.point"
         | "launcher.tool.wand"
         | "launcher.tool.text"
@@ -251,6 +260,40 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             };
             CommandMetadata::with(CommandScope::Both, true, true, false, None, Some(notes))
         }
+        "launcher.tool.rect.mode.rectangle"
+        | "launcher.tool.rect.mode.rounded"
+        | "launcher.tool.rect.mode.rotated"
+        | "launcher.tool.oval.mode.oval"
+        | "launcher.tool.oval.mode.ellipse"
+        | "launcher.tool.oval.mode.brush"
+        | "launcher.tool.line.mode.straight"
+        | "launcher.tool.line.mode.segmented"
+        | "launcher.tool.line.mode.freehand"
+        | "launcher.tool.line.mode.arrow"
+        | "launcher.tool.point.mode.point"
+        | "launcher.tool.point.mode.multipoint"
+        | "tool.dropper.palette.white_black"
+        | "tool.dropper.palette.black_white"
+        | "tool.dropper.palette.red"
+        | "tool.dropper.palette.green"
+        | "tool.dropper.palette.blue"
+        | "tool.dropper.palette.yellow"
+        | "tool.dropper.palette.cyan"
+        | "tool.dropper.palette.magenta"
+        | "tool.dropper.palette.foreground"
+        | "tool.dropper.palette.background"
+        | "tool.dropper.palette.colors"
+        | "tool.dropper.palette.color_picker"
+        | "viewer.roi.clear"
+        | "viewer.roi.abort"
+        | "viewer.roi.select_next" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("ImageJ-style interaction command routed to the viewer shell."),
+        ),
         "process.smooth" | "process.gaussian" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -382,6 +425,7 @@ mod tests {
             "launcher.tool.poly",
             "launcher.tool.free",
             "launcher.tool.line",
+            "launcher.tool.angle",
             "launcher.tool.point",
             "launcher.tool.wand",
             "launcher.tool.text",

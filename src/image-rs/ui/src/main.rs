@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod command_registry;
+mod interaction;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,11 @@ use eframe::egui;
 use image::load_from_memory;
 use image_model::{AxisKind, DatasetF32};
 use image_runtime::AppContext;
+use interaction::roi::RoiKind;
+use interaction::tooling::{
+    LineMode, OvalMode, PointMode, RectMode, ToolId, ToolOptionsState, ToolState,
+};
+use interaction::transform::{ViewerTransformState, zoom_level_down, zoom_level_up};
 use ndarray::IxDyn;
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -275,84 +281,6 @@ struct HoverInfo {
     value: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolId {
-    Rect,
-    Oval,
-    Poly,
-    Free,
-    Line,
-    Point,
-    Wand,
-    Text,
-    Zoom,
-    Hand,
-    Dropper,
-    Custom1,
-    Custom2,
-    Custom3,
-    More,
-}
-
-impl ToolId {
-    const fn command_id(self) -> &'static str {
-        match self {
-            Self::Rect => "launcher.tool.rect",
-            Self::Oval => "launcher.tool.oval",
-            Self::Poly => "launcher.tool.poly",
-            Self::Free => "launcher.tool.free",
-            Self::Line => "launcher.tool.line",
-            Self::Point => "launcher.tool.point",
-            Self::Wand => "launcher.tool.wand",
-            Self::Text => "launcher.tool.text",
-            Self::Zoom => "launcher.tool.zoom",
-            Self::Hand => "launcher.tool.hand",
-            Self::Dropper => "launcher.tool.dropper",
-            Self::Custom1 => "launcher.tool.custom1",
-            Self::Custom2 => "launcher.tool.custom2",
-            Self::Custom3 => "launcher.tool.custom3",
-            Self::More => "launcher.tool.more",
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Rect => "Rect",
-            Self::Oval => "Oval",
-            Self::Poly => "Poly",
-            Self::Free => "Free",
-            Self::Line => "Line",
-            Self::Point => "Point",
-            Self::Wand => "Wand",
-            Self::Text => "Text",
-            Self::Zoom => "Zoom",
-            Self::Hand => "Hand",
-            Self::Dropper => "Dropper",
-            Self::Custom1 => "Custom 1",
-            Self::Custom2 => "Custom 2",
-            Self::Custom3 => "Custom 3",
-            Self::More => "More",
-        }
-    }
-
-    const fn has_behavior(self) -> bool {
-        matches!(self, Self::Hand | Self::Zoom | Self::Point)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ToolState {
-    selected: ToolId,
-}
-
-impl Default for ToolState {
-    fn default() -> Self {
-        Self {
-            selected: ToolId::Rect,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum ProgressState {
     #[default]
@@ -392,8 +320,11 @@ struct ViewerUiState {
     channel: usize,
     zoom: f32,
     pan: egui::Vec2,
+    transform: ViewerTransformState,
+    rois: interaction::roi::RoiStore,
     show_inspector: bool,
     status_message: String,
+    tool_message: Option<String>,
     hover: Option<HoverInfo>,
     pinned: Option<HoverInfo>,
     frame: Option<Arc<ViewerFrameBuffer>>,
@@ -401,6 +332,10 @@ struct ViewerUiState {
     last_request: Option<ViewerFrameRequest>,
     last_generation: u64,
     fit_requested: bool,
+    pending_zoom: Option<ZoomCommand>,
+    active_drag_started: Option<egui::Pos2>,
+    active_polygon_points: Vec<egui::Pos2>,
+    last_status_pointer: Option<egui::Pos2>,
 }
 
 impl ViewerUiState {
@@ -413,8 +348,11 @@ impl ViewerUiState {
             channel: 0,
             zoom: 1.0,
             pan: egui::vec2(0.0, 0.0),
+            transform: ViewerTransformState::default(),
+            rois: interaction::roi::RoiStore::default(),
             show_inspector: false,
             status_message: "Ready.".to_string(),
+            tool_message: None,
             hover: None,
             pinned: None,
             frame: None,
@@ -422,6 +360,10 @@ impl ViewerUiState {
             last_request: None,
             last_generation: 0,
             fit_requested: true,
+            pending_zoom: None,
+            active_drag_started: None,
+            active_polygon_points: Vec::new(),
+            last_status_pointer: None,
         }
     }
 
@@ -429,7 +371,7 @@ impl ViewerUiState {
         ViewerTelemetry {
             hover: self.hover,
             pinned: self.pinned,
-            zoom: self.zoom,
+            zoom: self.transform.magnification,
             z: self.z,
             t: self.t,
             c: self.channel,
@@ -444,6 +386,12 @@ impl ViewerUiState {
         } else {
             "X:- Y:- Value:-".to_string()
         };
+        let roi_message = self.rois.active_status_text();
+        let message = self
+            .tool_message
+            .as_deref()
+            .or(roi_message.as_deref())
+            .unwrap_or(&self.status_message);
 
         format!(
             "Tool:{}  {}  Z:{} T:{} C:{}  Zoom:{:.0}%  {}",
@@ -452,8 +400,8 @@ impl ViewerUiState {
             self.z,
             self.t,
             self.channel,
-            self.zoom * 100.0,
-            self.status_message
+            self.transform.magnification * 100.0,
+            message
         )
     }
 }
@@ -473,12 +421,25 @@ enum UiAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZoomCommand {
+    In,
+    Out,
+    Original,
+    View100,
+    ToSelection,
+    ScaleToFit,
+    Set,
+    Maximize,
+}
+
 struct ImageUiApp {
     state: UiState,
     menus: Vec<MenuManifestTopLevel>,
     command_catalog: command_registry::CommandCatalog,
     launcher_ui: LauncherUiState,
     tool_state: ToolState,
+    tool_options: ToolOptionsState,
     toolbar_icons: HashMap<ToolbarIcon, egui::TextureHandle>,
     viewers_ui: HashMap<String, ViewerUiState>,
     viewer_telemetry: HashMap<String, ViewerTelemetry>,
@@ -532,6 +493,7 @@ impl ImageUiApp {
                     .to_string(),
             },
             tool_state: ToolState::default(),
+            tool_options: ToolOptionsState::default(),
             toolbar_icons: load_toolbar_icons(&cc.egui_ctx),
             viewers_ui: HashMap::new(),
             viewer_telemetry: HashMap::new(),
@@ -875,20 +837,248 @@ impl ImageUiApp {
             return Some(command_registry::CommandExecuteResult::ok(message));
         }
 
+        match command_id {
+            "launcher.tool.rect.mode.rectangle" => {
+                self.tool_options.rect_mode = RectMode::Rectangle;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "rectangle mode selected",
+                ));
+            }
+            "launcher.tool.rect.mode.rounded" => {
+                self.tool_options.rect_mode = RectMode::Rounded;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "rounded rectangle mode selected",
+                ));
+            }
+            "launcher.tool.rect.mode.rotated" => {
+                self.tool_options.rect_mode = RectMode::Rotated;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "rotated rectangle mode selected",
+                ));
+            }
+            "launcher.tool.oval.mode.oval" => {
+                self.tool_options.oval_mode = OvalMode::Oval;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "oval mode selected",
+                ));
+            }
+            "launcher.tool.oval.mode.ellipse" => {
+                self.tool_options.oval_mode = OvalMode::Ellipse;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "ellipse mode selected",
+                ));
+            }
+            "launcher.tool.oval.mode.brush" => {
+                self.tool_options.oval_mode = OvalMode::Brush;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "brush mode selected",
+                ));
+            }
+            "launcher.tool.line.mode.straight" => {
+                self.tool_options.line_mode = LineMode::Straight;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "straight line mode selected",
+                ));
+            }
+            "launcher.tool.line.mode.segmented" => {
+                self.tool_options.line_mode = LineMode::Segmented;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "segmented line mode selected",
+                ));
+            }
+            "launcher.tool.line.mode.freehand" => {
+                self.tool_options.line_mode = LineMode::Freehand;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "freehand line mode selected",
+                ));
+            }
+            "launcher.tool.line.mode.arrow" => {
+                self.tool_options.line_mode = LineMode::Arrow;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "arrow mode selected",
+                ));
+            }
+            "launcher.tool.point.mode.point" => {
+                self.tool_options.point_mode = PointMode::Point;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "point mode selected",
+                ));
+            }
+            "launcher.tool.point.mode.multipoint" => {
+                self.tool_options.point_mode = PointMode::MultiPoint;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "multipoint mode selected",
+                ));
+            }
+            "tool.dropper.palette.white_black" => {
+                self.tool_options.foreground_color = egui::Color32::WHITE;
+                self.tool_options.background_color = egui::Color32::BLACK;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "palette set to white/black",
+                ));
+            }
+            "tool.dropper.palette.black_white" => {
+                self.tool_options.foreground_color = egui::Color32::BLACK;
+                self.tool_options.background_color = egui::Color32::WHITE;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "palette set to black/white",
+                ));
+            }
+            "tool.dropper.palette.red" => {
+                self.tool_options.foreground_color = egui::Color32::RED;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground set to red",
+                ));
+            }
+            "tool.dropper.palette.green" => {
+                self.tool_options.foreground_color = egui::Color32::GREEN;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground set to green",
+                ));
+            }
+            "tool.dropper.palette.blue" => {
+                self.tool_options.foreground_color = egui::Color32::BLUE;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground set to blue",
+                ));
+            }
+            "tool.dropper.palette.yellow" => {
+                self.tool_options.foreground_color = egui::Color32::YELLOW;
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground set to yellow",
+                ));
+            }
+            "tool.dropper.palette.cyan" => {
+                self.tool_options.foreground_color = egui::Color32::from_rgb(0, 255, 255);
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground set to cyan",
+                ));
+            }
+            "tool.dropper.palette.magenta" => {
+                self.tool_options.foreground_color = egui::Color32::from_rgb(255, 0, 255);
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground set to magenta",
+                ));
+            }
+            "tool.dropper.palette.foreground" => {
+                std::mem::swap(
+                    &mut self.tool_options.foreground_color,
+                    &mut self.tool_options.background_color,
+                );
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground/background swapped",
+                ));
+            }
+            "tool.dropper.palette.background" => {
+                std::mem::swap(
+                    &mut self.tool_options.foreground_color,
+                    &mut self.tool_options.background_color,
+                );
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "foreground/background swapped",
+                ));
+            }
+            "tool.dropper.palette.colors" => {
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "color dialog is not implemented yet",
+                ));
+            }
+            "tool.dropper.palette.color_picker" => {
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "color picker dialog is not implemented yet",
+                ));
+            }
+            _ => {}
+        }
+
         let viewer = self.viewers_ui.get_mut(window_label)?;
 
         match command_id {
+            "viewer.slice.next" => {
+                if let Some(session) = self.state.label_to_session.get(window_label) {
+                    let max_z = session.committed_summary.z_slices.saturating_sub(1);
+                    viewer.z = (viewer.z + 1).min(max_z);
+                    viewer.last_request = None;
+                }
+                Some(command_registry::CommandExecuteResult::ok(
+                    "moved to next slice",
+                ))
+            }
+            "viewer.slice.previous" => {
+                viewer.z = viewer.z.saturating_sub(1);
+                viewer.last_request = None;
+                Some(command_registry::CommandExecuteResult::ok(
+                    "moved to previous slice",
+                ))
+            }
+            "viewer.roi.delete" => {
+                if let Some(selected) = viewer.rois.selected_roi_id {
+                    viewer.rois.overlay_rois.retain(|roi| roi.id != selected);
+                    viewer.rois.selected_roi_id = None;
+                } else {
+                    viewer.rois.clear_all();
+                }
+                Some(command_registry::CommandExecuteResult::ok(
+                    "deleted selection",
+                ))
+            }
             "image.zoom.in" => {
-                viewer.zoom = (viewer.zoom * 1.2).clamp(0.1, 64.0);
+                viewer.pending_zoom = Some(ZoomCommand::In);
                 Some(command_registry::CommandExecuteResult::ok("zoomed in"))
             }
             "image.zoom.out" => {
-                viewer.zoom = (viewer.zoom / 1.2).clamp(0.1, 64.0);
+                viewer.pending_zoom = Some(ZoomCommand::Out);
                 Some(command_registry::CommandExecuteResult::ok("zoomed out"))
             }
-            "image.zoom.reset" => {
-                viewer.fit_requested = true;
+            "image.zoom.reset" | "image.zoom.original" => {
+                viewer.pending_zoom = Some(ZoomCommand::Original);
                 Some(command_registry::CommandExecuteResult::ok("zoom reset"))
+            }
+            "image.zoom.view100" => {
+                viewer.pending_zoom = Some(ZoomCommand::View100);
+                Some(command_registry::CommandExecuteResult::ok("zoomed to 100%"))
+            }
+            "image.zoom.to_selection" => {
+                viewer.pending_zoom = Some(ZoomCommand::ToSelection);
+                Some(command_registry::CommandExecuteResult::ok(
+                    "zoomed to selection",
+                ))
+            }
+            "image.zoom.scale_to_fit" => {
+                viewer.pending_zoom = Some(ZoomCommand::ScaleToFit);
+                Some(command_registry::CommandExecuteResult::ok(
+                    "scale-to-fit enabled",
+                ))
+            }
+            "image.zoom.set" => {
+                viewer.pending_zoom = Some(ZoomCommand::Set);
+                Some(command_registry::CommandExecuteResult::ok(
+                    "zoom set dialog is not implemented yet",
+                ))
+            }
+            "image.zoom.maximize" => {
+                viewer.pending_zoom = Some(ZoomCommand::Maximize);
+                Some(command_registry::CommandExecuteResult::ok("zoom maximized"))
+            }
+            "viewer.roi.clear" => {
+                viewer.rois.clear_all();
+                Some(command_registry::CommandExecuteResult::ok(
+                    "selection cleared",
+                ))
+            }
+            "viewer.roi.abort" => {
+                viewer.rois.abort_active();
+                viewer.active_drag_started = None;
+                viewer.active_polygon_points.clear();
+                Some(command_registry::CommandExecuteResult::ok(
+                    "selection aborted",
+                ))
+            }
+            "viewer.roi.select_next" => {
+                viewer.rois.select_next();
+                Some(command_registry::CommandExecuteResult::ok(
+                    "selected next ROI",
+                ))
             }
             _ => None,
         }
@@ -959,9 +1149,42 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
-            "analyze.measure" => command_registry::CommandExecuteResult::unimplemented(
-                "analyze.measure is not implemented in this phase",
-            ),
+            "analyze.measure" => {
+                let Some(viewer) = self.viewers_ui.get(window_label) else {
+                    return command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required for measure",
+                    );
+                };
+                let request = ViewerFrameRequest {
+                    z: viewer.z,
+                    t: viewer.t,
+                    channel: viewer.channel,
+                };
+                match compute_viewer_frame(&mut self.state, window_label, &request, None) {
+                    Ok(frame) => {
+                        let count = frame.pixels_u8.len().max(1) as f32;
+                        let mean = frame
+                            .pixels_u8
+                            .iter()
+                            .map(|value| *value as f32)
+                            .sum::<f32>()
+                            / count;
+                        command_registry::CommandExecuteResult::with_payload(
+                            "measurement complete",
+                            json!({
+                                "min": frame.min,
+                                "max": frame.max,
+                                "meanU8": mean,
+                                "pixelCount": frame.pixels_u8.len(),
+                                "z": viewer.z,
+                                "t": viewer.t,
+                                "channel": viewer.channel
+                            }),
+                        )
+                    }
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             _ => command_registry::CommandExecuteResult::unimplemented(format!(
                 "command `{}` has no backend handler yet",
                 request.command_id
@@ -1192,7 +1415,7 @@ impl ImageUiApp {
         }
     }
 
-    fn draw_launcher_toolbar(&self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+    fn draw_launcher_toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
         for item in launcher_toolbar_items() {
             if item.kind == ToolbarKind::Separator {
                 ui.separator();
@@ -1230,6 +1453,183 @@ impl ImageUiApp {
                     params: None,
                 });
             }
+            response.context_menu(|ui| match item.command_id {
+                "launcher.tool.rect" => {
+                    if ui.button("Rectangle").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.rect.mode.rectangle".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Rounded Rectangle").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.rect.mode.rounded".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Rotated Rectangle").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.rect.mode.rotated".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                }
+                "launcher.tool.oval" => {
+                    if ui.button("Oval").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.oval.mode.oval".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Ellipse").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.oval.mode.ellipse".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Brush").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.oval.mode.brush".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                }
+                "launcher.tool.line" => {
+                    if ui.button("Straight").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.line.mode.straight".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Segmented").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.line.mode.segmented".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Freehand").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.line.mode.freehand".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Arrow").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.line.mode.arrow".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                }
+                "launcher.tool.point" => {
+                    if ui.button("Point").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.point.mode.point".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Multi-point").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: LAUNCHER_LABEL.to_string(),
+                            command_id: "launcher.tool.point.mode.multipoint".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                }
+                "launcher.tool.zoom" => {
+                    if ui.button("Original Scale").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self
+                                .active_viewer_label
+                                .clone()
+                                .unwrap_or_else(|| LAUNCHER_LABEL.to_string()),
+                            command_id: "image.zoom.original".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("View 100%").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self
+                                .active_viewer_label
+                                .clone()
+                                .unwrap_or_else(|| LAUNCHER_LABEL.to_string()),
+                            command_id: "image.zoom.view100".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("To Selection").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self
+                                .active_viewer_label
+                                .clone()
+                                .unwrap_or_else(|| LAUNCHER_LABEL.to_string()),
+                            command_id: "image.zoom.to_selection".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Scale to Fit").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self
+                                .active_viewer_label
+                                .clone()
+                                .unwrap_or_else(|| LAUNCHER_LABEL.to_string()),
+                            command_id: "image.zoom.scale_to_fit".to_string(),
+                            params: None,
+                        });
+                        ui.close_menu();
+                    }
+                }
+                "launcher.tool.dropper" => {
+                    for (label, command_id) in [
+                        ("White/Black", "tool.dropper.palette.white_black"),
+                        ("Black/White", "tool.dropper.palette.black_white"),
+                        ("Red", "tool.dropper.palette.red"),
+                        ("Green", "tool.dropper.palette.green"),
+                        ("Blue", "tool.dropper.palette.blue"),
+                        ("Yellow", "tool.dropper.palette.yellow"),
+                        ("Cyan", "tool.dropper.palette.cyan"),
+                        ("Magenta", "tool.dropper.palette.magenta"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            actions.push(UiAction::Command {
+                                window_label: self
+                                    .active_viewer_label
+                                    .clone()
+                                    .unwrap_or_else(|| LAUNCHER_LABEL.to_string()),
+                                command_id: command_id.to_string(),
+                                params: None,
+                            });
+                            ui.close_menu();
+                        }
+                    }
+                }
+                _ => {}
+            });
         }
     }
 
@@ -1303,6 +1703,52 @@ impl ImageUiApp {
                     params: None,
                 });
             }
+
+            if window_label.starts_with(VIEWER_PREFIX) {
+                if input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::Period)
+                {
+                    actions.push(UiAction::Command {
+                        window_label: window_label.to_string(),
+                        command_id: "viewer.slice.next".to_string(),
+                        params: None,
+                    });
+                }
+                if input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::Comma) {
+                    actions.push(UiAction::Command {
+                        window_label: window_label.to_string(),
+                        command_id: "viewer.slice.previous".to_string(),
+                        params: None,
+                    });
+                }
+                if input.key_pressed(egui::Key::ArrowUp) {
+                    actions.push(UiAction::Command {
+                        window_label: window_label.to_string(),
+                        command_id: "image.zoom.in".to_string(),
+                        params: None,
+                    });
+                }
+                if input.key_pressed(egui::Key::ArrowDown) {
+                    actions.push(UiAction::Command {
+                        window_label: window_label.to_string(),
+                        command_id: "image.zoom.out".to_string(),
+                        params: None,
+                    });
+                }
+                if input.key_pressed(egui::Key::Escape) {
+                    actions.push(UiAction::Command {
+                        window_label: window_label.to_string(),
+                        command_id: "viewer.roi.abort".to_string(),
+                        params: None,
+                    });
+                }
+                if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
+                    actions.push(UiAction::Command {
+                        window_label: window_label.to_string(),
+                        command_id: "viewer.roi.delete".to_string(),
+                        params: None,
+                    });
+                }
+            }
         }
 
         if wants_keyboard {
@@ -1340,12 +1786,27 @@ impl ImageUiApp {
                 }),
                 "0" => actions.push(UiAction::Command {
                     window_label: window_label.to_string(),
-                    command_id: "image.zoom.reset".to_string(),
+                    command_id: "image.zoom.original".to_string(),
+                    params: None,
+                }),
+                "5" => actions.push(UiAction::Command {
+                    window_label: window_label.to_string(),
+                    command_id: "image.zoom.view100".to_string(),
                     params: None,
                 }),
                 "M" | "m" => actions.push(UiAction::Command {
                     window_label: window_label.to_string(),
                     command_id: "analyze.measure".to_string(),
+                    params: None,
+                }),
+                "<" | "," => actions.push(UiAction::Command {
+                    window_label: window_label.to_string(),
+                    command_id: "viewer.slice.previous".to_string(),
+                    params: None,
+                }),
+                ">" | "." | ";" => actions.push(UiAction::Command {
+                    window_label: window_label.to_string(),
+                    command_id: "viewer.slice.next".to_string(),
                     params: None,
                 }),
                 _ => {}
@@ -1517,67 +1978,310 @@ impl ImageUiApp {
                         viewer.fit_requested = false;
                     }
 
+                    if let Some(zoom_command) = viewer.pending_zoom.take() {
+                        apply_zoom_command(viewer, zoom_command, rect, &frame);
+                    }
+
                     let hover_sample = response
                         .hover_pos()
                         .and_then(|pointer| sample_at_pointer(viewer, &frame, rect, pointer));
                     viewer.hover = hover_sample;
                     hovered_viewer = response.hovered() || response.dragged() || response.clicked();
+                    viewer.zoom = viewer.transform.magnification;
 
-                    if response.hovered() && selected_tool == ToolId::Zoom {
-                        let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.raw_scroll_delta.y);
-                        if scroll.abs() > f32::EPSILON
-                            && let Some(pointer) = response.hover_pos()
-                        {
-                            let zoom_factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
-                            zoom_about_pointer(viewer, rect, pointer, zoom_factor);
+                    let input = ui.input(|i| i.clone());
+                    let pointer = response.hover_pos();
+                    let pointer_image =
+                        pointer.and_then(|screen| viewer.transform.screen_to_image(rect, screen));
+                    if let Some(pointer) = pointer {
+                        if let Some(last) = viewer.last_status_pointer {
+                            if (pointer - last).length_sq() > 144.0 {
+                                viewer.tool_message = None;
+                                viewer.last_status_pointer = Some(pointer);
+                            }
+                        } else {
+                            viewer.last_status_pointer = Some(pointer);
+                        }
+                    }
+
+                    if response.hovered() {
+                        let scroll = input.smooth_scroll_delta.y + input.raw_scroll_delta.y;
+                        if scroll.abs() > f32::EPSILON {
+                            let zoom_modifier = input.modifiers.ctrl
+                                || input.modifiers.command
+                                || input.modifiers.shift;
+                            if zoom_modifier {
+                                if let Some(pointer) = pointer {
+                                    let zoom_factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
+                                    zoom_about_pointer(
+                                        viewer,
+                                        rect,
+                                        pointer,
+                                        zoom_factor,
+                                        frame.width,
+                                        frame.height,
+                                    );
+                                }
+                            } else if summary
+                                .as_ref()
+                                .is_some_and(|meta| meta.z_slices.saturating_sub(1) > 0)
+                            {
+                                if scroll < 0.0 {
+                                    if let Some(meta) = &summary {
+                                        viewer.z =
+                                            (viewer.z + 1).min(meta.z_slices.saturating_sub(1));
+                                    }
+                                } else {
+                                    viewer.z = viewer.z.saturating_sub(1);
+                                }
+                                viewer.last_request = None;
+                            } else {
+                                let horizontal = input.key_down(egui::Key::Space)
+                                    || viewer.transform.src_rect.height >= frame.height as f32;
+                                viewer.transform.wheel_pan(
+                                    -scroll.signum(),
+                                    horizontal,
+                                    frame.width,
+                                    frame.height,
+                                );
+                            }
                         }
                     }
 
                     match selected_tool {
                         ToolId::Hand => {
                             if response.dragged() {
-                                viewer.pan += ui.input(|i| i.pointer.delta());
+                                viewer.transform.scroll_by_screen_delta(
+                                    input.pointer.delta(),
+                                    frame.width,
+                                    frame.height,
+                                );
                             }
                         }
                         ToolId::Zoom => {
-                            if let Some(pointer) = response.hover_pos() {
+                            if let Some(pointer) = pointer {
                                 if response.clicked_by(egui::PointerButton::Primary) {
-                                    let zoom_factor = if ui.input(|i| i.modifiers.shift) {
+                                    let zoom_factor = if input.modifiers.shift {
                                         1.0 / 1.2
                                     } else {
                                         1.2
                                     };
-                                    zoom_about_pointer(viewer, rect, pointer, zoom_factor);
+                                    zoom_about_pointer(
+                                        viewer,
+                                        rect,
+                                        pointer,
+                                        zoom_factor,
+                                        frame.width,
+                                        frame.height,
+                                    );
                                 }
                                 if response.clicked_by(egui::PointerButton::Secondary) {
-                                    zoom_about_pointer(viewer, rect, pointer, 1.0 / 1.2);
+                                    zoom_about_pointer(
+                                        viewer,
+                                        rect,
+                                        pointer,
+                                        1.0 / 1.2,
+                                        frame.width,
+                                        frame.height,
+                                    );
                                 }
                             }
                         }
                         ToolId::Point => {
                             if response.clicked_by(egui::PointerButton::Primary) {
                                 viewer.pinned = hover_sample;
+                                if let Some(point) = pointer_image {
+                                    let mut points = vec![point];
+                                    let multi =
+                                        self.tool_options.point_mode == PointMode::MultiPoint;
+                                    if multi {
+                                        points = viewer
+                                            .rois
+                                            .overlay_rois
+                                            .iter()
+                                            .find_map(|roi| match &roi.kind {
+                                                RoiKind::Point { points, .. } => {
+                                                    Some(points.clone())
+                                                }
+                                                _ => None,
+                                            })
+                                            .unwrap_or_default();
+                                        points.push(point);
+                                    }
+                                    let roi = RoiKind::Point { points, multi };
+                                    viewer.rois.begin_active(
+                                        roi,
+                                        interaction::roi::RoiPosition {
+                                            channel: viewer.channel,
+                                            z: viewer.z,
+                                            t: viewer.t,
+                                        },
+                                    );
+                                    viewer.rois.commit_active(multi || input.modifiers.shift);
+                                }
+                            }
+                        }
+                        ToolId::Dropper => {
+                            if response.clicked_by(egui::PointerButton::Primary) {
+                                if let Some(sample) = hover_sample {
+                                    let v = sample.value.clamp(0.0, 255.0) as u8;
+                                    if input.modifiers.alt {
+                                        self.tool_options.background_color =
+                                            egui::Color32::from_gray(v);
+                                    } else {
+                                        self.tool_options.foreground_color =
+                                            egui::Color32::from_gray(v);
+                                    }
+                                }
+                            }
+                        }
+                        ToolId::Poly => {
+                            if response.clicked_by(egui::PointerButton::Primary)
+                                && let Some(point) = pointer_image
+                            {
+                                viewer.active_polygon_points.push(point);
+                            }
+                            if response.double_clicked() && viewer.active_polygon_points.len() >= 2
+                            {
+                                viewer.rois.begin_active(
+                                    RoiKind::Polygon {
+                                        points: viewer.active_polygon_points.clone(),
+                                        closed: true,
+                                    },
+                                    interaction::roi::RoiPosition {
+                                        channel: viewer.channel,
+                                        z: viewer.z,
+                                        t: viewer.t,
+                                    },
+                                );
+                                viewer.rois.commit_active(!input.modifiers.shift);
+                                viewer.active_polygon_points.clear();
+                            }
+                        }
+                        ToolId::Angle => {
+                            if response.clicked_by(egui::PointerButton::Primary)
+                                && let Some(point) = pointer_image
+                            {
+                                viewer.active_polygon_points.push(point);
+                                if viewer.active_polygon_points.len() == 3 {
+                                    let points = viewer.active_polygon_points.clone();
+                                    viewer.rois.begin_active(
+                                        RoiKind::Angle {
+                                            a: points[0],
+                                            b: points[1],
+                                            c: points[2],
+                                        },
+                                        interaction::roi::RoiPosition {
+                                            channel: viewer.channel,
+                                            z: viewer.z,
+                                            t: viewer.t,
+                                        },
+                                    );
+                                    viewer.rois.commit_active(!input.modifiers.shift);
+                                    viewer.active_polygon_points.clear();
+                                }
+                            }
+                        }
+                        ToolId::Wand => {
+                            if response.clicked_by(egui::PointerButton::Primary)
+                                && let Some(point) = pointer_image
+                            {
+                                let radius = self.tool_options.wand_tolerance.max(4.0);
+                                let mut points = Vec::with_capacity(16);
+                                for step in 0..16 {
+                                    let theta = step as f32 * std::f32::consts::TAU / 16.0;
+                                    points.push(egui::pos2(
+                                        point.x + radius * theta.cos(),
+                                        point.y + radius * theta.sin(),
+                                    ));
+                                }
+                                viewer.rois.begin_active(
+                                    RoiKind::WandTrace { points },
+                                    interaction::roi::RoiPosition {
+                                        channel: viewer.channel,
+                                        z: viewer.z,
+                                        t: viewer.t,
+                                    },
+                                );
+                                viewer.rois.commit_active(!input.modifiers.shift);
+                            }
+                        }
+                        ToolId::Text => {
+                            if response.clicked_by(egui::PointerButton::Primary)
+                                && let Some(point) = pointer_image
+                            {
+                                viewer.rois.begin_active(
+                                    RoiKind::Text {
+                                        at: point,
+                                        text: "Text".to_string(),
+                                    },
+                                    interaction::roi::RoiPosition {
+                                        channel: viewer.channel,
+                                        z: viewer.z,
+                                        t: viewer.t,
+                                    },
+                                );
+                                viewer.rois.commit_active(!input.modifiers.shift);
+                            }
+                        }
+                        ToolId::Rect | ToolId::Oval | ToolId::Line | ToolId::Free => {
+                            let primary_down =
+                                input.pointer.button_down(egui::PointerButton::Primary);
+                            if response.dragged()
+                                && viewer.active_drag_started.is_none()
+                                && let Some(start) = pointer_image
+                            {
+                                viewer.active_drag_started = Some(start);
+                            }
+                            if response.dragged()
+                                && let (Some(start), Some(end)) =
+                                    (viewer.active_drag_started, pointer_image)
+                            {
+                                let roi = drag_roi_for_tool(
+                                    selected_tool,
+                                    &self.tool_options,
+                                    start,
+                                    end,
+                                    &mut viewer.active_polygon_points,
+                                );
+                                viewer.rois.begin_active(
+                                    roi,
+                                    interaction::roi::RoiPosition {
+                                        channel: viewer.channel,
+                                        z: viewer.z,
+                                        t: viewer.t,
+                                    },
+                                );
+                            }
+                            if !primary_down && viewer.active_drag_started.is_some() {
+                                viewer.active_drag_started = None;
+                                viewer.active_polygon_points.clear();
+                                viewer.rois.commit_active(!input.modifiers.shift);
                             }
                         }
                         _ => {}
                     }
 
-                    let image_size =
-                        egui::vec2(frame.width as f32, frame.height as f32) * viewer.zoom;
-                    let image_rect = egui::Rect::from_min_size(rect.min + viewer.pan, image_size);
                     ui.painter().image(
                         texture_id,
-                        image_rect,
-                        egui::Rect::from_min_max(
-                            egui::Pos2::new(0.0, 0.0),
-                            egui::Pos2::new(1.0, 1.0),
-                        ),
+                        rect,
+                        viewer.transform.src_rect.uv_rect(frame.width, frame.height),
                         egui::Color32::WHITE,
                     );
 
                     if let Some(pinned) = viewer.pinned {
                         draw_point_marker(ui.painter(), viewer, rect, pinned);
                     }
+                    draw_rois(
+                        ui.painter(),
+                        viewer,
+                        rect,
+                        interaction::roi::RoiPosition {
+                            channel: viewer.channel,
+                            z: viewer.z,
+                            t: viewer.t,
+                        },
+                    );
                 }
             });
 
@@ -1632,10 +2336,8 @@ impl ImageUiApp {
                     if window_label == LAUNCHER_LABEL {
                         self.set_fallback_status(format!("{label}: {}", result.message));
                     } else if let Some(viewer) = self.viewers_ui.get_mut(&window_label) {
+                        viewer.tool_message = Some(result.message.clone());
                         viewer.status_message = result.message;
-                        if command_id.starts_with("image.zoom") {
-                            viewer.fit_requested = command_id == "image.zoom.reset";
-                        }
                     }
                 }
                 UiAction::OpenPaths { paths } => {
@@ -1773,6 +2475,7 @@ enum ToolbarIcon {
     Poly,
     Free,
     Line,
+    Angle,
     Point,
     Wand,
     Text,
@@ -1840,21 +2543,15 @@ fn launcher_toolbar_items() -> &'static [LauncherToolbarItem] {
         launcher_toolbar_button("launcher.tool.poly", "Polygon", ToolbarIcon::Poly),
         launcher_toolbar_button("launcher.tool.free", "Freehand", ToolbarIcon::Free),
         launcher_toolbar_button("launcher.tool.line", "Line", ToolbarIcon::Line),
+        launcher_toolbar_button("launcher.tool.angle", "Angle", ToolbarIcon::Angle),
         launcher_toolbar_button("launcher.tool.point", "Point", ToolbarIcon::Point),
         launcher_toolbar_button("launcher.tool.wand", "Wand", ToolbarIcon::Wand),
         launcher_toolbar_button("launcher.tool.text", "Text", ToolbarIcon::Text),
         launcher_toolbar_separator(),
-        launcher_toolbar_button("file.open", "Open", ToolbarIcon::Open),
         launcher_toolbar_button("launcher.tool.zoom", "Zoom", ToolbarIcon::Zoom),
         launcher_toolbar_button("launcher.tool.hand", "Hand", ToolbarIcon::Hand),
         launcher_toolbar_button("launcher.tool.dropper", "Dropper", ToolbarIcon::Dropper),
         launcher_toolbar_separator(),
-        launcher_toolbar_button("window.previous", "Previous Window", ToolbarIcon::Previous),
-        launcher_toolbar_button("window.next", "Next Window", ToolbarIcon::Next),
-        launcher_toolbar_button("file.quit", "Quit", ToolbarIcon::Quit),
-        launcher_toolbar_button("launcher.tool.custom1", "Custom 1", ToolbarIcon::Custom1),
-        launcher_toolbar_button("launcher.tool.custom2", "Custom 2", ToolbarIcon::Custom2),
-        launcher_toolbar_button("launcher.tool.custom3", "Custom 3", ToolbarIcon::Custom3),
         launcher_toolbar_button("launcher.tool.more", "More Tools", ToolbarIcon::More),
     ];
     ITEMS
@@ -1867,7 +2564,9 @@ fn viewer_toolbar_items() -> &'static [ViewerToolbarItem] {
         viewer_toolbar_separator(),
         viewer_toolbar_button("image.zoom.in", "Zoom In", "+"),
         viewer_toolbar_button("image.zoom.out", "Zoom Out", "-"),
-        viewer_toolbar_button("image.zoom.reset", "Zoom 100%", "1:1"),
+        viewer_toolbar_button("image.zoom.original", "Original Scale", "Orig"),
+        viewer_toolbar_button("image.zoom.view100", "View 100%", "100%"),
+        viewer_toolbar_button("image.zoom.to_selection", "To Selection", "Sel"),
         viewer_toolbar_separator(),
         viewer_toolbar_button("process.smooth", "Smooth", "S"),
         viewer_toolbar_button("process.gaussian", "Gaussian Blur", "G"),
@@ -1902,6 +2601,11 @@ fn load_toolbar_icons(ctx: &egui::Context) -> HashMap<ToolbarIcon, egui::Texture
         (
             ToolbarIcon::Line,
             "line",
+            include_bytes!("../assets/tools/line.png").as_slice(),
+        ),
+        (
+            ToolbarIcon::Angle,
+            "angle",
             include_bytes!("../assets/tools/line.png").as_slice(),
         ),
         (
@@ -2001,48 +2705,16 @@ fn load_toolbar_icons(ctx: &egui::Context) -> HashMap<ToolbarIcon, egui::Texture
 }
 
 fn tool_from_command_id(command_id: &str) -> Option<ToolId> {
-    match command_id {
-        "launcher.tool.rect" => Some(ToolId::Rect),
-        "launcher.tool.oval" => Some(ToolId::Oval),
-        "launcher.tool.poly" => Some(ToolId::Poly),
-        "launcher.tool.free" => Some(ToolId::Free),
-        "launcher.tool.line" => Some(ToolId::Line),
-        "launcher.tool.point" => Some(ToolId::Point),
-        "launcher.tool.wand" => Some(ToolId::Wand),
-        "launcher.tool.text" => Some(ToolId::Text),
-        "launcher.tool.zoom" => Some(ToolId::Zoom),
-        "launcher.tool.hand" => Some(ToolId::Hand),
-        "launcher.tool.dropper" => Some(ToolId::Dropper),
-        "launcher.tool.custom1" => Some(ToolId::Custom1),
-        "launcher.tool.custom2" => Some(ToolId::Custom2),
-        "launcher.tool.custom3" => Some(ToolId::Custom3),
-        "launcher.tool.more" => Some(ToolId::More),
-        _ => None,
-    }
+    interaction::tooling::tool_from_command_id(command_id)
 }
 
 fn tool_shortcut_command(text: &str) -> Option<&'static str> {
-    tool_shortcut_tool(text).map(ToolId::command_id)
+    interaction::tooling::tool_shortcut_command(text)
 }
 
+#[allow(dead_code)]
 fn tool_shortcut_tool(text: &str) -> Option<ToolId> {
-    match text {
-        "r" | "R" => Some(ToolId::Rect),
-        "o" | "O" => Some(ToolId::Oval),
-        "g" | "G" => Some(ToolId::Poly),
-        "f" | "F" => Some(ToolId::Free),
-        "l" | "L" => Some(ToolId::Line),
-        "p" | "P" | "." => Some(ToolId::Point),
-        "w" | "W" => Some(ToolId::Wand),
-        "t" | "T" => Some(ToolId::Text),
-        "z" | "Z" => Some(ToolId::Zoom),
-        "h" | "H" => Some(ToolId::Hand),
-        "d" | "D" => Some(ToolId::Dropper),
-        "1" => Some(ToolId::Custom1),
-        "2" => Some(ToolId::Custom2),
-        "3" => Some(ToolId::Custom3),
-        _ => None,
-    }
+    interaction::tooling::tool_shortcut_tool(text)
 }
 
 fn format_launcher_status(
@@ -2097,9 +2769,9 @@ fn sample_at_pointer(
     rect: egui::Rect,
     pointer: egui::Pos2,
 ) -> Option<HoverInfo> {
-    let local = pointer - (rect.min + viewer.pan);
-    let image_x = (local.x / viewer.zoom).floor() as isize;
-    let image_y = (local.y / viewer.zoom).floor() as isize;
+    let image_pos = viewer.transform.screen_to_image(rect, pointer)?;
+    let image_x = image_pos.x.floor() as isize;
+    let image_y = image_pos.y.floor() as isize;
     if image_x < 0 || image_y < 0 {
         return None;
     }
@@ -2121,13 +2793,22 @@ fn zoom_about_pointer(
     rect: egui::Rect,
     pointer: egui::Pos2,
     factor: f32,
+    image_width: usize,
+    image_height: usize,
 ) {
-    let previous_zoom = viewer.zoom;
-    let next_zoom = (viewer.zoom * factor).clamp(0.1, 64.0);
-    let pointer_local = pointer - rect.min;
-    let source_before = (pointer_local - viewer.pan) / previous_zoom;
-    viewer.zoom = next_zoom;
-    viewer.pan = pointer_local - source_before * next_zoom;
+    if factor >= 1.0 {
+        let next = zoom_level_up(viewer.transform.magnification);
+        viewer
+            .transform
+            .set_magnification_at(rect, pointer, next, image_width, image_height);
+    } else {
+        let next = zoom_level_down(viewer.transform.magnification);
+        viewer
+            .transform
+            .set_magnification_at(rect, pointer, next, image_width, image_height);
+    }
+    viewer.zoom = viewer.transform.magnification;
+    viewer.pan = egui::Vec2::ZERO;
 }
 
 fn draw_point_marker(
@@ -2136,12 +2817,10 @@ fn draw_point_marker(
     rect: egui::Rect,
     pinned: HoverInfo,
 ) {
-    let center = rect.min
-        + viewer.pan
-        + egui::vec2(
-            (pinned.x as f32 + 0.5) * viewer.zoom,
-            (pinned.y as f32 + 0.5) * viewer.zoom,
-        );
+    let center = viewer.transform.image_to_screen(
+        rect,
+        egui::pos2(pinned.x as f32 + 0.5, pinned.y as f32 + 0.5),
+    );
     let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 212, 26));
     painter.circle_stroke(center, 5.0, stroke);
     painter.line_segment(
@@ -2158,6 +2837,253 @@ fn draw_point_marker(
         ],
         stroke,
     );
+}
+
+fn apply_zoom_command(
+    viewer: &mut ViewerUiState,
+    command: ZoomCommand,
+    rect: egui::Rect,
+    frame: &ViewerFrameBuffer,
+) {
+    let pointer = rect.center();
+    match command {
+        ZoomCommand::In => {
+            zoom_about_pointer(viewer, rect, pointer, 1.2, frame.width, frame.height)
+        }
+        ZoomCommand::Out => {
+            zoom_about_pointer(viewer, rect, pointer, 1.0 / 1.2, frame.width, frame.height)
+        }
+        ZoomCommand::Original | ZoomCommand::ScaleToFit => {
+            fit_to_rect(viewer, rect, frame.width, frame.height);
+        }
+        ZoomCommand::View100 => {
+            viewer
+                .transform
+                .zoom_view_100(rect, frame.width, frame.height);
+            viewer.zoom = viewer.transform.magnification;
+        }
+        ZoomCommand::ToSelection => {
+            if let Some(roi) = viewer.rois.active_roi.as_ref() {
+                if let Some(bounds) = roi_bounds(&roi.kind) {
+                    let mut src_rect = interaction::transform::SourceRect {
+                        x: bounds.min.x,
+                        y: bounds.min.y,
+                        width: bounds.width().max(1.0),
+                        height: bounds.height().max(1.0),
+                    };
+                    src_rect.clamp_to_image(frame.width, frame.height);
+                    viewer.transform.src_rect = src_rect;
+                    viewer.transform.magnification = (rect.width() / src_rect.width)
+                        .min(rect.height() / src_rect.height)
+                        .clamp(
+                            interaction::transform::MIN_MAGNIFICATION,
+                            interaction::transform::MAX_MAGNIFICATION,
+                        );
+                    viewer.zoom = viewer.transform.magnification;
+                }
+            }
+        }
+        ZoomCommand::Set => {}
+        ZoomCommand::Maximize => {
+            let src_rect = interaction::transform::SourceRect {
+                x: viewer.transform.src_rect.x,
+                y: viewer.transform.src_rect.y,
+                width: (viewer.transform.src_rect.width * 0.5).max(1.0),
+                height: (viewer.transform.src_rect.height * 0.5).max(1.0),
+            };
+            let mut src_rect = src_rect;
+            src_rect.clamp_to_image(frame.width, frame.height);
+            viewer.transform.src_rect = src_rect;
+            viewer.transform.magnification = (rect.width() / src_rect.width)
+                .min(rect.height() / src_rect.height)
+                .clamp(
+                    interaction::transform::MIN_MAGNIFICATION,
+                    interaction::transform::MAX_MAGNIFICATION,
+                );
+            viewer.zoom = viewer.transform.magnification;
+        }
+    }
+}
+
+fn roi_bounds(kind: &RoiKind) -> Option<egui::Rect> {
+    match kind {
+        RoiKind::Rect { start, end, .. }
+        | RoiKind::Oval { start, end, .. }
+        | RoiKind::Line { start, end, .. } => Some(egui::Rect::from_two_pos(*start, *end)),
+        RoiKind::Angle { a, b, c } => {
+            let min_x = a.x.min(b.x).min(c.x);
+            let min_y = a.y.min(b.y).min(c.y);
+            let max_x = a.x.max(b.x).max(c.x);
+            let max_y = a.y.max(b.y).max(c.y);
+            Some(egui::Rect::from_min_max(
+                egui::pos2(min_x, min_y),
+                egui::pos2(max_x, max_y),
+            ))
+        }
+        RoiKind::Polygon { points, .. }
+        | RoiKind::Freehand { points }
+        | RoiKind::WandTrace { points } => {
+            let first = points.first()?;
+            let mut min_x = first.x;
+            let mut min_y = first.y;
+            let mut max_x = first.x;
+            let mut max_y = first.y;
+            for point in points.iter().skip(1) {
+                min_x = min_x.min(point.x);
+                min_y = min_y.min(point.y);
+                max_x = max_x.max(point.x);
+                max_y = max_y.max(point.y);
+            }
+            Some(egui::Rect::from_min_max(
+                egui::pos2(min_x, min_y),
+                egui::pos2(max_x, max_y),
+            ))
+        }
+        RoiKind::Point { points, .. } => {
+            let first = points.first()?;
+            Some(egui::Rect::from_center_size(*first, egui::vec2(1.0, 1.0)))
+        }
+        RoiKind::Text { at, .. } => Some(egui::Rect::from_center_size(*at, egui::vec2(1.0, 1.0))),
+    }
+}
+
+fn drag_roi_for_tool(
+    tool: ToolId,
+    options: &ToolOptionsState,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    active_polygon_points: &mut Vec<egui::Pos2>,
+) -> RoiKind {
+    match tool {
+        ToolId::Rect => RoiKind::Rect {
+            start,
+            end,
+            rounded: options.rect_mode == RectMode::Rounded,
+            rotated: options.rect_mode == RectMode::Rotated,
+        },
+        ToolId::Oval => RoiKind::Oval {
+            start,
+            end,
+            ellipse: options.oval_mode == OvalMode::Ellipse,
+            brush: options.oval_mode == OvalMode::Brush,
+        },
+        ToolId::Line => {
+            if options.line_mode == LineMode::Freehand {
+                if active_polygon_points.is_empty() {
+                    active_polygon_points.push(start);
+                }
+                active_polygon_points.push(end);
+                RoiKind::Freehand {
+                    points: active_polygon_points.clone(),
+                }
+            } else {
+                RoiKind::Line {
+                    start,
+                    end,
+                    arrow: options.line_mode == LineMode::Arrow,
+                }
+            }
+        }
+        ToolId::Free => {
+            if active_polygon_points.is_empty() {
+                active_polygon_points.push(start);
+            }
+            active_polygon_points.push(end);
+            RoiKind::Freehand {
+                points: active_polygon_points.clone(),
+            }
+        }
+        _ => RoiKind::Rect {
+            start,
+            end,
+            rounded: false,
+            rotated: false,
+        },
+    }
+}
+
+fn draw_rois(
+    painter: &egui::Painter,
+    viewer: &ViewerUiState,
+    canvas_rect: egui::Rect,
+    position: interaction::roi::RoiPosition,
+) {
+    for roi in viewer.rois.visible_rois(position) {
+        let selected = viewer.rois.selected_roi_id == Some(roi.id);
+        let stroke = if selected {
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 212, 26))
+        } else {
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(52, 212, 255))
+        };
+
+        match &roi.kind {
+            RoiKind::Rect { start, end, .. } => {
+                let rect = egui::Rect::from_two_pos(
+                    viewer.transform.image_to_screen(canvas_rect, *start),
+                    viewer.transform.image_to_screen(canvas_rect, *end),
+                );
+                painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Outside);
+            }
+            RoiKind::Oval { start, end, .. } => {
+                let rect = egui::Rect::from_two_pos(
+                    viewer.transform.image_to_screen(canvas_rect, *start),
+                    viewer.transform.image_to_screen(canvas_rect, *end),
+                );
+                painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.5, stroke);
+            }
+            RoiKind::Line { start, end, arrow } => {
+                let p1 = viewer.transform.image_to_screen(canvas_rect, *start);
+                let p2 = viewer.transform.image_to_screen(canvas_rect, *end);
+                painter.line_segment([p1, p2], stroke);
+                if *arrow {
+                    let direction = (p1 - p2).normalized();
+                    let left = egui::vec2(-direction.y, direction.x);
+                    painter.line_segment([p2, p2 + (direction + left) * 8.0], stroke);
+                    painter.line_segment([p2, p2 + (direction - left) * 8.0], stroke);
+                }
+            }
+            RoiKind::Polygon { points, closed } => {
+                let mut line_points = points
+                    .iter()
+                    .map(|point| viewer.transform.image_to_screen(canvas_rect, *point))
+                    .collect::<Vec<_>>();
+                if *closed && line_points.len() > 2 {
+                    line_points.push(line_points[0]);
+                }
+                painter.add(egui::Shape::line(line_points, stroke));
+            }
+            RoiKind::Freehand { points } | RoiKind::WandTrace { points } => {
+                let line_points = points
+                    .iter()
+                    .map(|point| viewer.transform.image_to_screen(canvas_rect, *point))
+                    .collect::<Vec<_>>();
+                painter.add(egui::Shape::line(line_points, stroke));
+            }
+            RoiKind::Angle { a, b, c } => {
+                let pa = viewer.transform.image_to_screen(canvas_rect, *a);
+                let pb = viewer.transform.image_to_screen(canvas_rect, *b);
+                let pc = viewer.transform.image_to_screen(canvas_rect, *c);
+                painter.line_segment([pa, pb], stroke);
+                painter.line_segment([pb, pc], stroke);
+            }
+            RoiKind::Point { points, .. } => {
+                for point in points {
+                    let center = viewer.transform.image_to_screen(canvas_rect, *point);
+                    painter.circle_stroke(center, 4.0, stroke);
+                }
+            }
+            RoiKind::Text { at, text } => {
+                let point = viewer.transform.image_to_screen(canvas_rect, *at);
+                painter.text(
+                    point,
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    egui::FontId::proportional(14.0),
+                    stroke.color,
+                );
+            }
+        }
+    }
 }
 
 fn compute_viewer_frame(
@@ -2463,20 +3389,9 @@ fn to_color_image(frame: &ViewerFrameBuffer) -> egui::ColorImage {
 }
 
 fn fit_to_rect(viewer: &mut ViewerUiState, rect: egui::Rect, width: usize, height: usize) {
-    let image_width = width as f32;
-    let image_height = height as f32;
-    if image_width <= 0.0 || image_height <= 0.0 {
-        return;
-    }
-
-    let zoom = (rect.width() / image_width)
-        .min(rect.height() / image_height)
-        .clamp(0.1, 64.0);
-    let pan_x = (rect.width() - image_width * zoom) * 0.5;
-    let pan_y = (rect.height() - image_height * zoom) * 0.5;
-
-    viewer.zoom = zoom;
-    viewer.pan = egui::vec2(pan_x, pan_y);
+    viewer.transform.fit_to_canvas(rect, width, height);
+    viewer.zoom = viewer.transform.magnification;
+    viewer.pan = egui::Vec2::ZERO;
 }
 
 fn ui_close_requested(ctx: &egui::Context) -> bool {
@@ -2612,6 +3527,10 @@ mod tests {
             tool_from_command_id("launcher.tool.point"),
             Some(ToolId::Point)
         );
+        assert_eq!(
+            tool_from_command_id("launcher.tool.angle"),
+            Some(ToolId::Angle)
+        );
         assert_eq!(tool_from_command_id("launcher.tool.unknown"), None);
     }
 
@@ -2620,6 +3539,7 @@ mod tests {
         assert_eq!(tool_shortcut_command("r"), Some("launcher.tool.rect"));
         assert_eq!(tool_shortcut_command("R"), Some("launcher.tool.rect"));
         assert_eq!(tool_shortcut_command("h"), Some("launcher.tool.hand"));
+        assert_eq!(tool_shortcut_command("a"), Some("launcher.tool.angle"));
         assert_eq!(tool_shortcut_command("."), Some("launcher.tool.point"));
         assert_eq!(tool_shortcut_command("?"), None);
     }
