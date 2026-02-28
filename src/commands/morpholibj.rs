@@ -274,4 +274,3 @@ mod tests {
         assert!(output.dataset.data[IxDyn(&[1, 1])] >= 1.0);
     }
 }
-

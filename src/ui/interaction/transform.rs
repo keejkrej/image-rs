@@ -356,4 +356,3 @@ mod tests {
         assert!(state.src_rect.height < 512.0);
     }
 }
-

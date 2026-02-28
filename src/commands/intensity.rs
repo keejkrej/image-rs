@@ -111,4 +111,3 @@ impl Operation for IntensityWindowOp {
         Ok(OpOutput::dataset_only(output_dataset))
     }
 }
-

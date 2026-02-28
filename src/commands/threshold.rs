@@ -124,4 +124,3 @@ fn otsu_threshold(values: &[f32]) -> f32 {
 
     (best_threshold as f32 / 255.0) * span + min
 }
-

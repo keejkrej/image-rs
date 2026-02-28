@@ -39,7 +39,9 @@ fn frame_to_dataset(frame: &thunderstorm_rs::Frame2D, metadata: &Metadata) -> Re
 fn to_measurements(output: &thunderstorm_rs::OpOutput) -> MeasurementTable {
     let mut table = MeasurementTable::default();
     for (key, value) in &output.measurements {
-        table.values.insert(format!("thunderstorm.{key}"), value.clone());
+        table
+            .values
+            .insert(format!("thunderstorm.{key}"), value.clone());
     }
     table.values.insert(
         "thunderstorm.detection_count".to_string(),
@@ -49,9 +51,10 @@ fn to_measurements(output: &thunderstorm_rs::OpOutput) -> MeasurementTable {
         "thunderstorm.localization_count".to_string(),
         json!(output.molecules.len()),
     );
-    table
-        .values
-        .insert("thunderstorm.detections".to_string(), json!(&output.detections));
+    table.values.insert(
+        "thunderstorm.detections".to_string(),
+        json!(&output.detections),
+    );
     table.values.insert(
         "thunderstorm.localizations".to_string(),
         json!(&output.molecules),
@@ -61,7 +64,8 @@ fn to_measurements(output: &thunderstorm_rs::OpOutput) -> MeasurementTable {
 
 fn execute_thunderstorm(op_name: &str, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
     let frame = dataset_to_frame(dataset)?;
-    let output = thunderstorm_rs::execute_operation(op_name, &frame, params).map_err(map_ts_error)?;
+    let output =
+        thunderstorm_rs::execute_operation(op_name, &frame, params).map_err(map_ts_error)?;
     let dataset = frame_to_dataset(&output.frame, &dataset.metadata)?;
     let measurements = to_measurements(&output);
     Ok(OpOutput {
@@ -214,4 +218,3 @@ impl Operation for ThunderstormPipelineLocalizeOp {
         execute_thunderstorm(self.name(), dataset, params)
     }
 }
-

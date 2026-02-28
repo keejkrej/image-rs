@@ -236,4 +236,3 @@ pub fn tool_shortcut_tool(text: &str) -> Option<ToolId> {
         _ => None,
     }
 }
-

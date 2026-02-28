@@ -70,4 +70,3 @@ pub(crate) fn neighborhood_offsets(
     );
     offsets
 }
-

@@ -183,4 +183,3 @@ impl RoiStore {
         Some(text)
     }
 }
-

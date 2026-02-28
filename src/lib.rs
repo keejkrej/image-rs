@@ -9,4 +9,3 @@ pub mod workflow;
 pub fn run_cli() -> Result<(), String> {
     cli::run_cli()
 }
-

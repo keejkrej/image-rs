@@ -47,4 +47,3 @@ pub struct CanvasEvent {
     pub pointer_image: Option<egui::Pos2>,
     pub modifiers: CanvasModifiers,
 }
-

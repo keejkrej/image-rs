@@ -177,4 +177,3 @@ impl Operation for MorphologyCloseOp {
         Ok(OpOutput::dataset_only(output_dataset))
     }
 }
-

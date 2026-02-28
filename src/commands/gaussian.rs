@@ -140,4 +140,3 @@ fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     }
     strides
 }
-
