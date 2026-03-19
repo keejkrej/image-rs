@@ -19,7 +19,7 @@ use super::interaction::tooling::{
     LineMode, OvalMode, PointMode, RectMode, ToolId, ToolOptionsState, ToolState,
 };
 use super::interaction::transform::{ViewerTransformState, zoom_level_down, zoom_level_up};
-use crate::formats::supported_formats;
+use crate::formats::{NativeRasterImage, supported_formats};
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
 use crate::runtime::AppContext;
 use eframe::egui;
@@ -66,6 +66,24 @@ struct UiState {
     next_job_id: u64,
 }
 
+#[derive(Debug, Clone)]
+enum ViewerImageSource {
+    Native(Arc<NativeRasterImage>),
+    Dataset(Arc<DatasetF32>),
+}
+
+impl ViewerImageSource {
+    fn to_dataset(&self) -> Result<Arc<DatasetF32>, String> {
+        match self {
+            Self::Native(image) => image
+                .to_dataset()
+                .map(Arc::new)
+                .map_err(|error: crate::formats::IoError| error.to_string()),
+            Self::Dataset(dataset) => Ok(dataset.clone()),
+        }
+    }
+}
+
 impl UiState {
     fn new(startup_input: Option<PathBuf>) -> Self {
         Self {
@@ -93,8 +111,8 @@ impl UiState {
 #[derive(Debug, Clone)]
 struct ViewerSession {
     path: PathBuf,
-    base_dataset: Arc<DatasetF32>,
-    committed_dataset: Arc<DatasetF32>,
+    base_source: ViewerImageSource,
+    committed_source: ViewerImageSource,
     committed_summary: ImageSummary,
     undo_stack: Vec<Arc<DatasetF32>>,
     redo_stack: Vec<Arc<DatasetF32>>,
@@ -106,12 +124,12 @@ struct ViewerSession {
 }
 
 impl ViewerSession {
-    fn new(path: PathBuf, dataset: Arc<DatasetF32>) -> Self {
-        let committed_summary = summarize_dataset(dataset.as_ref(), &path);
+    fn new(path: PathBuf, source: ViewerImageSource) -> Self {
+        let committed_summary = summarize_source(&source, &path);
         Self {
             path,
-            base_dataset: dataset.clone(),
-            committed_dataset: dataset,
+            base_source: source.clone(),
+            committed_source: source,
             committed_summary,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -131,13 +149,17 @@ impl ViewerSession {
         }
     }
 
-    fn dataset_for_source(&self, source_kind: &str) -> Option<Arc<DatasetF32>> {
+    fn source_for_kind(&self, source_kind: &str) -> Option<ViewerImageSource> {
         if source_kind == SOURCE_COMMITTED {
-            return Some(self.committed_dataset.clone());
+            return Some(self.committed_source.clone());
         }
 
         if let Some(key) = source_kind.strip_prefix(SOURCE_PREVIEW_PREFIX) {
-            return self.preview_cache.get(key).cloned();
+            return self
+                .preview_cache
+                .get(key)
+                .cloned()
+                .map(ViewerImageSource::Dataset);
         }
 
         None
@@ -148,15 +170,36 @@ impl ViewerSession {
         self.frame_cache.clear();
     }
 
+    fn committed_dataset(&self) -> Option<Arc<DatasetF32>> {
+        match &self.committed_source {
+            ViewerImageSource::Native(_) => None,
+            ViewerImageSource::Dataset(dataset) => Some(dataset.clone()),
+        }
+    }
+
+    fn committed_source(&self) -> ViewerImageSource {
+        self.committed_source.clone()
+    }
+
+    fn ensure_committed_dataset(&mut self) -> Result<Arc<DatasetF32>, String> {
+        let dataset = self.committed_source.to_dataset()?;
+        self.committed_source = ViewerImageSource::Dataset(dataset.clone());
+        self.committed_summary = summarize_source(&self.committed_source, &self.path);
+        self.frame_cache.clear();
+        Ok(dataset)
+    }
+
     fn commit_dataset(&mut self, dataset: Arc<DatasetF32>) {
-        self.undo_stack.push(self.committed_dataset.clone());
+        if let Some(current) = self.committed_dataset() {
+            self.undo_stack.push(current);
+        }
         self.redo_stack.clear();
         self.replace_committed_dataset(dataset);
     }
 
     fn replace_committed_dataset(&mut self, dataset: Arc<DatasetF32>) {
-        self.committed_summary = summarize_dataset(dataset.as_ref(), &self.path);
-        self.committed_dataset = dataset;
+        self.committed_source = ViewerImageSource::Dataset(dataset);
+        self.committed_summary = summarize_source(&self.committed_source, &self.path);
         self.active_preview = None;
         self.preview_cache.clear();
         self.frame_cache.clear();
@@ -174,7 +217,9 @@ impl ViewerSession {
         let Some(previous) = self.undo_stack.pop() else {
             return false;
         };
-        self.redo_stack.push(self.committed_dataset.clone());
+        if let Some(current) = self.committed_dataset() {
+            self.redo_stack.push(current);
+        }
         self.replace_committed_dataset(previous);
         true
     }
@@ -183,20 +228,30 @@ impl ViewerSession {
         let Some(next) = self.redo_stack.pop() else {
             return false;
         };
-        self.undo_stack.push(self.committed_dataset.clone());
+        if let Some(current) = self.committed_dataset() {
+            self.undo_stack.push(current);
+        }
         self.replace_committed_dataset(next);
         true
     }
 
     fn revert_to_base(&mut self) -> bool {
-        if Arc::ptr_eq(&self.committed_dataset, &self.base_dataset) {
-            self.replace_committed_dataset(self.base_dataset.clone());
+        if source_ptr_eq(&self.committed_source, &self.base_source) {
+            self.committed_source = self.base_source.clone();
+            self.committed_summary = summarize_source(&self.committed_source, &self.path);
+            self.active_preview = None;
+            self.preview_cache.clear();
+            self.frame_cache.clear();
             self.undo_stack.clear();
             self.redo_stack.clear();
             return false;
         }
 
-        self.replace_committed_dataset(self.base_dataset.clone());
+        self.committed_source = self.base_source.clone();
+        self.committed_summary = summarize_source(&self.committed_source, &self.path);
+        self.active_preview = None;
+        self.preview_cache.clear();
+        self.frame_cache.clear();
         self.redo_stack.clear();
         self.undo_stack.clear();
         true
@@ -204,10 +259,10 @@ impl ViewerSession {
 
     fn mark_saved(&mut self, path: PathBuf) {
         self.path = path;
-        self.base_dataset = self.committed_dataset.clone();
+        self.base_source = self.committed_source.clone();
         self.undo_stack.clear();
         self.redo_stack.clear();
-        self.committed_summary = summarize_dataset(self.committed_dataset.as_ref(), &self.path);
+        self.committed_summary = summarize_source(&self.committed_source, &self.path);
     }
 
     fn is_active_job(&self, job_id: u64, generation: u64) -> bool {
@@ -653,7 +708,7 @@ fn should_request_periodic_repaint(inputs: RepaintDecisionInputs) -> bool {
 }
 
 impl ImageUiApp {
-    fn new(cc: &eframe::CreationContext<'_>, startup_input: Option<PathBuf>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, startup_input: Option<PathBuf>) -> Self {
         let menus: Vec<MenuManifestTopLevel> =
             serde_json::from_str(include_str!("menu/imagej-menu-manifest.json"))
                 .expect("failed to parse menu manifest");
@@ -673,7 +728,7 @@ impl ImageUiApp {
             },
             tool_state: ToolState::default(),
             tool_options: ToolOptionsState::default(),
-            toolbar_icons: load_toolbar_icons(&cc.egui_ctx),
+            toolbar_icons: HashMap::new(),
             viewers_ui: HashMap::new(),
             viewer_telemetry: HashMap::new(),
             viewport_positions: HashMap::new(),
@@ -877,18 +932,29 @@ impl ImageUiApp {
             self.remove_stale_mapping(&normalized_path, &label);
         }
 
-        let dataset = self
+        let source = if let Some(native) = self
             .state
             .app
             .io_service()
-            .read(&normalized_path)
-            .map_err(|error| error.to_string())?;
-        let label = self.create_viewer(normalized_path.clone(), Arc::new(dataset));
+            .read_native(&normalized_path)
+            .map_err(|error: crate::runtime::AppError| error.to_string())?
+        {
+            ViewerImageSource::Native(Arc::new(native))
+        } else {
+            let dataset = self
+                .state
+                .app
+                .io_service()
+                .read(&normalized_path)
+                .map_err(|error| error.to_string())?;
+            ViewerImageSource::Dataset(Arc::new(dataset))
+        };
+        let label = self.create_viewer(normalized_path.clone(), source);
         Ok(OpenOutcome::Opened { label })
     }
 
-    fn create_viewer(&mut self, path: PathBuf, dataset: Arc<DatasetF32>) -> String {
-        let session = ViewerSession::new(path.clone(), dataset);
+    fn create_viewer(&mut self, path: PathBuf, source: ViewerImageSource) -> String {
+        let session = ViewerSession::new(path.clone(), source);
         let id = self.state.next_window_id();
         let label = format!("{VIEWER_PREFIX}{id}");
         let title = format!(
@@ -961,10 +1027,10 @@ impl ImageUiApp {
             .label_to_session
             .get(window_label)
             .ok_or_else(|| format!("no viewer session for `{window_label}`"))?;
-        let dataset = session
-            .dataset_for_source(&session.current_source_kind())
+        let source = session
+            .source_for_kind(&session.current_source_kind())
             .ok_or_else(|| format!("no dataset found for `{window_label}`"))?;
-        extract_slice(dataset.as_ref(), request.z, request.t, request.channel)
+        extract_slice_from_source(&source, request.z, request.t, request.channel)
     }
 
     fn save_viewer(&mut self, window_label: &str, path: Option<PathBuf>) -> Result<String, String> {
@@ -987,18 +1053,40 @@ impl ImageUiApp {
                 normalized_target.display()
             ));
         }
-        let dataset = self
+        let source = self
             .state
             .label_to_session
             .get(window_label)
-            .map(|session| session.committed_dataset.clone())
+            .map(ViewerSession::committed_source)
             .ok_or_else(|| format!("no viewer session for `{window_label}`"))?;
 
-        self.state
-            .app
-            .io_service()
-            .write(&normalized_target, dataset.as_ref())
-            .map_err(|error| error.to_string())?;
+        match &source {
+            ViewerImageSource::Native(image) => {
+                if self
+                    .state
+                    .app
+                    .io_service()
+                    .write_native(&normalized_target, image.as_ref())
+                    .is_err()
+                {
+                    let dataset = image
+                        .to_dataset()
+                        .map_err(|error: crate::formats::IoError| error.to_string())?;
+                    self.state
+                        .app
+                        .io_service()
+                        .write(&normalized_target, &dataset)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            ViewerImageSource::Dataset(dataset) => {
+                self.state
+                    .app
+                    .io_service()
+                    .write(&normalized_target, dataset.as_ref())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
 
         if normalized_target != current_path {
             self.state.path_to_label.remove(&current_path);
@@ -1075,7 +1163,7 @@ impl ImageUiApp {
             "Untitled-{}.tif",
             self.state.next_window_id + 1
         )));
-        let label = self.create_viewer(path, Arc::new(dataset));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
         Ok(format!("created new image in {label}"))
     }
 
@@ -1147,7 +1235,7 @@ impl ImageUiApp {
             .and_then(|name| name.to_str())
             .unwrap_or("sequence");
         let virtual_path = normalize_path(&PathBuf::from(format!("{first_name}-sequence.tif")));
-        self.create_viewer(virtual_path, Arc::new(dataset));
+        self.create_viewer(virtual_path, ViewerImageSource::Dataset(Arc::new(dataset)));
         Ok("image sequence imported".to_string())
     }
 
@@ -1176,7 +1264,7 @@ impl ImageUiApp {
             normalize_path(&PathBuf::from(
                 url.rsplit('/').next().unwrap_or("downloaded-image.tif"),
             )),
-            Arc::new(dataset),
+            ViewerImageSource::Dataset(Arc::new(dataset)),
         );
         Ok("image imported from URL".to_string())
     }
@@ -1202,7 +1290,10 @@ impl ImageUiApp {
             Ok(dataset) => dataset,
             Err(error) => return error.to_string(),
         };
-        self.create_viewer(normalize_path(&path), Arc::new(dataset));
+        self.create_viewer(
+            normalize_path(&path),
+            ViewerImageSource::Dataset(Arc::new(dataset)),
+        );
         self.raw_import_dialog.open = false;
         "raw image imported".to_string()
     }
@@ -1557,9 +1648,9 @@ impl ImageUiApp {
         let session = self
             .state
             .label_to_session
-            .get(viewer_label)
+            .get_mut(viewer_label)
             .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
-        let mut dataset = (*session.committed_dataset).clone();
+        let mut dataset = (*session.ensure_committed_dataset()?).clone();
         let x_axis = dataset.axis_index(AxisKind::X).unwrap_or(1);
         let y_axis = dataset.axis_index(AxisKind::Y).unwrap_or(0);
         let z_axis = dataset.axis_index(AxisKind::Z);
@@ -2226,34 +2317,16 @@ impl ImageUiApp {
             }
             "image.adjust.size" => {
                 if let Some(session) = self.state.label_to_session.get(window_label) {
-                    let shape = session.committed_dataset.shape();
-                    let y_axis = session
-                        .committed_dataset
-                        .axis_index(AxisKind::Y)
-                        .unwrap_or(0);
-                    let x_axis = session
-                        .committed_dataset
-                        .axis_index(AxisKind::X)
-                        .unwrap_or(1);
-                    self.resize_dialog.width = shape[x_axis];
-                    self.resize_dialog.height = shape[y_axis];
+                    self.resize_dialog.width = session.committed_summary.shape[1];
+                    self.resize_dialog.height = session.committed_summary.shape[0];
                 }
                 self.resize_dialog.open = true;
                 command_registry::CommandExecuteResult::ok("resize dialog opened")
             }
             "image.adjust.canvas" => {
                 if let Some(session) = self.state.label_to_session.get(window_label) {
-                    let shape = session.committed_dataset.shape();
-                    let y_axis = session
-                        .committed_dataset
-                        .axis_index(AxisKind::Y)
-                        .unwrap_or(0);
-                    let x_axis = session
-                        .committed_dataset
-                        .axis_index(AxisKind::X)
-                        .unwrap_or(1);
-                    self.canvas_dialog.width = shape[x_axis];
-                    self.canvas_dialog.height = shape[y_axis];
+                    self.canvas_dialog.width = session.committed_summary.shape[1];
+                    self.canvas_dialog.height = session.committed_summary.shape[0];
                 }
                 self.canvas_dialog.open = true;
                 command_registry::CommandExecuteResult::ok("canvas size dialog opened")
@@ -2489,7 +2562,7 @@ impl ImageUiApp {
                 mode: request.mode.clone(),
                 op: request.op.clone(),
             });
-            (session.committed_dataset.clone(), generation)
+            (session.ensure_committed_dataset()?, generation)
         };
 
         if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
@@ -2597,7 +2670,7 @@ impl ImageUiApp {
                 "edit.undo" => return session.can_undo(),
                 "edit.redo" => return session.can_redo(),
                 "file.revert" => {
-                    return !Arc::ptr_eq(&session.committed_dataset, &session.base_dataset);
+                    return !source_ptr_eq(&session.committed_source, &session.base_source);
                 }
                 _ => {}
             }
@@ -2719,10 +2792,7 @@ impl ImageUiApp {
             }
 
             let enabled = self.command_is_enabled(LAUNCHER_LABEL, item.command_id, true);
-            let icon_texture = self
-                .toolbar_icons
-                .get(&item.icon)
-                .expect("toolbar icon should be preloaded");
+            let icon_texture = self.toolbar_texture(ui.ctx(), item.icon).clone();
             let icon = egui::Image::new((icon_texture.id(), icon_texture.size_vec2()))
                 .fit_to_exact_size(egui::vec2(16.0, 16.0))
                 .tint(if enabled {
@@ -2927,6 +2997,28 @@ impl ImageUiApp {
                 _ => {}
             });
         }
+    }
+
+    fn toolbar_texture(&mut self, ctx: &egui::Context, icon: ToolbarIcon) -> &egui::TextureHandle {
+        self.toolbar_icons.entry(icon).or_insert_with(|| {
+            let (name, bytes) = toolbar_icon_asset(icon);
+            let decoded = load_from_memory(bytes)
+                .map(|image| image.to_rgba8())
+                .ok()
+                .map(|rgba| {
+                    egui::ColorImage::from_rgba_unmultiplied(
+                        [rgba.width() as usize, rgba.height() as usize],
+                        rgba.as_raw(),
+                    )
+                })
+                .unwrap_or_else(|| egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]));
+
+            ctx.load_texture(
+                format!("toolbar-icon-{name}"),
+                decoded,
+                egui::TextureOptions::LINEAR,
+            )
+        })
     }
 
     fn draw_viewer_toolbar(&self, ui: &mut egui::Ui, label: &str, actions: &mut Vec<UiAction>) {
@@ -4159,6 +4251,7 @@ struct ViewerToolbarItem {
     glyph: &'static str,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ToolbarIcon {
     Rect,
@@ -4267,132 +4360,44 @@ fn viewer_toolbar_items() -> &'static [ViewerToolbarItem] {
     ITEMS
 }
 
-fn load_toolbar_icons(ctx: &egui::Context) -> HashMap<ToolbarIcon, egui::TextureHandle> {
-    let specs = [
-        (
-            ToolbarIcon::Rect,
-            "rect",
-            include_bytes!("assets/tools/rect.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Oval,
-            "oval",
-            include_bytes!("assets/tools/oval.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Poly,
-            "poly",
-            include_bytes!("assets/tools/poly.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Free,
-            "free",
-            include_bytes!("assets/tools/free.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Line,
-            "line",
-            include_bytes!("assets/tools/line.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Angle,
-            "angle",
-            include_bytes!("assets/tools/line.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Point,
-            "point",
-            include_bytes!("assets/tools/point.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Wand,
-            "wand",
-            include_bytes!("assets/tools/wand.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Text,
-            "text",
-            include_bytes!("assets/tools/text.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Open,
-            "open",
-            include_bytes!("assets/tools/open.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Zoom,
-            "zoom",
-            include_bytes!("assets/tools/zoom.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Hand,
-            "hand",
-            include_bytes!("assets/tools/hand.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Dropper,
+fn toolbar_icon_asset(icon: ToolbarIcon) -> (&'static str, &'static [u8]) {
+    match icon {
+        ToolbarIcon::Rect => ("rect", include_bytes!("assets/tools/rect.png").as_slice()),
+        ToolbarIcon::Oval => ("oval", include_bytes!("assets/tools/oval.png").as_slice()),
+        ToolbarIcon::Poly => ("poly", include_bytes!("assets/tools/poly.png").as_slice()),
+        ToolbarIcon::Free => ("free", include_bytes!("assets/tools/free.png").as_slice()),
+        ToolbarIcon::Line => ("line", include_bytes!("assets/tools/line.png").as_slice()),
+        ToolbarIcon::Angle => ("angle", include_bytes!("assets/tools/line.png").as_slice()),
+        ToolbarIcon::Point => ("point", include_bytes!("assets/tools/point.png").as_slice()),
+        ToolbarIcon::Wand => ("wand", include_bytes!("assets/tools/wand.png").as_slice()),
+        ToolbarIcon::Text => ("text", include_bytes!("assets/tools/text.png").as_slice()),
+        ToolbarIcon::Open => ("open", include_bytes!("assets/tools/open.png").as_slice()),
+        ToolbarIcon::Zoom => ("zoom", include_bytes!("assets/tools/zoom.png").as_slice()),
+        ToolbarIcon::Hand => ("hand", include_bytes!("assets/tools/hand.png").as_slice()),
+        ToolbarIcon::Dropper => (
             "dropper",
             include_bytes!("assets/tools/dropper.png").as_slice(),
         ),
-        (
-            ToolbarIcon::Previous,
+        ToolbarIcon::Previous => (
             "previous",
             include_bytes!("assets/tools/previous.png").as_slice(),
         ),
-        (
-            ToolbarIcon::Next,
-            "next",
-            include_bytes!("assets/tools/next.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Quit,
-            "quit",
-            include_bytes!("assets/tools/quit.png").as_slice(),
-        ),
-        (
-            ToolbarIcon::Custom1,
+        ToolbarIcon::Next => ("next", include_bytes!("assets/tools/next.png").as_slice()),
+        ToolbarIcon::Quit => ("quit", include_bytes!("assets/tools/quit.png").as_slice()),
+        ToolbarIcon::Custom1 => (
             "custom1",
             include_bytes!("assets/tools/custom1.png").as_slice(),
         ),
-        (
-            ToolbarIcon::Custom2,
+        ToolbarIcon::Custom2 => (
             "custom2",
             include_bytes!("assets/tools/custom2.png").as_slice(),
         ),
-        (
-            ToolbarIcon::Custom3,
+        ToolbarIcon::Custom3 => (
             "custom3",
             include_bytes!("assets/tools/custom3.png").as_slice(),
         ),
-        (
-            ToolbarIcon::More,
-            "more",
-            include_bytes!("assets/tools/more.png").as_slice(),
-        ),
-    ];
-
-    let mut icons = HashMap::with_capacity(specs.len());
-    for (icon, name, bytes) in specs {
-        let decoded = load_from_memory(bytes)
-            .map(|image| image.to_rgba8())
-            .ok()
-            .map(|rgba| {
-                egui::ColorImage::from_rgba_unmultiplied(
-                    [rgba.width() as usize, rgba.height() as usize],
-                    rgba.as_raw(),
-                )
-            })
-            .unwrap_or_else(|| egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]));
-
-        let texture = ctx.load_texture(
-            format!("toolbar-icon-{name}"),
-            decoded,
-            egui::TextureOptions::LINEAR,
-        );
-        icons.insert(icon, texture);
+        ToolbarIcon::More => ("more", include_bytes!("assets/tools/more.png").as_slice()),
     }
-
-    icons
 }
 
 fn tool_from_command_id(command_id: &str) -> Option<ToolId> {
@@ -4783,7 +4788,7 @@ fn compute_viewer_frame(
     request: &ViewerFrameRequest,
     preview_override: Option<&PreviewRequest>,
 ) -> Result<Arc<ViewerFrameBuffer>, String> {
-    let (source_kind, dataset) = dataset_for_window(state, window_label, preview_override)?;
+    let (source_kind, source) = source_for_window(state, window_label, preview_override)?;
     let frame_key = FrameKey {
         source_kind: source_kind.clone(),
         z: request.z,
@@ -4799,7 +4804,7 @@ fn compute_viewer_frame(
         return Ok(frame);
     }
 
-    let frame = Arc::new(build_frame(dataset.as_ref(), request)?);
+    let frame = Arc::new(build_frame(&source, request)?);
 
     if let Some(session) = state.label_to_session.get_mut(window_label) {
         let can_store = preview_override.is_some() || session.current_source_kind() == source_kind;
@@ -4811,14 +4816,17 @@ fn compute_viewer_frame(
     Ok(frame)
 }
 
-fn dataset_for_window(
+fn source_for_window(
     state: &mut UiState,
     window_label: &str,
     preview_override: Option<&PreviewRequest>,
-) -> Result<(String, Arc<DatasetF32>), String> {
+) -> Result<(String, ViewerImageSource), String> {
     if let Some(preview) = preview_override {
         let (preview_key, dataset) = ensure_preview_dataset(state, window_label, preview)?;
-        return Ok((format!("{SOURCE_PREVIEW_PREFIX}{preview_key}"), dataset));
+        return Ok((
+            format!("{SOURCE_PREVIEW_PREFIX}{preview_key}"),
+            ViewerImageSource::Dataset(dataset),
+        ));
     }
 
     let session = state
@@ -4826,11 +4834,11 @@ fn dataset_for_window(
         .get(window_label)
         .ok_or_else(|| format!("no viewer session for `{window_label}`"))?;
     let source_kind = session.current_source_kind();
-    let dataset = session
-        .dataset_for_source(&source_kind)
-        .ok_or_else(|| format!("no dataset found for source `{source_kind}`"))?;
+    let source = session
+        .source_for_kind(&source_kind)
+        .ok_or_else(|| format!("no source found for `{source_kind}`"))?;
 
-    Ok((source_kind, dataset))
+    Ok((source_kind, source))
 }
 
 fn ensure_preview_dataset(
@@ -4850,7 +4858,7 @@ fn ensure_preview_dataset(
             return Ok((key, dataset.clone()));
         }
 
-        session.committed_dataset.clone()
+        session.committed_source.to_dataset()?
     };
 
     let generated = state
@@ -4882,7 +4890,6 @@ fn summary_for_window(
         .get(window_label)
         .ok_or_else(|| format!("no viewer session for `{window_label}`"))?;
 
-    let _baseline_shape = session.base_dataset.shape();
     let summary = session.committed_summary.clone();
     Ok((session.path.clone(), summary))
 }
@@ -5233,6 +5240,16 @@ fn canonical_json(value: &Value) -> Value {
 }
 
 fn build_frame(
+    source: &ViewerImageSource,
+    request: &ViewerFrameRequest,
+) -> Result<ViewerFrameBuffer, String> {
+    match source {
+        ViewerImageSource::Native(image) => build_native_frame(image.as_ref(), request),
+        ViewerImageSource::Dataset(dataset) => build_dataset_frame(dataset.as_ref(), request),
+    }
+}
+
+fn build_dataset_frame(
     dataset: &DatasetF32,
     request: &ViewerFrameRequest,
 ) -> Result<ViewerFrameBuffer, String> {
@@ -5249,25 +5266,121 @@ fn build_frame(
     })
 }
 
+fn build_native_frame(
+    image: &NativeRasterImage,
+    request: &ViewerFrameRequest,
+) -> Result<ViewerFrameBuffer, String> {
+    if request.z > 0 || request.t > 0 {
+        return Err("native rasters expose only a single Z/T plane".to_string());
+    }
+
+    match image {
+        NativeRasterImage::Gray8 {
+            width,
+            height,
+            pixels,
+            ..
+        } => {
+            let (min, max) = image.min_max();
+            Ok(ViewerFrameBuffer {
+                width: *width,
+                height: *height,
+                pixels_u8: pixels.clone(),
+                min,
+                max,
+            })
+        }
+        NativeRasterImage::Gray16 {
+            width,
+            height,
+            pixels,
+            ..
+        } => {
+            let (min, max) = image.min_max();
+            Ok(ViewerFrameBuffer {
+                width: *width,
+                height: *height,
+                pixels_u8: pixels.iter().map(|value| (value / 257) as u8).collect(),
+                min,
+                max,
+            })
+        }
+        NativeRasterImage::Rgb8 {
+            width,
+            height,
+            pixels,
+            ..
+        } => {
+            let channel = request.channel.min(2);
+            let mut pixels_u8 = Vec::with_capacity(width * height);
+            let mut min_sample = u8::MAX;
+            let mut max_sample = u8::MIN;
+            for chunk in pixels.chunks_exact(3) {
+                let sample = chunk[channel];
+                min_sample = min_sample.min(sample);
+                max_sample = max_sample.max(sample);
+                pixels_u8.push(sample);
+            }
+            Ok(ViewerFrameBuffer {
+                width: *width,
+                height: *height,
+                pixels_u8,
+                min: f32::from(min_sample) / 255.0,
+                max: f32::from(max_sample) / 255.0,
+            })
+        }
+    }
+}
+
+fn summarize_source(source: &ViewerImageSource, path: &Path) -> ImageSummary {
+    match source {
+        ViewerImageSource::Native(image) => summarize_native_image(image.as_ref(), path),
+        ViewerImageSource::Dataset(dataset) => summarize_dataset(dataset.as_ref(), path),
+    }
+}
+
 fn summarize_dataset(dataset: &DatasetF32, source: &Path) -> ImageSummary {
     let (min, max) = dataset.min_max().unwrap_or((0.0, 0.0));
-    let channel_axis = dataset.axis_index(AxisKind::Channel);
-    let z_axis = dataset.axis_index(AxisKind::Z);
-    let t_axis = dataset.axis_index(AxisKind::Time);
+    summarize_metadata(dataset.shape(), &dataset.metadata.dims, min, max, source)
+}
+
+fn summarize_native_image(image: &NativeRasterImage, source: &Path) -> ImageSummary {
+    let metadata = image.metadata();
+    let shape = if image.channel_count() > 1 {
+        vec![image.height(), image.width(), image.channel_count()]
+    } else {
+        vec![image.height(), image.width()]
+    };
+    let (min, max) = image.min_max();
+    summarize_metadata(&shape, &metadata.dims, min, max, source)
+}
+
+fn summarize_metadata(
+    shape: &[usize],
+    dims: &[Dim],
+    min: f32,
+    max: f32,
+    source: &Path,
+) -> ImageSummary {
+    let channel_axis = dims
+        .iter()
+        .position(|dimension| dimension.axis == AxisKind::Channel);
+    let z_axis = dims
+        .iter()
+        .position(|dimension| dimension.axis == AxisKind::Z);
+    let t_axis = dims
+        .iter()
+        .position(|dimension| dimension.axis == AxisKind::Time);
 
     ImageSummary {
-        shape: dataset.shape().to_vec(),
-        axes: dataset
-            .metadata
-            .dims
+        shape: shape.to_vec(),
+        axes: dims
             .iter()
             .map(|dimension| format!("{:?}", dimension.axis))
             .collect(),
-        channels: channel_axis
-            .map(|index| dataset.shape()[index])
-            .unwrap_or(1),
-        z_slices: z_axis.map(|index| dataset.shape()[index]).unwrap_or(1),
-        times: t_axis.map(|index| dataset.shape()[index]).unwrap_or(1),
+        channels: channel_axis.map(|index| shape[index]).unwrap_or(1),
+        z_slices: z_axis.map(|index| shape[index]).unwrap_or(1),
+        times: t_axis.map(|index| shape[index]).unwrap_or(1),
         min,
         max,
         source: source.display().to_string(),
@@ -5322,6 +5435,76 @@ fn extract_slice(
         height,
         values,
     })
+}
+
+fn extract_slice_from_source(
+    source: &ViewerImageSource,
+    z: usize,
+    t: usize,
+    channel: usize,
+) -> Result<SliceImage, String> {
+    match source {
+        ViewerImageSource::Native(image) => {
+            extract_slice_from_native(image.as_ref(), z, t, channel)
+        }
+        ViewerImageSource::Dataset(dataset) => extract_slice(dataset.as_ref(), z, t, channel),
+    }
+}
+
+fn extract_slice_from_native(
+    image: &NativeRasterImage,
+    z: usize,
+    t: usize,
+    channel: usize,
+) -> Result<SliceImage, String> {
+    if z > 0 || t > 0 {
+        return Err("native rasters expose only a single Z/T plane".to_string());
+    }
+
+    match image {
+        NativeRasterImage::Gray8 {
+            width,
+            height,
+            pixels,
+            ..
+        } => Ok(SliceImage {
+            width: *width,
+            height: *height,
+            values: pixels
+                .iter()
+                .map(|value| f32::from(*value) / 255.0)
+                .collect(),
+        }),
+        NativeRasterImage::Gray16 {
+            width,
+            height,
+            pixels,
+            ..
+        } => Ok(SliceImage {
+            width: *width,
+            height: *height,
+            values: pixels
+                .iter()
+                .map(|value| f32::from(*value) / 65_535.0)
+                .collect(),
+        }),
+        NativeRasterImage::Rgb8 {
+            width,
+            height,
+            pixels,
+            ..
+        } => {
+            let selected = channel.min(2);
+            Ok(SliceImage {
+                width: *width,
+                height: *height,
+                values: pixels
+                    .chunks_exact(3)
+                    .map(|chunk| f32::from(chunk[selected]) / 255.0)
+                    .collect(),
+            })
+        }
+    }
 }
 
 fn to_u8_samples(values: &[f32]) -> Vec<u8> {
@@ -5404,6 +5587,18 @@ fn viewport_id_for_label(label: &str) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(format!("viewport-{label}"))
 }
 
+fn source_ptr_eq(left: &ViewerImageSource, right: &ViewerImageSource) -> bool {
+    match (left, right) {
+        (ViewerImageSource::Native(left), ViewerImageSource::Native(right)) => {
+            Arc::ptr_eq(left, right)
+        }
+        (ViewerImageSource::Dataset(left), ViewerImageSource::Dataset(right)) => {
+            Arc::ptr_eq(left, right)
+        }
+        _ => false,
+    }
+}
+
 pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -5433,10 +5628,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        HoverInfo, LauncherStatusModel, ProgressState, RepaintDecisionInputs, ToolId, UiState,
-        ViewerFrameRequest, ViewerSession, ViewerTelemetry, canonical_json, compute_viewer_frame,
-        format_launcher_status, preview_cache_key, should_request_periodic_repaint,
-        should_request_repaint_now, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
+        HoverInfo, LauncherStatusModel, NativeRasterImage, ProgressState, RepaintDecisionInputs,
+        ToolId, UiState, ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry,
+        build_frame, canonical_json, compute_viewer_frame, format_launcher_status,
+        preview_cache_key, should_request_periodic_repaint, should_request_repaint_now,
+        source_ptr_eq, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
     };
 
     fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
@@ -5447,6 +5643,15 @@ mod tests {
             data,
             PixelType::F32,
         ))
+    }
+
+    fn native_gray8_2x2(values: [u8; 4]) -> Arc<NativeRasterImage> {
+        Arc::new(NativeRasterImage::Gray8 {
+            width: 2,
+            height: 2,
+            pixels: values.to_vec(),
+            source: Some(PathBuf::from("/tmp/native.png")),
+        })
     }
 
     #[test]
@@ -5603,7 +5808,10 @@ mod tests {
     #[test]
     fn viewer_session_summary_updates_on_commit() {
         let path = PathBuf::from("/tmp/summary-update.tif");
-        let mut session = ViewerSession::new(path.clone(), dataset_2x2([0.0, 1.0, 2.0, 3.0]));
+        let mut session = ViewerSession::new(
+            path.clone(),
+            ViewerImageSource::Dataset(dataset_2x2([0.0, 1.0, 2.0, 3.0])),
+        );
 
         assert_eq!(session.committed_summary.min, 0.0);
         assert_eq!(session.committed_summary.max, 3.0);
@@ -5622,7 +5830,7 @@ mod tests {
     fn viewer_session_tracks_undo_redo_and_revert() {
         let path = PathBuf::from("/tmp/history.tif");
         let original = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
-        let mut session = ViewerSession::new(path, original.clone());
+        let mut session = ViewerSession::new(path, ViewerImageSource::Dataset(original.clone()));
         let updated = dataset_2x2([10.0, 11.0, 12.0, 13.0]);
 
         session.commit_dataset(updated.clone());
@@ -5650,10 +5858,36 @@ mod tests {
         assert_eq!(session.committed_summary.source, "/tmp/history-saved.tif");
         assert!(!session.can_undo());
         assert!(!session.can_redo());
-        assert!(Arc::ptr_eq(
-            &session.base_dataset,
-            &session.committed_dataset
+        assert!(source_ptr_eq(
+            &session.base_source,
+            &session.committed_source
         ));
+    }
+
+    #[test]
+    fn native_viewer_session_promotes_once_for_processing() {
+        let path = PathBuf::from("/tmp/native-history.png");
+        let native = native_gray8_2x2([0, 64, 128, 255]);
+        let mut session = ViewerSession::new(path, ViewerImageSource::Native(native));
+
+        assert!(matches!(
+            session.committed_source,
+            ViewerImageSource::Native(_)
+        ));
+
+        let first = session
+            .ensure_committed_dataset()
+            .expect("first materialization");
+        let second = session
+            .ensure_committed_dataset()
+            .expect("second materialization");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(matches!(
+            session.committed_source,
+            ViewerImageSource::Dataset(_)
+        ));
+        assert!(matches!(session.base_source, ViewerImageSource::Native(_)));
     }
 
     #[test]
@@ -5662,7 +5896,7 @@ mod tests {
         let label = "viewer-1".to_string();
         let session = ViewerSession::new(
             PathBuf::from("/tmp/frame-cache.tif"),
-            dataset_2x2([0.0, 1.0, 2.0, 3.0]),
+            ViewerImageSource::Dataset(dataset_2x2([0.0, 1.0, 2.0, 3.0])),
         );
         state.label_to_session.insert(label.clone(), session);
 
@@ -5672,6 +5906,27 @@ mod tests {
             compute_viewer_frame(&mut state, &label, &request, None).expect("cached second frame");
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn native_and_dataset_frames_match_for_gray8() {
+        let native = ViewerImageSource::Native(native_gray8_2x2([0, 64, 128, 255]));
+        let dataset = ViewerImageSource::Dataset(
+            native_gray8_2x2([0, 64, 128, 255])
+                .to_dataset()
+                .map(Arc::new)
+                .expect("dataset"),
+        );
+        let request = ViewerFrameRequest::default();
+
+        let native_frame = build_frame(&native, &request).expect("native frame");
+        let dataset_frame = build_frame(&dataset, &request).expect("dataset frame");
+
+        assert_eq!(native_frame.width, dataset_frame.width);
+        assert_eq!(native_frame.height, dataset_frame.height);
+        assert_eq!(native_frame.pixels_u8, dataset_frame.pixels_u8);
+        assert_eq!(native_frame.min, dataset_frame.min);
+        assert_eq!(native_frame.max, dataset_frame.max);
     }
 
     #[test]

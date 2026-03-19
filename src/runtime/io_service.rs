@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::formats::{IoError, read_dataset, read_dataset_bytes, write_dataset};
+use crate::formats::{
+    IoError, NativeRasterImage, read_dataset, read_dataset_bytes, read_native_image, write_dataset,
+    write_native_image,
+};
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
 use ndarray::{ArrayD, IxDyn};
 
@@ -14,12 +17,21 @@ impl IoService {
         Ok(read_dataset(path)?)
     }
 
+    pub fn read_native(&self, path: impl AsRef<Path>) -> Result<Option<NativeRasterImage>> {
+        Ok(read_native_image(path)?)
+    }
+
     pub fn read_bytes(&self, bytes: &[u8], format_hint: &str) -> Result<DatasetF32> {
         Ok(read_dataset_bytes(bytes, format_hint)?)
     }
 
     pub fn write(&self, path: impl AsRef<Path>, dataset: &DatasetF32) -> Result<()> {
         write_dataset(path, dataset)?;
+        Ok(())
+    }
+
+    pub fn write_native(&self, path: impl AsRef<Path>, image: &NativeRasterImage) -> Result<()> {
+        write_native_image(path, image)?;
         Ok(())
     }
 

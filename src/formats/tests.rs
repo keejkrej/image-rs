@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::time::Instant;
 
-use image::{ImageBuffer, Luma, Rgb};
+use image::{ImageBuffer, Luma, Rgb, Rgba};
 use ndarray::Array;
 use tempfile::tempdir;
 
-use super::{read_dataset, write_dataset};
+use super::{NativeRasterImage, read_dataset, read_native_image, write_dataset};
 use crate::model::{AxisKind, Dataset, Dim, Metadata, PixelType};
 
 #[test]
@@ -47,6 +48,56 @@ fn png_and_jpeg_decode_channel_mapping() {
 }
 
 #[test]
+fn read_native_image_fast_path_recognizes_common_rasters() {
+    let dir = tempdir().expect("tempdir");
+    let gray8_path = dir.path().join("gray8.png");
+    let gray16_path = dir.path().join("gray16.png");
+    let rgba_path = dir.path().join("rgba.png");
+
+    ImageBuffer::<Luma<u8>, Vec<u8>>::from_vec(2, 1, vec![0, 255])
+        .expect("gray8")
+        .save(&gray8_path)
+        .expect("save gray8");
+    ImageBuffer::<Luma<u16>, Vec<u16>>::from_vec(2, 1, vec![0, 65_535])
+        .expect("gray16")
+        .save(&gray16_path)
+        .expect("save gray16");
+    ImageBuffer::<Rgba<u8>, Vec<u8>>::from_vec(1, 1, vec![0, 0, 255, 128])
+        .expect("rgba")
+        .save(&rgba_path)
+        .expect("save rgba");
+
+    let gray8 = read_native_image(&gray8_path).expect("read gray8");
+    let gray16 = read_native_image(&gray16_path).expect("read gray16");
+    let rgba = read_native_image(&rgba_path).expect("read rgba");
+
+    assert!(matches!(
+        gray8,
+        Some(NativeRasterImage::Gray8 {
+            width: 2,
+            height: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        gray16,
+        Some(NativeRasterImage::Gray16 {
+            width: 2,
+            height: 1,
+            ..
+        })
+    ));
+    assert!(matches!(
+        rgba,
+        Some(NativeRasterImage::Rgb8 {
+            width: 1,
+            height: 1,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn conversion_between_formats() {
     let dir = tempdir().expect("tempdir");
     let input = dir.path().join("input.png");
@@ -70,4 +121,34 @@ fn unsupported_layout_errors() {
     let err = write_dataset(Path::new(&output), &dataset).expect_err("must fail");
     let message = err.to_string();
     assert!(message.contains("expects [Y, X] or [Y, X, C]"));
+}
+
+#[test]
+#[ignore = "timing harness"]
+fn benchmark_native_png_read_path() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("bench.png");
+    let image = ImageBuffer::<Luma<u8>, Vec<u8>>::from_fn(512, 512, |x, y| {
+        Luma([((x ^ y) & 0xff) as u8])
+    });
+    image.save(&path).expect("save png");
+
+    let start = Instant::now();
+    for _ in 0..50 {
+        let native = read_native_image(&path).expect("native read");
+        assert!(native.is_some());
+    }
+    let native_elapsed = start.elapsed();
+
+    let start = Instant::now();
+    for _ in 0..50 {
+        let dataset = read_dataset(&path).expect("dataset read");
+        assert_eq!(dataset.shape(), &[512, 512]);
+    }
+    let dataset_elapsed = start.elapsed();
+
+    eprintln!(
+        "native fast path: {:?}, eager dataset path: {:?}",
+        native_elapsed, dataset_elapsed
+    );
 }
