@@ -75,5 +75,5 @@ Current constraints:
 - Run `image` with no arguments to launch the native UI.
 - Native launcher shell: menu bar, ImageJ-style tool icon strip, and status row.
 - Launcher window is resizable and starts at minimum size (`600x200`, 3:1).
-- Use `File > Open...` (native file dialog) or drag-and-drop TIFF files (`.tif`/`.tiff`) onto the launcher.
+- Use `File > Open...` (native file dialog) or drag-and-drop supported image files: `png`, `jpg`/`jpeg`, `tif`/`tiff`.
 - Tool shortcuts (`R`, `O`, `G`, `F`, `L`, `P`, `W`, `T`, `Z`, `H`, `D`) are shared across launcher and viewer windows.

@@ -13,6 +13,7 @@ use super::interaction::tooling::{
     LineMode, OvalMode, PointMode, RectMode, ToolId, ToolOptionsState, ToolState,
 };
 use super::interaction::transform::{ViewerTransformState, zoom_level_down, zoom_level_up};
+use crate::formats::supported_formats;
 use crate::model::{AxisKind, DatasetF32};
 use crate::runtime::AppContext;
 use eframe::egui;
@@ -799,8 +800,9 @@ impl ImageUiApp {
         command_id: &str,
     ) -> Option<command_registry::CommandExecuteResult> {
         if command_id == "file.open" {
+            let extensions = supported_formats();
             let picked_paths = FileDialog::new()
-                .add_filter("TIFF images", &["tif", "tiff"])
+                .add_filter("Supported images", extensions)
                 .set_title("Open Image")
                 .pick_files()
                 .unwrap_or_default();
@@ -3279,7 +3281,10 @@ fn ui_close_requested(ctx: &egui::Context) -> bool {
 fn is_supported_image_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "tif" | "tiff"))
+        .map(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            supported_formats().contains(&extension.as_str())
+        })
         .unwrap_or(false)
 }
 
