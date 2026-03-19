@@ -172,6 +172,16 @@ impl CommandMetadata {
 
 pub fn metadata(command_id: &str) -> CommandMetadata {
     match command_id {
+        "file.new" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(
+                json!({"width": 512, "height": 512, "slices": 1, "channels": 1, "fill": 0.0, "pixelType": "f32"}),
+            ),
+            Some("Create a new blank image via a native utility dialog."),
+        ),
         "file.open" => CommandMetadata::with(
             CommandScope::Both,
             true,
@@ -179,6 +189,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             false,
             None,
             Some("Open files using the native platform file picker."),
+        ),
+        "file.save_as" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Save the active image to a new path using the native file picker."),
         ),
         "file.close" => CommandMetadata::with(
             CommandScope::Both,
@@ -188,6 +206,38 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Close the active ImageJ-like window."),
         ),
+        "file.save" | "file.revert" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Persist or restore the active image."),
+        ),
+        "file.import.image" | "file.import.raw" | "file.import.url" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Import images using sequence, raw, or URL workflows."),
+        ),
+        "file.export.image" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Export the active image using the save-as flow."),
+        ),
+        "file.export.results" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Export the shared results table as CSV or JSON."),
+        ),
         "file.quit" => CommandMetadata::with(
             CommandScope::Both,
             true,
@@ -195,6 +245,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             false,
             None,
             Some("Exit the image application."),
+        ),
+        "file.open_recent.none" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Open recently used files from persisted desktop state."),
         ),
         "window.next" => CommandMetadata::with(
             CommandScope::Both,
@@ -211,6 +269,30 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             false,
             None,
             Some("Cycles active image windows in reverse order."),
+        ),
+        "edit.undo" | "edit.redo" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Undo or redo committed image edits in the active viewer."),
+        ),
+        "edit.cut" | "edit.copy" | "edit.paste" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Use the internal image clipboard for ROI or frame data."),
+        ),
+        "edit.options.appearance" | "edit.options.memory" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Open informational utility dialogs for appearance and memory."),
         ),
         "image.zoom.in"
         | "image.zoom.out"
@@ -302,13 +384,97 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"sigma": 1.0})),
             Some("Processes the active image using gaussian blur/ smooth path."),
         ),
-        "analyze.measure" => CommandMetadata::with(
+        "image.type.8bit" | "image.type.16bit" | "image.type.32bit" | "image.type.rgb" => {
+            CommandMetadata::with(
+                CommandScope::Viewer,
+                true,
+                false,
+                true,
+                None,
+                Some("Convert the active image pixel type or channel layout."),
+            )
+        }
+        "image.adjust.brightness" | "image.adjust.threshold" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             false,
             true,
             None,
-            Some("Computes measurement summary for the active image."),
+            Some("Applies automatic normalization or thresholding to the active image."),
+        ),
+        "image.adjust.size" | "image.adjust.canvas" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Open utility dialogs for X/Y resize and canvas size changes."),
+        ),
+        "image.stacks.next" | "image.stacks.previous" | "image.stacks.set" => {
+            CommandMetadata::with(
+                CommandScope::Viewer,
+                true,
+                true,
+                true,
+                None,
+                Some("Image stack navigation is implemented in the viewer shell."),
+            )
+        }
+        "process.binary.make" | "process.binary.erode" | "process.binary.dilate" => {
+            CommandMetadata::with(
+                CommandScope::Viewer,
+                true,
+                false,
+                true,
+                None,
+                Some("Runs binary threshold or binary morphology on the active image."),
+            )
+        }
+        "process.sharpen" | "process.find_edges" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Run sharpen or edge-detection filters on the active image."),
+        ),
+        "analyze.measure"
+        | "analyze.histogram"
+        | "analyze.set_measurements"
+        | "analyze.analyze_particles"
+        | "analyze.plot_profile"
+        | "analyze.tools.roi_manager"
+        | "analyze.tools.results" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Analyze the active image and surface results in shared utility windows."),
+        ),
+        "plugins.commands.find"
+        | "help.about"
+        | "help.docs"
+        | "help.shortcuts"
+        | "window.tile"
+        | "window.cascade" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Desktop utility commands are implemented using native utility windows."),
+        ),
+        "plugins.macros.run"
+        | "plugins.macros.record"
+        | "plugins.macros.install"
+        | "plugins.utilities.startup" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            false,
+            false,
+            None,
+            Some("Macro/plugin compatibility is intentionally deferred in this pass."),
         ),
         _ => CommandMetadata::unsupported(),
     }
@@ -438,6 +604,44 @@ mod tests {
             assert!(metadata.frontend_only, "{command} should be frontend-only");
             assert!(metadata.scope.contains("main"));
             assert!(metadata.scope.contains("viewer-1"));
+        }
+    }
+
+    #[test]
+    fn viewer_edit_and_file_commands_require_an_image() {
+        for command in [
+            "file.save",
+            "file.save_as",
+            "file.revert",
+            "edit.undo",
+            "edit.redo",
+        ] {
+            let metadata = metadata(command);
+            assert!(metadata.implemented, "{command} should be implemented");
+            assert!(metadata.requires_image, "{command} should require an image");
+            assert!(metadata.scope.contains("viewer-1"));
+            assert!(!metadata.scope.contains("main"));
+        }
+    }
+
+    #[test]
+    fn manifest_core_commands_are_classified() {
+        for command in [
+            "file.new",
+            "file.import.image",
+            "file.export.results",
+            "image.type.rgb",
+            "image.adjust.size",
+            "process.sharpen",
+            "analyze.analyze_particles",
+            "analyze.tools.results",
+            "plugins.commands.find",
+            "help.shortcuts",
+        ] {
+            assert!(
+                metadata(command).implemented,
+                "{command} should be implemented or explicitly handled"
+            );
         }
     }
 }

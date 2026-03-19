@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, PixelType};
@@ -11,7 +12,15 @@ use super::{IoError, Result};
 
 pub(crate) fn read_tiff(path: &Path) -> Result<DatasetF32> {
     let file = File::open(path)?;
-    let mut decoder = Decoder::new(file)?;
+    read_tiff_decoder(Decoder::new(file)?, path)
+}
+
+pub(crate) fn read_tiff_bytes(bytes: &[u8], format_hint: &str) -> Result<DatasetF32> {
+    let cursor = Cursor::new(bytes.to_vec());
+    read_tiff_decoder(Decoder::new(cursor)?, Path::new(format_hint))
+}
+
+fn read_tiff_decoder<R: Read + Seek>(mut decoder: Decoder<R>, path: &Path) -> Result<DatasetF32> {
     let (width, height) = decoder.dimensions()?;
     let mut pages = Vec::new();
     let mut pixel_type = PixelType::F32;
@@ -68,8 +77,8 @@ pub(crate) fn read_tiff(path: &Path) -> Result<DatasetF32> {
     Ok(Dataset::new(data, metadata)?)
 }
 
-fn decode_tiff_page(
-    decoder: &mut Decoder<File>,
+fn decode_tiff_page<R: Read + Seek>(
+    decoder: &mut Decoder<R>,
     pixel_type: &mut PixelType,
     width: u32,
     height: u32,

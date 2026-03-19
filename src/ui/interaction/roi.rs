@@ -56,8 +56,11 @@ pub enum RoiKind {
 #[derive(Debug, Clone)]
 pub struct RoiModel {
     pub id: u64,
+    pub name: String,
     pub kind: RoiKind,
     pub position: RoiPosition,
+    pub visible: bool,
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,10 +78,14 @@ impl RoiStore {
     }
 
     pub fn begin_active(&mut self, kind: RoiKind, position: RoiPosition) {
+        let id = self.next_id();
         self.active_roi = Some(RoiModel {
-            id: self.next_id(),
+            id,
+            name: format!("ROI {id}"),
             kind,
             position,
+            visible: true,
+            locked: false,
         });
     }
 
@@ -133,11 +140,11 @@ impl RoiStore {
     pub fn visible_rois<'a>(&'a self, position: RoiPosition) -> impl Iterator<Item = &'a RoiModel> {
         self.overlay_rois
             .iter()
-            .filter(move |roi| roi.position == position)
+            .filter(move |roi| roi.position == position && roi.visible)
             .chain(
                 self.active_roi
                     .iter()
-                    .filter(move |roi| roi.position == position),
+                    .filter(move |roi| roi.position == position && roi.visible),
             )
     }
 

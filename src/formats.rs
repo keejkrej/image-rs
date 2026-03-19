@@ -8,6 +8,8 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-pub use api::{read_dataset, save_slice_png, source_path, supported_formats, write_dataset};
+pub use api::{
+    read_dataset, read_dataset_bytes, save_slice_png, source_path, supported_formats, write_dataset,
+};
 pub use codec::{DefaultImageCodec, ImageReader, ImageWriter};
 pub use error::{IoError, Result};

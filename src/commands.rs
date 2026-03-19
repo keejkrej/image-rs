@@ -13,6 +13,7 @@ mod schema;
 mod threshold;
 #[cfg(feature = "thunderstorm")]
 mod thunderstorm;
+mod transform;
 mod util;
 
 #[cfg(test)]
@@ -38,6 +39,9 @@ pub use threshold::{ThresholdFixedOp, ThresholdOtsuOp};
 pub use thunderstorm::{
     ThunderstormGaussianFilterOp, ThunderstormLsqGaussianFitOp, ThunderstormNonMaxSuppressionOp,
     ThunderstormPipelineLocalizeOp,
+};
+pub use transform::{
+    ImageCanvasResizeOp, ImageConvertOp, ImageFindEdgesOp, ImageResizeOp, ImageSharpenOp,
 };
 
 pub(crate) use axes::spatial_axes;

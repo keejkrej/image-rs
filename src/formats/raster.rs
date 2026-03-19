@@ -9,6 +9,16 @@ use super::{IoError, Result};
 
 pub(crate) fn read_common_raster(path: &Path) -> Result<DatasetF32> {
     let image = image::open(path)?;
+    dataset_from_dynamic_image(image, Some(path))
+}
+
+pub(crate) fn read_common_raster_bytes(bytes: &[u8], format_hint: &str) -> Result<DatasetF32> {
+    let image = image::load_from_memory(bytes)?;
+    let pseudo_path = Path::new(format_hint);
+    dataset_from_dynamic_image(image, Some(pseudo_path))
+}
+
+fn dataset_from_dynamic_image(image: DynamicImage, path: Option<&Path>) -> Result<DatasetF32> {
     match image {
         DynamicImage::ImageLuma8(buffer) => {
             let (width, height) = buffer.dimensions();
@@ -20,7 +30,7 @@ pub(crate) fn read_common_raster(path: &Path) -> Result<DatasetF32> {
                 .expect("shape checked")
                 .into_dyn();
             let metadata = metadata_for_dims(
-                path,
+                path.unwrap_or_else(|| Path::new("<memory>")),
                 vec![
                     Dim::new(AxisKind::Y, height as usize),
                     Dim::new(AxisKind::X, width as usize),
@@ -39,7 +49,7 @@ pub(crate) fn read_common_raster(path: &Path) -> Result<DatasetF32> {
                 .expect("shape checked")
                 .into_dyn();
             let metadata = metadata_for_dims(
-                path,
+                path.unwrap_or_else(|| Path::new("<memory>")),
                 vec![
                     Dim::new(AxisKind::Y, height as usize),
                     Dim::new(AxisKind::X, width as usize),
@@ -60,7 +70,7 @@ pub(crate) fn read_common_raster(path: &Path) -> Result<DatasetF32> {
                 .expect("shape checked")
                 .into_dyn();
             let mut metadata = metadata_for_dims(
-                path,
+                path.unwrap_or_else(|| Path::new("<memory>")),
                 vec![
                     Dim::new(AxisKind::Y, height as usize),
                     Dim::new(AxisKind::X, width as usize),
@@ -84,7 +94,7 @@ pub(crate) fn read_common_raster(path: &Path) -> Result<DatasetF32> {
                 .expect("shape checked")
                 .into_dyn();
             let mut metadata = metadata_for_dims(
-                path,
+                path.unwrap_or_else(|| Path::new("<memory>")),
                 vec![
                     Dim::new(AxisKind::Y, height as usize),
                     Dim::new(AxisKind::X, width as usize),

@@ -5,10 +5,10 @@ use crate::model::DatasetF32;
 use serde_json::Value;
 
 use super::{
-    ComponentsLabelOp, GaussianBlurOp, IntensityNormalizeOp, IntensityWindowOp,
-    MeasurementsSummaryOp, MorphologyCloseOp, MorphologyDilateOp, MorphologyErodeOp,
-    MorphologyOpenOp, OpOutput, OpSchema, Operation, OpsError, Result, ThresholdFixedOp,
-    ThresholdOtsuOp,
+    ComponentsLabelOp, GaussianBlurOp, ImageCanvasResizeOp, ImageConvertOp, ImageFindEdgesOp,
+    ImageResizeOp, ImageSharpenOp, IntensityNormalizeOp, IntensityWindowOp, MeasurementsSummaryOp,
+    MorphologyCloseOp, MorphologyDilateOp, MorphologyErodeOp, MorphologyOpenOp, OpOutput, OpSchema,
+    Operation, OpsError, Result, ThresholdFixedOp, ThresholdOtsuOp,
 };
 #[cfg(feature = "morpholib")]
 use super::{
@@ -34,6 +34,11 @@ fn registry() -> &'static Registry {
         register(&mut map, IntensityNormalizeOp);
         register(&mut map, IntensityWindowOp);
         register(&mut map, GaussianBlurOp);
+        register(&mut map, ImageConvertOp);
+        register(&mut map, ImageResizeOp);
+        register(&mut map, ImageCanvasResizeOp);
+        register(&mut map, ImageSharpenOp);
+        register(&mut map, ImageFindEdgesOp);
         register(&mut map, ThresholdFixedOp);
         register(&mut map, ThresholdOtsuOp);
         register(&mut map, MorphologyErodeOp);

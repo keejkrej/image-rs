@@ -27,12 +27,47 @@ fn contains_required_operations() {
         .map(|schema| schema.name)
         .collect::<Vec<_>>();
     assert!(names.contains(&"gaussian.blur".to_string()));
+    assert!(names.contains(&"image.convert".to_string()));
+    assert!(names.contains(&"image.resize".to_string()));
+    assert!(names.contains(&"image.canvas_resize".to_string()));
+    assert!(names.contains(&"image.sharpen".to_string()));
+    assert!(names.contains(&"image.find_edges".to_string()));
     assert!(names.contains(&"components.label".to_string()));
     assert!(names.contains(&"measurements.summary".to_string()));
     #[cfg(feature = "morpholib")]
     assert!(names.contains(&"morpholibj.distance.chamfer".to_string()));
     #[cfg(feature = "thunderstorm")]
     assert!(names.contains(&"thunderstorm.pipeline.localize".to_string()));
+}
+
+#[test]
+fn image_resize_changes_xy_shape() {
+    let dataset = test_dataset(vec![0.0, 1.0, 0.5, 0.25], (2, 2));
+    let output = execute_operation("image.resize", &dataset, &json!({"width": 4, "height": 3}))
+        .expect("resize");
+    assert_eq!(output.dataset.shape(), &[3, 4]);
+}
+
+#[test]
+fn image_convert_rgb_adds_channel_axis() {
+    let dataset = test_dataset(vec![0.0, 1.0, 0.5, 0.25], (2, 2));
+    let output =
+        execute_operation("image.convert", &dataset, &json!({"target": "rgb"})).expect("convert");
+    assert_eq!(output.dataset.shape(), &[2, 2, 3]);
+}
+
+#[test]
+fn find_edges_highlights_gradient() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 0.0, 0.0, //
+            0.0, 1.0, 1.0, //
+            0.0, 1.0, 1.0, //
+        ],
+        (3, 3),
+    );
+    let output = execute_operation("image.find_edges", &dataset, &json!({})).expect("edges");
+    assert!(output.dataset.data[IxDyn(&[1, 1])] > 0.0);
 }
 
 #[test]
