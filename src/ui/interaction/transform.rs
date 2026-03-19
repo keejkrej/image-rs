@@ -210,7 +210,7 @@ impl ViewerTransformState {
         image_width: usize,
         image_height: usize,
     ) {
-        self.fit_to_canvas(canvas_rect, image_width, image_height);
+        self.zoom_view_100(canvas_rect, image_width, image_height);
     }
 
     pub fn zoom_view_100(
@@ -231,32 +231,51 @@ impl ViewerTransformState {
         image_width: usize,
         image_height: usize,
     ) {
+        self.set_magnification_at_with_viewport(
+            canvas_rect,
+            canvas_rect,
+            pointer_screen,
+            next_magnification,
+            image_width,
+            image_height,
+        );
+    }
+
+    pub fn set_magnification_at_with_viewport(
+        &mut self,
+        mapping_rect: egui::Rect,
+        viewport_rect: egui::Rect,
+        pointer_screen: egui::Pos2,
+        next_magnification: f32,
+        image_width: usize,
+        image_height: usize,
+    ) {
         let image_w = image_width.max(1) as f32;
         let image_h = image_height.max(1) as f32;
         let next_mag = next_magnification.clamp(MIN_MAGNIFICATION, MAX_MAGNIFICATION);
 
-        let pointer_image =
-            self.screen_to_image(canvas_rect, pointer_screen)
-                .unwrap_or(egui::pos2(
-                    self.src_rect.x + self.src_rect.width * 0.5,
-                    self.src_rect.y + self.src_rect.height * 0.5,
-                ));
+        let pointer_image = self
+            .screen_to_image(mapping_rect, pointer_screen)
+            .unwrap_or(egui::pos2(
+                self.src_rect.x + self.src_rect.width * 0.5,
+                self.src_rect.y + self.src_rect.height * 0.5,
+            ));
 
-        let nx = if canvas_rect.width() > 0.0 {
-            (pointer_screen.x - canvas_rect.min.x) / canvas_rect.width()
+        let nx = if mapping_rect.width() > 0.0 {
+            (pointer_screen.x - mapping_rect.min.x) / mapping_rect.width()
         } else {
             0.5
         }
         .clamp(0.0, 1.0);
-        let ny = if canvas_rect.height() > 0.0 {
-            (pointer_screen.y - canvas_rect.min.y) / canvas_rect.height()
+        let ny = if mapping_rect.height() > 0.0 {
+            (pointer_screen.y - mapping_rect.min.y) / mapping_rect.height()
         } else {
             0.5
         }
         .clamp(0.0, 1.0);
 
-        let mut new_width = (canvas_rect.width() / next_mag).max(1.0);
-        let mut new_height = (canvas_rect.height() / next_mag).max(1.0);
+        let mut new_width = (viewport_rect.width() / next_mag).max(1.0);
+        let mut new_height = (viewport_rect.height() / next_mag).max(1.0);
         new_width = new_width.min(image_w);
         new_height = new_height.min(image_h);
 

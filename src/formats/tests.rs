@@ -128,9 +128,8 @@ fn unsupported_layout_errors() {
 fn benchmark_native_png_read_path() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("bench.png");
-    let image = ImageBuffer::<Luma<u8>, Vec<u8>>::from_fn(512, 512, |x, y| {
-        Luma([((x ^ y) & 0xff) as u8])
-    });
+    let image =
+        ImageBuffer::<Luma<u8>, Vec<u8>>::from_fn(512, 512, |x, y| Luma([((x ^ y) & 0xff) as u8]));
     image.save(&path).expect("save png");
 
     let start = Instant::now();

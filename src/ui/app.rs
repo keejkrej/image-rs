@@ -33,7 +33,8 @@ const LAUNCHER_LABEL: &str = "main";
 const VIEWER_PREFIX: &str = "viewer-";
 const SOURCE_COMMITTED: &str = "committed";
 const SOURCE_PREVIEW_PREFIX: &str = "preview:";
-const VIEWER_DEFAULT_SIZE: [f32; 2] = [980.0, 980.0];
+const VIEWER_MIN_WINDOW_SIZE: [f32; 2] = [220.0, 160.0];
+const VIEWER_WINDOW_EXTRA_SIZE: [f32; 2] = [24.0, 120.0];
 const LAUNCHER_MIN_WINDOW_SIZE: [f32; 2] = [600.0, 200.0];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,6 +373,7 @@ struct SliceImage {
 struct ViewerFrameBuffer {
     width: usize,
     height: usize,
+    values: Vec<f32>,
     pixels_u8: Vec<u8>,
     min: f32,
     max: f32,
@@ -546,6 +548,8 @@ struct ViewerUiState {
     texture: Option<egui::TextureHandle>,
     last_request: Option<ViewerFrameRequest>,
     last_generation: u64,
+    initial_magnification: f32,
+    initial_viewport_sized: bool,
     fit_requested: bool,
     pending_zoom: Option<ZoomCommand>,
     active_drag_started: Option<egui::Pos2>,
@@ -573,6 +577,8 @@ impl ViewerUiState {
             texture: None,
             last_request: None,
             last_generation: 0,
+            initial_magnification: 1.0,
+            initial_viewport_sized: false,
             fit_requested: true,
             pending_zoom: None,
             active_drag_started: None,
@@ -3748,25 +3754,31 @@ impl ImageUiApp {
 
                 if let (Some(frame), Some(texture_id)) = (frame, texture_id) {
                     if viewer.fit_requested {
-                        fit_to_rect(viewer, rect, frame.width, frame.height);
+                        initialize_view_to_open_state(viewer, rect, frame.width, frame.height);
                         viewer.fit_requested = false;
                     }
 
+                    let image_rect =
+                        image_draw_rect(rect, &viewer.transform, frame.width, frame.height);
+
                     if let Some(zoom_command) = viewer.pending_zoom.take() {
-                        apply_zoom_command(viewer, zoom_command, rect, &frame);
+                        apply_zoom_command(viewer, zoom_command, rect, image_rect, &frame);
                     }
+
+                    let image_rect =
+                        image_draw_rect(rect, &viewer.transform, frame.width, frame.height);
 
                     let hover_sample = response
                         .hover_pos()
-                        .and_then(|pointer| sample_at_pointer(viewer, &frame, rect, pointer));
+                        .and_then(|pointer| sample_at_pointer(viewer, &frame, image_rect, pointer));
                     viewer.hover = hover_sample;
                     hovered_viewer = response.hovered() || response.dragged() || response.clicked();
                     viewer.zoom = viewer.transform.magnification;
 
                     let input = ui.input(|i| i.clone());
                     let pointer = response.hover_pos();
-                    let pointer_image =
-                        pointer.and_then(|screen| viewer.transform.screen_to_image(rect, screen));
+                    let pointer_image = pointer
+                        .and_then(|screen| viewer.transform.screen_to_image(image_rect, screen));
                     if let Some(pointer) = pointer {
                         if let Some(last) = viewer.last_status_pointer {
                             if (pointer - last).length_sq() > 144.0 {
@@ -3779,17 +3791,27 @@ impl ImageUiApp {
                     }
 
                     if response.hovered() {
-                        let scroll = input.smooth_scroll_delta.y + input.raw_scroll_delta.y;
-                        if scroll.abs() > f32::EPSILON {
-                            let zoom_modifier = input.modifiers.ctrl
-                                || input.modifiers.command
-                                || input.modifiers.shift;
+                        let scroll_delta = effective_scroll_delta(
+                            input.smooth_scroll_delta,
+                            input.raw_scroll_delta,
+                        );
+                        let zoom_modifier = input.modifiers.ctrl || input.modifiers.shift;
+                        let zoom_scroll = dominant_scroll_component(scroll_delta);
+                        let scroll = scroll_delta.y;
+                        let has_scroll = if zoom_modifier {
+                            zoom_scroll.abs() > f32::EPSILON
+                        } else {
+                            scroll.abs() > f32::EPSILON
+                        };
+                        if has_scroll {
                             if zoom_modifier {
                                 if let Some(pointer) = pointer {
-                                    let zoom_factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
+                                    let zoom_factor =
+                                        if zoom_scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
                                     zoom_about_pointer(
                                         viewer,
                                         rect,
+                                        image_rect,
                                         pointer,
                                         zoom_factor,
                                         frame.width,
@@ -3843,6 +3865,7 @@ impl ImageUiApp {
                                     zoom_about_pointer(
                                         viewer,
                                         rect,
+                                        image_rect,
                                         pointer,
                                         zoom_factor,
                                         frame.width,
@@ -3853,6 +3876,7 @@ impl ImageUiApp {
                                     zoom_about_pointer(
                                         viewer,
                                         rect,
+                                        image_rect,
                                         pointer,
                                         1.0 / 1.2,
                                         frame.width,
@@ -4038,18 +4062,18 @@ impl ImageUiApp {
 
                     ui.painter().image(
                         texture_id,
-                        rect,
+                        image_rect,
                         viewer.transform.src_rect.uv_rect(frame.width, frame.height),
                         egui::Color32::WHITE,
                     );
 
                     if let Some(pinned) = viewer.pinned {
-                        draw_point_marker(ui.painter(), viewer, rect, pinned);
+                        draw_point_marker(ui.painter(), viewer, image_rect, pinned);
                     }
                     draw_rois(
                         ui.painter(),
                         viewer,
-                        rect,
+                        image_rect,
                         interaction::roi::RoiPosition {
                             channel: viewer.channel,
                             z: viewer.z,
@@ -4154,22 +4178,38 @@ impl eframe::App for ImageUiApp {
             }
             existing_labels.insert(label.clone());
             let viewport_id = viewport_id_for_label(&label);
-            let title = self
-                .viewers_ui
-                .get(&label)
-                .map(|viewer| viewer.title.clone())
-                .unwrap_or_else(|| "image-rs Viewer".to_string());
+            let summary = summary_for_window(&self.state, &label)
+                .ok()
+                .map(|(_, summary)| summary);
+            let (title, initial_size) = if let Some(viewer) = self.viewers_ui.get_mut(&label) {
+                let initial_size = if !viewer.initial_viewport_sized {
+                    let size = summary.as_ref().map(|summary| {
+                        compute_initial_viewport_size(
+                            summary,
+                            ctx.input(|i| i.viewport().monitor_size),
+                        )
+                    });
+                    viewer.initial_viewport_sized = true;
+                    size
+                } else {
+                    None
+                };
+                (viewer.title.clone(), initial_size)
+            } else {
+                ("image-rs Viewer".to_string(), None)
+            };
 
-            ctx.show_viewport_immediate(
-                viewport_id,
-                egui::ViewportBuilder::default()
-                    .with_title(title)
-                    .with_inner_size(VIEWER_DEFAULT_SIZE)
-                    .with_min_inner_size([640.0, 420.0]),
-                |ctx, _class| {
-                    self.draw_viewer_viewport(ctx, &label, &mut actions);
-                },
-            );
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(title)
+                .with_min_inner_size(VIEWER_MIN_WINDOW_SIZE)
+                .with_clamp_size_to_monitor_size(true);
+            if let Some(size) = initial_size {
+                builder = builder.with_inner_size(size);
+            }
+
+            ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+                self.draw_viewer_viewport(ctx, &label, &mut actions);
+            });
 
             if let Some(position) = self.viewport_positions.get(&label).copied() {
                 ctx.send_viewport_cmd_to(
@@ -4479,14 +4519,17 @@ fn sample_at_pointer(
     }
 
     let index = y * frame.width + x;
-    let gray = frame.pixels_u8[index] as f32;
-    let value = frame.min + (gray / 255.0) * (frame.max - frame.min);
+    let value = frame.values.get(index).copied().unwrap_or_else(|| {
+        let gray = frame.pixels_u8[index] as f32;
+        frame.min + (gray / 255.0) * (frame.max - frame.min)
+    });
     Some(HoverInfo { x, y, value })
 }
 
 fn zoom_about_pointer(
     viewer: &mut ViewerUiState,
-    rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    image_rect: egui::Rect,
     pointer: egui::Pos2,
     factor: f32,
     image_width: usize,
@@ -4494,14 +4537,24 @@ fn zoom_about_pointer(
 ) {
     if factor >= 1.0 {
         let next = zoom_level_up(viewer.transform.magnification);
-        viewer
-            .transform
-            .set_magnification_at(rect, pointer, next, image_width, image_height);
+        viewer.transform.set_magnification_at_with_viewport(
+            image_rect,
+            viewport_rect,
+            pointer,
+            next,
+            image_width,
+            image_height,
+        );
     } else {
         let next = zoom_level_down(viewer.transform.magnification);
-        viewer
-            .transform
-            .set_magnification_at(rect, pointer, next, image_width, image_height);
+        viewer.transform.set_magnification_at_with_viewport(
+            image_rect,
+            viewport_rect,
+            pointer,
+            next,
+            image_width,
+            image_height,
+        );
     }
     viewer.zoom = viewer.transform.magnification;
     viewer.pan = egui::Vec2::ZERO;
@@ -4538,25 +4591,45 @@ fn draw_point_marker(
 fn apply_zoom_command(
     viewer: &mut ViewerUiState,
     command: ZoomCommand,
-    rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    image_rect: egui::Rect,
     frame: &ViewerFrameBuffer,
 ) {
-    let pointer = rect.center();
+    let pointer = image_rect.center();
     match command {
-        ZoomCommand::In => {
-            zoom_about_pointer(viewer, rect, pointer, 1.2, frame.width, frame.height)
-        }
-        ZoomCommand::Out => {
-            zoom_about_pointer(viewer, rect, pointer, 1.0 / 1.2, frame.width, frame.height)
-        }
-        ZoomCommand::Original | ZoomCommand::ScaleToFit => {
-            fit_to_rect(viewer, rect, frame.width, frame.height);
+        ZoomCommand::In => zoom_about_pointer(
+            viewer,
+            viewport_rect,
+            image_rect,
+            pointer,
+            1.2,
+            frame.width,
+            frame.height,
+        ),
+        ZoomCommand::Out => zoom_about_pointer(
+            viewer,
+            viewport_rect,
+            image_rect,
+            pointer,
+            1.0 / 1.2,
+            frame.width,
+            frame.height,
+        ),
+        ZoomCommand::Original => {
+            viewer.transform.src_rect =
+                interaction::transform::SourceRect::full(frame.width, frame.height);
+            viewer.transform.magnification = viewer.initial_magnification;
+            viewer.zoom = viewer.transform.magnification;
+            viewer.pan = egui::Vec2::ZERO;
         }
         ZoomCommand::View100 => {
             viewer
                 .transform
-                .zoom_view_100(rect, frame.width, frame.height);
+                .zoom_view_100(viewport_rect, frame.width, frame.height);
             viewer.zoom = viewer.transform.magnification;
+        }
+        ZoomCommand::ScaleToFit => {
+            fit_to_rect(viewer, viewport_rect, frame.width, frame.height);
         }
         ZoomCommand::ToSelection => {
             if let Some(roi) = viewer.rois.active_roi.as_ref() {
@@ -4569,8 +4642,8 @@ fn apply_zoom_command(
                     };
                     src_rect.clamp_to_image(frame.width, frame.height);
                     viewer.transform.src_rect = src_rect;
-                    viewer.transform.magnification = (rect.width() / src_rect.width)
-                        .min(rect.height() / src_rect.height)
+                    viewer.transform.magnification = (viewport_rect.width() / src_rect.width)
+                        .min(viewport_rect.height() / src_rect.height)
                         .clamp(
                             interaction::transform::MIN_MAGNIFICATION,
                             interaction::transform::MAX_MAGNIFICATION,
@@ -4590,14 +4663,94 @@ fn apply_zoom_command(
             let mut src_rect = src_rect;
             src_rect.clamp_to_image(frame.width, frame.height);
             viewer.transform.src_rect = src_rect;
-            viewer.transform.magnification = (rect.width() / src_rect.width)
-                .min(rect.height() / src_rect.height)
+            viewer.transform.magnification = (viewport_rect.width() / src_rect.width)
+                .min(viewport_rect.height() / src_rect.height)
                 .clamp(
                     interaction::transform::MIN_MAGNIFICATION,
                     interaction::transform::MAX_MAGNIFICATION,
                 );
             viewer.zoom = viewer.transform.magnification;
         }
+    }
+}
+
+fn image_draw_rect(
+    canvas_rect: egui::Rect,
+    transform: &ViewerTransformState,
+    image_width: usize,
+    image_height: usize,
+) -> egui::Rect {
+    let draw_width = (transform.src_rect.width * transform.magnification)
+        .max(1.0)
+        .min(image_width.max(1) as f32 * interaction::transform::MAX_MAGNIFICATION);
+    let draw_height = (transform.src_rect.height * transform.magnification)
+        .max(1.0)
+        .min(image_height.max(1) as f32 * interaction::transform::MAX_MAGNIFICATION);
+    let offset_x = ((canvas_rect.width() - draw_width) * 0.5).max(0.0);
+    let offset_y = ((canvas_rect.height() - draw_height) * 0.5).max(0.0);
+
+    egui::Rect::from_min_size(
+        egui::pos2(canvas_rect.min.x + offset_x, canvas_rect.min.y + offset_y),
+        egui::vec2(draw_width, draw_height),
+    )
+}
+
+fn compute_initial_viewport_size(
+    summary: &ImageSummary,
+    monitor_size: Option<egui::Vec2>,
+) -> egui::Vec2 {
+    let image_width = summary.shape.get(1).copied().unwrap_or(1) as f32;
+    let image_height = summary.shape.first().copied().unwrap_or(1) as f32;
+    let max_inner = monitor_size
+        .map(|size| {
+            egui::vec2(
+                (size.x - VIEWER_WINDOW_EXTRA_SIZE[0] - 20.0).max(VIEWER_MIN_WINDOW_SIZE[0]),
+                (size.y - VIEWER_WINDOW_EXTRA_SIZE[1] - 40.0).max(VIEWER_MIN_WINDOW_SIZE[1]),
+            )
+        })
+        .unwrap_or(egui::vec2(1200.0, 900.0));
+    let available_canvas = egui::vec2(
+        (max_inner.x - VIEWER_WINDOW_EXTRA_SIZE[0]).max(1.0),
+        (max_inner.y - VIEWER_WINDOW_EXTRA_SIZE[1]).max(1.0),
+    );
+    let initial_mag = (available_canvas.x / image_width)
+        .min(available_canvas.y / image_height)
+        .min(1.0);
+
+    egui::vec2(
+        (image_width * initial_mag + VIEWER_WINDOW_EXTRA_SIZE[0])
+            .clamp(VIEWER_MIN_WINDOW_SIZE[0], max_inner.x),
+        (image_height * initial_mag + VIEWER_WINDOW_EXTRA_SIZE[1])
+            .clamp(VIEWER_MIN_WINDOW_SIZE[1], max_inner.y),
+    )
+}
+
+fn dominant_scroll_component(delta: egui::Vec2) -> f32 {
+    if delta.y.abs() >= delta.x.abs() {
+        delta.y
+    } else {
+        delta.x
+    }
+}
+
+fn effective_scroll_delta(smooth: egui::Vec2, raw: egui::Vec2) -> egui::Vec2 {
+    if smooth == egui::Vec2::ZERO {
+        raw
+    } else if raw == egui::Vec2::ZERO {
+        smooth
+    } else {
+        egui::vec2(
+            if smooth.x.abs() >= raw.x.abs() {
+                smooth.x
+            } else {
+                raw.x
+            },
+            if smooth.y.abs() >= raw.y.abs() {
+                smooth.y
+            } else {
+                raw.y
+            },
+        )
     }
 }
 
@@ -5260,6 +5413,7 @@ fn build_dataset_frame(
     Ok(ViewerFrameBuffer {
         width: slice.width,
         height: slice.height,
+        values: slice.values.clone(),
         pixels_u8,
         min,
         max,
@@ -5285,6 +5439,10 @@ fn build_native_frame(
             Ok(ViewerFrameBuffer {
                 width: *width,
                 height: *height,
+                values: pixels
+                    .iter()
+                    .map(|value| f32::from(*value) / 255.0)
+                    .collect(),
                 pixels_u8: pixels.clone(),
                 min,
                 max,
@@ -5300,6 +5458,10 @@ fn build_native_frame(
             Ok(ViewerFrameBuffer {
                 width: *width,
                 height: *height,
+                values: pixels
+                    .iter()
+                    .map(|value| f32::from(*value) / 65_535.0)
+                    .collect(),
                 pixels_u8: pixels.iter().map(|value| (value / 257) as u8).collect(),
                 min,
                 max,
@@ -5324,6 +5486,10 @@ fn build_native_frame(
             Ok(ViewerFrameBuffer {
                 width: *width,
                 height: *height,
+                values: pixels_u8
+                    .iter()
+                    .map(|value| f32::from(*value) / 255.0)
+                    .collect(),
                 pixels_u8,
                 min: f32::from(min_sample) / 255.0,
                 max: f32::from(max_sample) / 255.0,
@@ -5508,20 +5674,9 @@ fn extract_slice_from_native(
 }
 
 fn to_u8_samples(values: &[f32]) -> Vec<u8> {
-    let (min, max) = min_max(values);
-    let unit_range = min >= 0.0 && max <= 1.0;
     values
         .iter()
-        .map(|value| {
-            let normalized = if unit_range {
-                *value
-            } else if (max - min).abs() < f32::EPSILON {
-                0.0
-            } else {
-                (*value - min) / (max - min)
-            };
-            (normalized.clamp(0.0, 1.0) * 255.0).round() as u8
-        })
+        .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
         .collect()
 }
 
@@ -5549,6 +5704,24 @@ fn fit_to_rect(viewer: &mut ViewerUiState, rect: egui::Rect, width: usize, heigh
     viewer.transform.fit_to_canvas(rect, width, height);
     viewer.zoom = viewer.transform.magnification;
     viewer.pan = egui::Vec2::ZERO;
+}
+
+fn initialize_view_to_open_state(
+    viewer: &mut ViewerUiState,
+    rect: egui::Rect,
+    width: usize,
+    height: usize,
+) {
+    let fits_without_scaling = width as f32 <= rect.width() && height as f32 <= rect.height();
+    if fits_without_scaling {
+        viewer.transform = ViewerTransformState::new(width, height);
+        viewer.initial_magnification = viewer.transform.magnification;
+        viewer.zoom = viewer.transform.magnification;
+        viewer.pan = egui::Vec2::ZERO;
+    } else {
+        fit_to_rect(viewer, rect, width, height);
+        viewer.initial_magnification = viewer.transform.magnification;
+    }
 }
 
 fn ui_close_requested(ctx: &egui::Context) -> bool {
@@ -5624,15 +5797,20 @@ mod tests {
     use std::sync::Arc;
 
     use crate::model::{DatasetF32, PixelType};
+    use crate::ui::interaction::transform::ViewerTransformState;
+    use eframe::egui;
     use ndarray::Array;
     use serde_json::json;
 
     use super::{
-        HoverInfo, LauncherStatusModel, NativeRasterImage, ProgressState, RepaintDecisionInputs,
-        ToolId, UiState, ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry,
-        build_frame, canonical_json, compute_viewer_frame, format_launcher_status,
-        preview_cache_key, should_request_periodic_repaint, should_request_repaint_now,
-        source_ptr_eq, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
+        HoverInfo, ImageSummary, LauncherStatusModel, NativeRasterImage, ProgressState,
+        RepaintDecisionInputs, ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest,
+        ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState, ZoomCommand,
+        apply_zoom_command, build_frame, canonical_json, compute_initial_viewport_size,
+        compute_viewer_frame, dominant_scroll_component, effective_scroll_delta,
+        format_launcher_status, image_draw_rect, initialize_view_to_open_state, preview_cache_key,
+        should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
+        tool_from_command_id, tool_shortcut_command, viewer_sort_key,
     };
 
     fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
@@ -5927,6 +6105,116 @@ mod tests {
         assert_eq!(native_frame.pixels_u8, dataset_frame.pixels_u8);
         assert_eq!(native_frame.min, dataset_frame.min);
         assert_eq!(native_frame.max, dataset_frame.max);
+    }
+
+    #[test]
+    fn dataset_frame_does_not_auto_stretch_display_range() {
+        let dataset = ViewerImageSource::Dataset(dataset_2x2([0.25, 0.5, 0.75, 1.0]));
+        let frame = build_frame(&dataset, &ViewerFrameRequest::default()).expect("frame");
+
+        assert_eq!(frame.pixels_u8, vec![64, 128, 191, 255]);
+        assert_eq!(frame.values, vec![0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn image_draw_rect_keeps_native_size_at_100_percent() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let transform = ViewerTransformState::new(100, 50);
+
+        let image_rect = image_draw_rect(canvas, &transform, 100, 50);
+
+        assert_eq!(image_rect.size(), egui::vec2(100.0, 50.0));
+        assert_eq!(image_rect.center(), canvas.center());
+    }
+
+    #[test]
+    fn oversized_images_scale_down_on_initial_open() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let mut viewer = ViewerUiState::new("viewer-1", "Test".to_string());
+
+        initialize_view_to_open_state(&mut viewer, canvas, 1200, 300);
+
+        assert!(viewer.transform.magnification < 1.0);
+        assert_eq!(viewer.initial_magnification, viewer.transform.magnification);
+        let image_rect = image_draw_rect(canvas, &viewer.transform, 1200, 300);
+        assert!(image_rect.width() <= canvas.width() + f32::EPSILON);
+        assert!(image_rect.height() <= canvas.height() + f32::EPSILON);
+    }
+
+    #[test]
+    fn original_scale_restores_initial_fit_while_view_100_forces_native_size() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let frame = ViewerFrameBuffer {
+            width: 1200,
+            height: 300,
+            values: vec![0.0; 1200 * 300],
+            pixels_u8: vec![0; 1200 * 300],
+            min: 0.0,
+            max: 0.0,
+        };
+        let mut viewer = ViewerUiState::new("viewer-1", "Test".to_string());
+        initialize_view_to_open_state(&mut viewer, canvas, frame.width, frame.height);
+
+        let initial = viewer.initial_magnification;
+        assert!(initial < 1.0);
+        let image_rect = image_draw_rect(canvas, &viewer.transform, frame.width, frame.height);
+
+        apply_zoom_command(
+            &mut viewer,
+            ZoomCommand::View100,
+            canvas,
+            image_rect,
+            &frame,
+        );
+        assert!((viewer.transform.magnification - 1.0).abs() < f32::EPSILON);
+
+        let image_rect = image_draw_rect(canvas, &viewer.transform, frame.width, frame.height);
+        apply_zoom_command(
+            &mut viewer,
+            ZoomCommand::Original,
+            canvas,
+            image_rect,
+            &frame,
+        );
+        assert!((viewer.transform.magnification - initial).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn initial_viewport_size_scales_large_images_to_monitor() {
+        let summary = ImageSummary {
+            shape: vec![300, 1200],
+            axes: vec!["Y".to_string(), "X".to_string()],
+            channels: 1,
+            z_slices: 1,
+            times: 1,
+            min: 0.0,
+            max: 1.0,
+            source: "/tmp/wide.png".to_string(),
+        };
+
+        let size = compute_initial_viewport_size(&summary, Some(egui::vec2(800.0, 600.0)));
+
+        assert!(size.x <= 800.0);
+        assert!(size.y <= 600.0);
+        assert!(size.x > size.y);
+    }
+
+    #[test]
+    fn dominant_scroll_component_prefers_larger_axis() {
+        assert_eq!(dominant_scroll_component(egui::vec2(8.0, 2.0)), 8.0);
+        assert_eq!(dominant_scroll_component(egui::vec2(1.0, -4.0)), -4.0);
+    }
+
+    #[test]
+    fn effective_scroll_delta_prefers_populated_stream() {
+        assert_eq!(
+            effective_scroll_delta(egui::Vec2::ZERO, egui::vec2(1.0, 2.0)),
+            egui::vec2(1.0, 2.0)
+        );
+        assert_eq!(
+            effective_scroll_delta(egui::vec2(3.0, 4.0), egui::Vec2::ZERO),
+            egui::vec2(3.0, 4.0)
+        );
     }
 
     #[test]
