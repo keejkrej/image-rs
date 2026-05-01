@@ -30,6 +30,9 @@ pub struct ImageCoordinatesOp;
 pub struct ImageSetScaleOp;
 
 #[derive(Debug, Clone, Copy)]
+pub struct ImageCalibrateOp;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImageStackAddSliceOp;
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +58,18 @@ pub struct ImageStackMontageOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageStackMontageToStackOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackToHyperstackOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageHyperstackToStackOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageHyperstackReduceDimensionalityOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageHyperstackSubsetOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageBinOp;
@@ -118,6 +133,9 @@ pub struct ImageFftPowerSpectrumOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageFftBandpassOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageSurfacePlotOp;
 
 impl Operation for ImageConvertOp {
     fn name(&self) -> &'static str {
@@ -499,6 +517,51 @@ impl Operation for ImageSetScaleOp {
     }
 }
 
+impl Operation for ImageCalibrateOp {
+    fn name(&self) -> &'static str {
+        "image.calibrate"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Apply ImageJ Analyze/Calibrate value-unit metadata.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "function".to_string(),
+                    description:
+                        "Density calibration function; currently supports ImageJ None only."
+                            .to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "unit".to_string(),
+                    description: "Calibrated value unit, such as Gray Value or OD.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "global".to_string(),
+                    description: "Record whether ImageJ global calibration was requested."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let mut metadata = dataset.metadata.clone();
+        apply_calibration_metadata(&mut metadata, params)?;
+        Ok(OpOutput::dataset_only(Dataset::new(
+            dataset.data.clone(),
+            metadata,
+        )?))
+    }
+}
+
 impl Operation for ImageStackAddSliceOp {
     fn name(&self) -> &'static str {
         "image.stack.add_slice"
@@ -814,6 +877,169 @@ impl Operation for ImageStackMontageToStackOp {
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
         Ok(OpOutput::dataset_only(montage_to_stack(dataset, params)?))
+    }
+}
+
+impl Operation for ImageStackToHyperstackOp {
+    fn name(&self) -> &'static str {
+        "image.stack.to_hyperstack"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Convert a linear ImageJ-style stack into a C/Z/T hyperstack.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "channels".to_string(),
+                    description: "Number of channels in the output hyperstack.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "slices".to_string(),
+                    description: "Number of Z slices in the output hyperstack.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "frames".to_string(),
+                    description: "Number of time frames in the output hyperstack.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "order".to_string(),
+                    description: "Source stack order: czt, ctz, zct, ztc, tcz, or tzc.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(stack_to_hyperstack(
+            dataset, params,
+        )?))
+    }
+}
+
+impl Operation for ImageHyperstackToStackOp {
+    fn name(&self) -> &'static str {
+        "image.hyperstack.to_stack"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Flatten an ImageJ-style C/Z/T hyperstack into a linear Z stack."
+                .to_string(),
+            params: vec![],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, _params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(hyperstack_to_stack(dataset)?))
+    }
+}
+
+impl Operation for ImageHyperstackReduceDimensionalityOp {
+    fn name(&self) -> &'static str {
+        "image.hyperstack.reduce_dimensionality"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description:
+                "Reduce an ImageJ-style hyperstack by keeping or collapsing C/Z/T dimensions."
+                    .to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "keep_channels".to_string(),
+                    description: "When false, keep only the current channel.".to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "keep_slices".to_string(),
+                    description: "When false, keep only the current Z slice.".to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "keep_frames".to_string(),
+                    description: "When false, keep only the current time frame.".to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "channel".to_string(),
+                    description: "Zero-based current channel used when channels are collapsed."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "z".to_string(),
+                    description: "Zero-based current Z slice used when slices are collapsed."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "time".to_string(),
+                    description: "Zero-based current time frame used when frames are collapsed."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(hyperstack_reduce_dimensionality(
+            dataset, params,
+        )?))
+    }
+}
+
+impl Operation for ImageHyperstackSubsetOp {
+    fn name(&self) -> &'static str {
+        "image.hyperstack.subset"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Create an ImageJ-style C/Z/T subset from a hyperstack.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "channels".to_string(),
+                    description: "One-based channel range/list, e.g. `1-3` or `1,3`.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "slices".to_string(),
+                    description: "One-based Z slice range/list, e.g. `2-14-3`.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "frames".to_string(),
+                    description: "One-based time frame range/list.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(hyperstack_subset(dataset, params)?))
     }
 }
 
@@ -1794,6 +2020,70 @@ impl Operation for ImageFftBandpassOp {
     }
 }
 
+impl Operation for ImageSurfacePlotOp {
+    fn name(&self) -> &'static str {
+        "image.surface_plot"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Render an ImageJ-style grayscale surface plot from an XY plane."
+                .to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "z".to_string(),
+                    description: "Zero-based Z index for stack inputs.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "time".to_string(),
+                    description: "Zero-based time index for hyperstacks.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "channel".to_string(),
+                    description: "Zero-based channel index for multichannel inputs.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "plot_width".to_string(),
+                    description: "Rendered plot width in pixels.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "polygon_multiplier".to_string(),
+                    description: "ImageJ Surface Plotter polygon multiplier percentage."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "source_background_lighter".to_string(),
+                    description: "Invert height values when the source background is lighter."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "black_fill".to_string(),
+                    description: "Use a black plot background.".to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(surface_plot_xy(dataset, params)?))
+    }
+}
+
 fn convert_pixel_type(dataset: &DatasetF32, pixel_type: PixelType) -> Result<DatasetF32> {
     let mut metadata = dataset.metadata.clone();
     metadata.pixel_type = pixel_type;
@@ -2087,6 +2377,456 @@ fn stack_delete_slice(dataset: &DatasetF32, index: usize) -> Result<DatasetF32> 
     let mut metadata = dataset.metadata.clone();
     metadata.dims[z_axis].size -= 1;
     Ok(Dataset::new(data, metadata)?)
+}
+
+fn stack_to_hyperstack(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let stack_axis = axis_index(dataset, AxisKind::Z)?;
+    if dataset.axis_index(AxisKind::Channel).is_some()
+        || dataset.axis_index(AxisKind::Time).is_some()
+    {
+        return Err(OpsError::UnsupportedLayout(
+            "Stack to Hyperstack requires a linear X/Y/Z stack".to_string(),
+        ));
+    }
+    let input_shape = dataset.shape();
+    let width = input_shape[x_axis];
+    let height = input_shape[y_axis];
+    let stack_size = input_shape[stack_axis];
+    if stack_size <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Stack to Hyperstack requires a stack".to_string(),
+        ));
+    }
+
+    let channels = get_optional_usize(params, "channels", 1);
+    let slices = get_optional_usize(params, "slices", stack_size);
+    let frames = get_optional_usize(params, "frames", 1);
+    if channels == 0 || slices == 0 || frames == 0 {
+        return Err(OpsError::InvalidParams(
+            "channels, slices and frames must be positive".to_string(),
+        ));
+    }
+    if channels * slices * frames != stack_size {
+        return Err(OpsError::InvalidParams(format!(
+            "channels x slices x frames ({}) must equal stack size ({stack_size})",
+            channels * slices * frames
+        )));
+    }
+    let order = hyperstack_order(params)?;
+
+    let mut output_shape = vec![height, width];
+    let z_axis = if slices > 1 {
+        output_shape.push(slices);
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+    let channel_axis = if channels > 1 {
+        output_shape.push(channels);
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+    let time_axis = if frames > 1 {
+        output_shape.push(frames);
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let z = z_axis.map(|axis| coord[axis]).unwrap_or(0);
+        let channel = channel_axis.map(|axis| coord[axis]).unwrap_or(0);
+        let time = time_axis.map(|axis| coord[axis]).unwrap_or(0);
+        let stack_index =
+            hyperstack_linear_index(order, channel, z, time, channels, slices, frames);
+        let mut src = vec![0usize; dataset.ndim()];
+        src[y_axis] = coord[0];
+        src[x_axis] = coord[1];
+        src[stack_axis] = stack_index;
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build hyperstack dataset".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims = vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)];
+    if slices > 1 {
+        metadata.dims.push(Dim::new(AxisKind::Z, slices));
+    }
+    if channels > 1 {
+        metadata.dims.push(Dim::new(AxisKind::Channel, channels));
+    }
+    if frames > 1 {
+        metadata.dims.push(Dim::new(AxisKind::Time, frames));
+    }
+    metadata.extras.insert(
+        "hyperstack_dimensions".to_string(),
+        json!({
+            "channels": channels,
+            "slices": slices,
+            "frames": frames
+        }),
+    );
+    metadata
+        .extras
+        .insert("hyperstack_source_order".to_string(), json!(order));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn hyperstack_to_stack(dataset: &DatasetF32) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let channel_axis = dataset.axis_index(AxisKind::Channel);
+    let z_axis = dataset.axis_index(AxisKind::Z);
+    let time_axis = dataset.axis_index(AxisKind::Time);
+    if channel_axis.is_none() && time_axis.is_none() {
+        return Err(OpsError::UnsupportedLayout(
+            "Hyperstack to Stack requires a Channel or Time axis".to_string(),
+        ));
+    }
+
+    let shape = dataset.shape();
+    let width = shape[x_axis];
+    let height = shape[y_axis];
+    let channels = channel_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let slices = z_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let frames = time_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let stack_size = channels * slices * frames;
+    let output_shape = vec![height, width, stack_size];
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+
+    iterate_indices(&output_shape, |coord| {
+        let stack_index = coord[2];
+        let channel = stack_index % channels;
+        let z = (stack_index / channels) % slices;
+        let time = stack_index / (channels * slices);
+        let mut src = vec![0usize; dataset.ndim()];
+        src[y_axis] = coord[0];
+        src[x_axis] = coord[1];
+        if let Some(axis) = channel_axis {
+            src[axis] = channel;
+        }
+        if let Some(axis) = z_axis {
+            src[axis] = z;
+        }
+        if let Some(axis) = time_axis {
+            src[axis] = time;
+        }
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build flattened stack".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims = vec![
+        Dim::new(AxisKind::Y, height),
+        Dim::new(AxisKind::X, width),
+        Dim::new(AxisKind::Z, stack_size),
+    ];
+    metadata.extras.insert(
+        "hyperstack_to_stack_dimensions".to_string(),
+        json!({
+            "channels": channels,
+            "slices": slices,
+            "frames": frames
+        }),
+    );
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn hyperstack_reduce_dimensionality(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let channel_axis = dataset.axis_index(AxisKind::Channel);
+    let z_axis = dataset.axis_index(AxisKind::Z);
+    let time_axis = dataset.axis_index(AxisKind::Time);
+    if channel_axis.is_none() && time_axis.is_none() {
+        return Err(OpsError::UnsupportedLayout(
+            "Reduce Dimensionality requires a hyperstack".to_string(),
+        ));
+    }
+
+    let shape = dataset.shape();
+    let width = shape[x_axis];
+    let height = shape[y_axis];
+    let channels = channel_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let slices = z_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let frames = time_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let keep_channels = optional_bool_param(params, "keep_channels", true);
+    let keep_slices = optional_bool_param(params, "keep_slices", true);
+    let keep_frames = optional_bool_param(params, "keep_frames", true);
+    let current_channel = checked_axis_param(params, "channel", channels)?;
+    let current_z = checked_axis_param(params, "z", slices)?;
+    let current_time = checked_axis_param(params, "time", frames)?;
+
+    let mut output_shape = vec![height, width];
+    let output_z_axis = if keep_slices && slices > 1 {
+        output_shape.push(slices);
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+    let output_channel_axis = if keep_channels && channels > 1 {
+        output_shape.push(channels);
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+    let output_time_axis = if keep_frames && frames > 1 {
+        output_shape.push(frames);
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut src = vec![0usize; dataset.ndim()];
+        src[y_axis] = coord[0];
+        src[x_axis] = coord[1];
+        if let Some(axis) = z_axis {
+            src[axis] = output_z_axis
+                .map(|output_axis| coord[output_axis])
+                .unwrap_or(current_z);
+        }
+        if let Some(axis) = channel_axis {
+            src[axis] = output_channel_axis
+                .map(|output_axis| coord[output_axis])
+                .unwrap_or(current_channel);
+        }
+        if let Some(axis) = time_axis {
+            src[axis] = output_time_axis
+                .map(|output_axis| coord[output_axis])
+                .unwrap_or(current_time);
+        }
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build reduced hyperstack".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims = vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)];
+    if let Some(axis) = output_z_axis {
+        metadata
+            .dims
+            .push(Dim::new(AxisKind::Z, output_shape[axis]));
+    }
+    if let Some(axis) = output_channel_axis {
+        metadata
+            .dims
+            .push(Dim::new(AxisKind::Channel, output_shape[axis]));
+    }
+    if let Some(axis) = output_time_axis {
+        metadata
+            .dims
+            .push(Dim::new(AxisKind::Time, output_shape[axis]));
+    }
+    metadata.extras.insert(
+        "reduced_hyperstack_source_position".to_string(),
+        json!({
+            "channel": current_channel,
+            "z": current_z,
+            "time": current_time
+        }),
+    );
+    metadata.extras.insert(
+        "reduced_hyperstack_kept_axes".to_string(),
+        json!({
+            "channels": keep_channels,
+            "slices": keep_slices,
+            "frames": keep_frames
+        }),
+    );
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn hyperstack_subset(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let channel_axis = dataset.axis_index(AxisKind::Channel);
+    let z_axis = dataset.axis_index(AxisKind::Z);
+    let time_axis = dataset.axis_index(AxisKind::Time);
+    if channel_axis.is_none() && z_axis.is_none() && time_axis.is_none() {
+        return Err(OpsError::UnsupportedLayout(
+            "Make Subset requires a stack or hyperstack".to_string(),
+        ));
+    }
+
+    let shape = dataset.shape();
+    let width = shape[x_axis];
+    let height = shape[y_axis];
+    let channels = channel_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let slices = z_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let frames = time_axis.map(|axis| shape[axis]).unwrap_or(1);
+    let selected_channels = parse_axis_selection(params, &["channels", "c"], channels)?;
+    let selected_slices = parse_axis_selection(params, &["slices", "z"], slices)?;
+    let selected_frames = parse_axis_selection(params, &["frames", "t", "time"], frames)?;
+
+    let mut output_shape = vec![height, width];
+    let output_z_axis = if selected_slices.len() > 1 {
+        output_shape.push(selected_slices.len());
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+    let output_channel_axis = if selected_channels.len() > 1 {
+        output_shape.push(selected_channels.len());
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+    let output_time_axis = if selected_frames.len() > 1 {
+        output_shape.push(selected_frames.len());
+        Some(output_shape.len() - 1)
+    } else {
+        None
+    };
+
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut src = vec![0usize; dataset.ndim()];
+        src[y_axis] = coord[0];
+        src[x_axis] = coord[1];
+        if let Some(axis) = z_axis {
+            let index = output_z_axis.map(|axis| coord[axis]).unwrap_or(0);
+            src[axis] = selected_slices[index];
+        }
+        if let Some(axis) = channel_axis {
+            let index = output_channel_axis.map(|axis| coord[axis]).unwrap_or(0);
+            src[axis] = selected_channels[index];
+        }
+        if let Some(axis) = time_axis {
+            let index = output_time_axis.map(|axis| coord[axis]).unwrap_or(0);
+            src[axis] = selected_frames[index];
+        }
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build hyperstack subset".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims = vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)];
+    if let Some(axis) = output_z_axis {
+        metadata
+            .dims
+            .push(Dim::new(AxisKind::Z, output_shape[axis]));
+    }
+    if let Some(axis) = output_channel_axis {
+        metadata
+            .dims
+            .push(Dim::new(AxisKind::Channel, output_shape[axis]));
+    }
+    if let Some(axis) = output_time_axis {
+        metadata
+            .dims
+            .push(Dim::new(AxisKind::Time, output_shape[axis]));
+    }
+    metadata.extras.insert(
+        "hyperstack_subset_channels".to_string(),
+        json!(
+            selected_channels
+                .iter()
+                .map(|index| index + 1)
+                .collect::<Vec<_>>()
+        ),
+    );
+    metadata.extras.insert(
+        "hyperstack_subset_slices".to_string(),
+        json!(
+            selected_slices
+                .iter()
+                .map(|index| index + 1)
+                .collect::<Vec<_>>()
+        ),
+    );
+    metadata.extras.insert(
+        "hyperstack_subset_frames".to_string(),
+        json!(
+            selected_frames
+                .iter()
+                .map(|index| index + 1)
+                .collect::<Vec<_>>()
+        ),
+    );
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn parse_axis_selection(
+    params: &Value,
+    keys: &[&str],
+    size: usize,
+) -> Result<Vec<usize>> {
+    for key in keys {
+        if let Some(selection) = params
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|selection| !selection.is_empty())
+        {
+            return parse_one_based_slice_selection(selection, size);
+        }
+    }
+    Ok((0..size).collect())
+}
+
+fn optional_bool_param(params: &Value, key: &str, default: bool) -> bool {
+    params.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+fn checked_axis_param(params: &Value, key: &str, size: usize) -> Result<usize> {
+    let index = get_optional_usize(params, key, 0);
+    if index >= size {
+        return Err(OpsError::InvalidParams(format!(
+            "`{key}` index is outside axis bounds"
+        )));
+    }
+    Ok(index)
+}
+
+fn hyperstack_order(params: &Value) -> Result<&'static str> {
+    match params
+        .get("order")
+        .and_then(Value::as_str)
+        .unwrap_or("czt")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "czt" | "default" => Ok("czt"),
+        "ctz" => Ok("ctz"),
+        "zct" => Ok("zct"),
+        "ztc" => Ok("ztc"),
+        "tcz" => Ok("tcz"),
+        "tzc" => Ok("tzc"),
+        other => Err(OpsError::InvalidParams(format!(
+            "unsupported hyperstack order `{other}`"
+        ))),
+    }
+}
+
+fn hyperstack_linear_index(
+    order: &str,
+    channel: usize,
+    z: usize,
+    time: usize,
+    channels: usize,
+    slices: usize,
+    frames: usize,
+) -> usize {
+    let (first, middle, last) = match order {
+        "ctz" => ((channel, channels), (time, frames), (z, slices)),
+        "zct" => ((z, slices), (channel, channels), (time, frames)),
+        "ztc" => ((z, slices), (time, frames), (channel, channels)),
+        "tcz" => ((time, frames), (channel, channels), (z, slices)),
+        "tzc" => ((time, frames), (z, slices), (channel, channels)),
+        _ => ((channel, channels), (z, slices), (time, frames)),
+    };
+    first.0 + middle.0 * first.1 + last.0 * first.1 * middle.1
 }
 
 fn stack_substack(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
@@ -2899,6 +3639,43 @@ fn apply_set_scale(metadata: &mut Metadata, dataset: &DatasetF32, params: &Value
     metadata
         .extras
         .insert("global_calibration".to_string(), json!(global));
+    Ok(())
+}
+
+fn apply_calibration_metadata(metadata: &mut Metadata, params: &Value) -> Result<()> {
+    let function = params
+        .get("function")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .trim();
+    let normalized_function = function.to_ascii_lowercase().replace([' ', '_'], "");
+    if !normalized_function.is_empty() && normalized_function != "none" {
+        return Err(OpsError::InvalidParams(format!(
+            "unsupported calibration function `{function}`"
+        )));
+    }
+
+    let unit = params
+        .get("unit")
+        .and_then(Value::as_str)
+        .filter(|unit| !unit.trim().is_empty())
+        .unwrap_or("Gray Value")
+        .trim();
+    let global = params
+        .get("global")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    metadata
+        .extras
+        .insert("value_unit".to_string(), json!(unit));
+    metadata
+        .extras
+        .insert("density_calibration_function".to_string(), json!("none"));
+    metadata
+        .extras
+        .insert("global_density_calibration".to_string(), json!(global));
+
     Ok(())
 }
 
@@ -4557,6 +5334,136 @@ fn sample_clamped(
     index[x_axis] = x.clamp(0, dataset.shape()[x_axis] as isize - 1) as usize;
     index[y_axis] = y.clamp(0, dataset.shape()[y_axis] as isize - 1) as usize;
     dataset.data[IxDyn(&index)]
+}
+
+fn surface_plot_xy(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let input_shape = dataset.shape();
+    let width = input_shape[x_axis];
+    let height = input_shape[y_axis];
+    if width == 0 || height == 0 {
+        return Err(OpsError::UnsupportedLayout(
+            "Surface Plot requires a non-empty X/Y image".to_string(),
+        ));
+    }
+
+    let mut base_coord = vec![0usize; dataset.ndim()];
+    for (axis_kind, key) in [
+        (AxisKind::Z, "z"),
+        (AxisKind::Time, "time"),
+        (AxisKind::Channel, "channel"),
+    ] {
+        if let Some(axis) = dataset.axis_index(axis_kind) {
+            base_coord[axis] = get_optional_usize(params, key, 0).min(input_shape[axis] - 1);
+        }
+    }
+
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for y in 0..height {
+        for x in 0..width {
+            let mut coord = base_coord.clone();
+            coord[x_axis] = x;
+            coord[y_axis] = y;
+            let value = dataset.data[IxDyn(&coord)];
+            if value.is_finite() {
+                min = min.min(value);
+                max = max.max(value);
+            }
+        }
+    }
+    if min == f32::INFINITY {
+        min = 0.0;
+        max = 1.0;
+    }
+    let span = (max - min).max(f32::EPSILON);
+
+    let plot_width = get_optional_usize(params, "plot_width", width.max(64)).max(1);
+    let polygon_multiplier = get_optional_usize(params, "polygon_multiplier", 100).clamp(10, 400);
+    let source_background_lighter = params
+        .get("source_background_lighter")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let black_fill = params
+        .get("black_fill")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let rows = ((height as f32) * (polygon_multiplier as f32 / 100.0))
+        .round()
+        .max(1.0) as usize;
+    let height_scale = (plot_width as f32 * 0.45).max(1.0);
+    let row_step = (plot_width as f32 * 0.18 / rows.max(1) as f32).max(1.0);
+    let skew = (plot_width as f32 * 0.35 / rows.max(1) as f32).max(0.0);
+    let margin = 8usize;
+    let output_width = plot_width + (skew * rows as f32).ceil() as usize + margin * 2;
+    let output_height = (height_scale + row_step * rows as f32).ceil() as usize + margin * 2 + 1;
+    let background = if black_fill { 0.0 } else { 1.0 };
+    let mut output = vec![background; output_width * output_height];
+
+    for row in (0..rows).rev() {
+        let src_y = ((row as f32 + 0.5) * height as f32 / rows as f32)
+            .floor()
+            .clamp(0.0, (height - 1) as f32) as usize;
+        let depth = rows - 1 - row;
+        for col in 0..plot_width {
+            let src_x = ((col as f32 + 0.5) * width as f32 / plot_width as f32)
+                .floor()
+                .clamp(0.0, (width - 1) as f32) as usize;
+            let mut coord = base_coord.clone();
+            coord[x_axis] = src_x;
+            coord[y_axis] = src_y;
+            let mut normalized = ((dataset.data[IxDyn(&coord)] - min) / span).clamp(0.0, 1.0);
+            if source_background_lighter {
+                normalized = 1.0 - normalized;
+            }
+
+            let base_x = margin as f32 + col as f32 + depth as f32 * skew;
+            let base_y = margin as f32 + height_scale + depth as f32 * row_step;
+            let top_y = base_y - normalized * height_scale;
+            let shade = (1.0 - normalized * 0.85).clamp(0.0, 1.0);
+            let x = base_x.round() as usize;
+            let y0 = top_y.floor().max(0.0) as usize;
+            let y1 = base_y.ceil().min((output_height - 1) as f32) as usize;
+            if x >= output_width {
+                continue;
+            }
+            for y in y0..=y1 {
+                output[y * output_width + x] = shade;
+            }
+        }
+    }
+
+    let data =
+        ArrayD::from_shape_vec(IxDyn(&[output_height, output_width]), output).map_err(|_| {
+            OpsError::UnsupportedLayout("failed to build surface plot dataset".to_string())
+        })?;
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, output_height),
+            Dim::new(AxisKind::X, output_width),
+        ],
+        pixel_type: PixelType::F32,
+        channel_names: Vec::new(),
+        source: dataset.metadata.source.clone(),
+        extras: dataset.metadata.extras.clone(),
+    };
+    metadata.extras.insert(
+        "surface_plot_source_shape".to_string(),
+        json!([height, width]),
+    );
+    metadata
+        .extras
+        .insert("surface_plot_min".to_string(), json!(min));
+    metadata
+        .extras
+        .insert("surface_plot_max".to_string(), json!(max));
+    metadata.extras.insert(
+        "surface_plot_polygon_multiplier".to_string(),
+        json!(polygon_multiplier),
+    );
+    Ok(Dataset::new(data, metadata)?)
 }
 
 fn axis_index(dataset: &DatasetF32, axis: AxisKind) -> Result<usize> {

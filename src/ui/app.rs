@@ -1,6 +1,6 @@
 use super::state::{
-    DesktopState, MeasurementSettings, ResultsTableState, load_desktop_state, push_recent_file,
-    save_desktop_state,
+    BinaryOptions, DesktopState, MeasurementSettings, OverlaySettings, ResultsTableState,
+    load_desktop_state, push_recent_file, save_desktop_state,
 };
 use super::{command_registry, interaction};
 
@@ -14,7 +14,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use super::interaction::roi::RoiKind;
+use super::interaction::roi::{RoiKind, RoiModel, RoiStore};
 use super::interaction::tooling::{
     LineMode, OvalMode, PointMode, RectMode, ToolId, ToolOptionsState, ToolState,
 };
@@ -25,7 +25,7 @@ use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
 use crate::runtime::AppContext;
 use eframe::egui;
 use image::load_from_memory;
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{ArrayD, Axis, IxDyn, stack};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -37,6 +37,10 @@ const SOURCE_PREVIEW_PREFIX: &str = "preview:";
 const VIEWER_MIN_WINDOW_SIZE: [f32; 2] = [220.0, 160.0];
 const VIEWER_WINDOW_EXTRA_SIZE: [f32; 2] = [24.0, 120.0];
 const LAUNCHER_MIN_WINDOW_SIZE: [f32; 2] = [600.0, 200.0];
+const BINARY_MAX_ITERATIONS: usize = 100;
+const BINARY_MAX_COUNT: usize = 8;
+const SLICE_LABELS_KEY: &str = "slice_labels";
+const CURRENT_SLICE_LABEL_KEY: &str = "Slice_Label";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MenuManifestTopLevel {
@@ -455,6 +459,7 @@ struct NewImageDialogState {
     height: usize,
     slices: usize,
     channels: usize,
+    frames: usize,
     pixel_type: PixelType,
     fill: f32,
 }
@@ -467,6 +472,7 @@ impl Default for NewImageDialogState {
             height: 512,
             slices: 1,
             channels: 1,
+            frames: 1,
             pixel_type: PixelType::F32,
             fill: 0.0,
         }
@@ -509,6 +515,25 @@ impl Default for StackPositionDialogState {
             channel: 1,
             slice: 1,
             frame: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StackLabelDialogState {
+    open: bool,
+    window_label: String,
+    slice: usize,
+    label: String,
+}
+
+impl Default for StackLabelDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            slice: 1,
+            label: String::new(),
         }
     }
 }
@@ -622,6 +647,7 @@ struct ViewerUiState {
     pinned: Option<HoverInfo>,
     frame: Option<Arc<ViewerFrameBuffer>>,
     texture: Option<egui::TextureHandle>,
+    lookup_table: LookupTable,
     last_request: Option<ViewerFrameRequest>,
     last_generation: u64,
     initial_magnification: f32,
@@ -651,6 +677,7 @@ impl ViewerUiState {
             pinned: None,
             frame: None,
             texture: None,
+            lookup_table: LookupTable::Grays,
             last_request: None,
             last_generation: 0,
             initial_magnification: 1.0,
@@ -717,6 +744,12 @@ enum UiAction {
     },
 }
 
+#[derive(Debug, Clone)]
+struct StoredCommand {
+    command_id: String,
+    params: Option<Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ZoomCommand {
     In,
@@ -739,6 +772,72 @@ enum LayoutMode {
     Cascade,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum OverlayVisibility {
+    Show,
+    Hide,
+    Toggle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LookupTable {
+    Grays,
+    Inverted,
+    Fire,
+    Ice,
+    Spectrum,
+    Rgb332,
+    Red,
+    Green,
+    Blue,
+    Cyan,
+    Magenta,
+    Yellow,
+    RedGreen,
+}
+
+fn binary_morphology_uses_options(command_id: &str) -> bool {
+    matches!(
+        command_id,
+        "process.binary.erode"
+            | "process.binary.dilate"
+            | "process.binary.open"
+            | "process.binary.close"
+    )
+}
+
+fn clamp_binary_options(options: &mut BinaryOptions) {
+    options.iterations = options.iterations.clamp(1, BINARY_MAX_ITERATIONS);
+    options.count = options.count.clamp(1, BINARY_MAX_COUNT);
+}
+
+fn update_binary_options_from_params(options: &mut BinaryOptions, params: &Value) {
+    if let Some(iterations) = params.get("iterations").and_then(Value::as_u64) {
+        options.iterations = iterations as usize;
+    }
+    if let Some(count) = params.get("count").and_then(Value::as_u64) {
+        options.count = count as usize;
+    }
+    clamp_binary_options(options);
+}
+
+fn binary_morphology_params(
+    command_id: &str,
+    request_params: Option<Value>,
+    options: &BinaryOptions,
+) -> Value {
+    let mut params = command_registry::merge_params(command_id, request_params);
+    if binary_morphology_uses_options(command_id) {
+        if let Value::Object(map) = &mut params {
+            map.entry("iterations".to_string())
+                .or_insert_with(|| json!(options.iterations.clamp(1, BINARY_MAX_ITERATIONS)));
+            map.entry("count".to_string())
+                .or_insert_with(|| json!(options.count.clamp(1, BINARY_MAX_COUNT)));
+        }
+    }
+    params
+}
+
 struct ImageUiApp {
     state: UiState,
     desktop_state: DesktopState,
@@ -758,17 +857,20 @@ struct ImageUiApp {
     resize_dialog: ResizeDialogState,
     canvas_dialog: ResizeDialogState,
     stack_position_dialog: StackPositionDialogState,
+    stack_label_dialog: StackLabelDialogState,
     zoom_set_dialog: ZoomSetDialogState,
     color_dialog: ColorDialogState,
     raw_import_dialog: RawImportDialogState,
     url_import_dialog: UrlImportDialogState,
     command_finder: CommandFinderState,
     roi_manager: RoiManagerState,
+    last_repeatable_command: Option<StoredCommand>,
     active_viewer_label: Option<String>,
     worker_tx: Sender<WorkerEvent>,
     worker_rx: Receiver<WorkerEvent>,
     focus_launcher: bool,
     focus_viewer_label: Option<String>,
+    show_all_windows_requested: bool,
     should_quit: bool,
 }
 
@@ -828,17 +930,20 @@ impl ImageUiApp {
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
+            stack_label_dialog: StackLabelDialogState::default(),
             zoom_set_dialog: ZoomSetDialogState::default(),
             color_dialog: ColorDialogState::default(),
             raw_import_dialog: RawImportDialogState::default(),
             url_import_dialog: UrlImportDialogState::default(),
             command_finder: CommandFinderState::default(),
             roi_manager: RoiManagerState::default(),
+            last_repeatable_command: None,
             active_viewer_label: None,
             worker_tx,
             worker_rx,
             focus_launcher: false,
             focus_viewer_label: None,
+            show_all_windows_requested: false,
             should_quit: false,
         };
 
@@ -1244,39 +1349,7 @@ impl ImageUiApp {
     }
 
     fn create_new_image(&mut self, params: &Value) -> Result<String, String> {
-        let width = params.get("width").and_then(Value::as_u64).unwrap_or(512) as usize;
-        let height = params.get("height").and_then(Value::as_u64).unwrap_or(512) as usize;
-        let slices = params.get("slices").and_then(Value::as_u64).unwrap_or(1) as usize;
-        let channels = params.get("channels").and_then(Value::as_u64).unwrap_or(1) as usize;
-        let fill = params.get("fill").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-        let pixel_type = match params
-            .get("pixelType")
-            .and_then(Value::as_str)
-            .unwrap_or("f32")
-        {
-            "u8" => PixelType::U8,
-            "u16" => PixelType::U16,
-            _ => PixelType::F32,
-        };
-        let mut shape = vec![height, width];
-        let mut dims = vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)];
-        if slices > 1 {
-            shape.push(slices);
-            dims.push(Dim::new(AxisKind::Z, slices));
-        }
-        if channels > 1 {
-            shape.push(channels);
-            dims.push(Dim::new(AxisKind::Channel, channels));
-        }
-        let len: usize = shape.iter().product();
-        let data = ArrayD::from_shape_vec(IxDyn(&shape), vec![fill; len])
-            .map_err(|error| format!("new image shape error: {error}"))?;
-        let metadata = Metadata {
-            dims,
-            pixel_type,
-            ..Metadata::default()
-        };
-        let dataset = Dataset::new(data, metadata).map_err(|error| error.to_string())?;
+        let dataset = new_image_dataset(params)?;
         let path = normalize_path(&PathBuf::from(format!(
             "Untitled-{}.tif",
             self.state.next_window_id + 1
@@ -1477,6 +1550,154 @@ impl ImageUiApp {
         Ok("measurement added to results".to_string())
     }
 
+    fn measure_stack(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Measure Stack".to_string())?
+            .to_string();
+        let (channel, time, roi_bbox) = {
+            let viewer = self
+                .viewers_ui
+                .get(&viewer_label)
+                .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+            (viewer.channel, viewer.t, selected_roi_bbox(viewer))
+        };
+        let dataset = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?
+            .ensure_committed_dataset()?;
+        let rows = stack_measurement_rows(
+            dataset.as_ref(),
+            &self.desktop_state.measurement_settings,
+            roi_bbox,
+            channel,
+            time,
+        )?;
+        let count = rows.len();
+        for row in rows {
+            self.results_table.add_row(row);
+        }
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(format!("measured {count} stack slices"))
+    }
+
+    fn plot_stack_xy_profile(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Plot XY Profile".to_string())?
+            .to_string();
+        let dataset = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?
+            .ensure_committed_dataset()?;
+        let rows = stack_xy_profile_rows(dataset.as_ref(), params)?;
+        let count = rows.len();
+        self.results_table.clear();
+        for row in rows {
+            self.results_table.add_row(row);
+        }
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(format!("plotted XY profiles for {count} stack slices"))
+    }
+
+    fn open_stack_label_dialog(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Set Label".to_string())?
+            .to_string();
+        let (slice, label) = {
+            let viewer = self
+                .viewers_ui
+                .get(&viewer_label)
+                .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+            let dataset = self
+                .state
+                .label_to_session
+                .get(&viewer_label)
+                .and_then(ViewerSession::committed_dataset)
+                .ok_or_else(|| "Set Label requires a dataset-backed image".to_string())?;
+            let slice = viewer.z;
+            let label = stack_slice_label(dataset.as_ref(), slice).unwrap_or_default();
+            (slice, label)
+        };
+        self.stack_label_dialog.open = true;
+        self.stack_label_dialog.window_label = viewer_label;
+        self.stack_label_dialog.slice = slice + 1;
+        self.stack_label_dialog.label = label;
+        Ok("slice label dialog opened".to_string())
+    }
+
+    fn set_stack_slice_label(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Set Label".to_string())?
+            .to_string();
+        let viewer_z = self
+            .viewers_ui
+            .get(&viewer_label)
+            .map(|viewer| viewer.z)
+            .unwrap_or(0);
+        let slice = params
+            .get("slice")
+            .and_then(Value::as_u64)
+            .map(|slice| slice.saturating_sub(1) as usize)
+            .unwrap_or(viewer_z);
+        let label = params
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let dataset = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?
+            .ensure_committed_dataset()?;
+        let labeled = set_stack_slice_label_dataset(dataset.as_ref(), slice, &label)?;
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+        session.commit_dataset(Arc::new(labeled));
+        Ok(format!("set label for slice {}", slice + 1))
+    }
+
+    fn remove_stack_slice_labels(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Remove Slice Labels".to_string())?
+            .to_string();
+        let dataset = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?
+            .ensure_committed_dataset()?;
+        let unlabeled = remove_stack_slice_labels_dataset(dataset.as_ref())?;
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+        session.commit_dataset(Arc::new(unlabeled));
+        Ok("removed slice labels".to_string())
+    }
+
     fn image_to_results(&mut self, window_label: &str) -> Result<String, String> {
         let viewer_label = self
             .current_viewer_label(window_label)
@@ -1494,6 +1715,29 @@ impl ImageUiApp {
         Ok(format!("image slice copied to results ({row_count} rows)"))
     }
 
+    fn save_xy_coordinates(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for XY coordinates".to_string())?
+            .to_string();
+        let (slice, roi_bbox, _, _, _) = self.measurement_context(&viewer_label)?;
+        let rows = xy_coordinate_rows(&slice, roi_bbox, params)?;
+        let row_count = rows.len();
+        self.results_table.clear();
+        for row in rows {
+            self.results_table.add_row(row);
+        }
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(format!(
+            "XY coordinates copied to results ({row_count} rows)"
+        ))
+    }
+
     fn results_to_image(&mut self) -> Result<String, String> {
         let dataset = results_rows_to_dataset(&self.results_table.rows)?;
         let path = normalize_path(&PathBuf::from(format!(
@@ -1502,6 +1746,228 @@ impl ImageUiApp {
         )));
         let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
         Ok(format!("created results image in {label}"))
+    }
+
+    fn surface_plot_viewer(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for surface plot".to_string())?
+            .to_string();
+        let dataset = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?
+            .ensure_committed_dataset()?;
+        let output = self
+            .state
+            .app
+            .ops_service()
+            .execute("image.surface_plot", dataset.as_ref(), params)
+            .map_err(|error| error.to_string())?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "Surface Plot-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(output.dataset)));
+        Ok(format!("created surface plot in {label}"))
+    }
+
+    fn stack_to_images(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Stack to Images".to_string())?
+            .to_string();
+        let (source_path, dataset) = {
+            let session = self
+                .state
+                .label_to_session
+                .get_mut(&viewer_label)
+                .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+            let source_path = session.path.clone();
+            let dataset = session.ensure_committed_dataset()?;
+            (source_path, dataset)
+        };
+        let images = stack_to_image_datasets(dataset.as_ref())?;
+        let count = images.len();
+        for (index, image) in images.into_iter().enumerate() {
+            let path = stack_slice_path(&source_path, index + 1);
+            self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(image)));
+        }
+        Ok(format!("created {count} image windows from stack"))
+    }
+
+    fn images_to_stack(&mut self) -> Result<String, String> {
+        let mut labels = self
+            .state
+            .label_to_session
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|label| viewer_sort_key(label));
+
+        let mut images = Vec::new();
+        for label in labels {
+            let Some(session) = self.state.label_to_session.get_mut(&label) else {
+                continue;
+            };
+            let dataset = session.ensure_committed_dataset()?;
+            if dataset.axis_index(AxisKind::Z).is_some() {
+                continue;
+            }
+            let title = session
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Image")
+                .to_string();
+            images.push((title, dataset));
+        }
+
+        let image_refs = images
+            .iter()
+            .map(|(title, dataset)| (title.as_str(), dataset.as_ref()))
+            .collect::<Vec<_>>();
+        let stack = images_to_stack_dataset(&image_refs)?;
+        let count = image_refs.len();
+        let path = normalize_path(&PathBuf::from(format!(
+            "Stack-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(stack)));
+        Ok(format!("created stack {label} from {count} images"))
+    }
+
+    fn combine_stacks(&mut self, window_label: &str, params: &Value) -> Result<String, String> {
+        let first_label = params
+            .get("first")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.current_viewer_label(window_label).map(str::to_string))
+            .ok_or_else(|| "two open images are required for Combine".to_string())?;
+        let second_label = params
+            .get("second")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.next_dataset_viewer_label(&first_label))
+            .ok_or_else(|| "a second open image is required for Combine".to_string())?;
+        if first_label == second_label {
+            return Err("Combine requires two different images".to_string());
+        }
+        let vertical = params
+            .get("vertical")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let fill = params.get("fill").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let first = self.ensure_viewer_dataset(&first_label)?;
+        let second = self.ensure_viewer_dataset(&second_label)?;
+        let combined = combine_stack_datasets(first.as_ref(), second.as_ref(), vertical, fill)?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "Combined Stacks-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(combined)));
+        Ok(format!("created combined stack in {label}"))
+    }
+
+    fn concatenate_stacks(&mut self, params: &Value) -> Result<String, String> {
+        let fill = params.get("fill").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let mut labels = self
+            .state
+            .label_to_session
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|label| viewer_sort_key(label));
+
+        let mut datasets = Vec::new();
+        for label in labels {
+            let Some(session) = self.state.label_to_session.get_mut(&label) else {
+                continue;
+            };
+            let title = session
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Image")
+                .to_string();
+            let dataset = session.ensure_committed_dataset()?;
+            datasets.push((title, dataset));
+        }
+        let refs = datasets
+            .iter()
+            .map(|(title, dataset)| (title.as_str(), dataset.as_ref()))
+            .collect::<Vec<_>>();
+        let concatenated = concatenate_stack_datasets(&refs, fill)?;
+        let count = refs.len();
+        let path = normalize_path(&PathBuf::from(format!(
+            "Concatenated Stacks-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(concatenated)));
+        Ok(format!(
+            "created concatenated stack {label} from {count} images"
+        ))
+    }
+
+    fn insert_stack(&mut self, window_label: &str, params: &Value) -> Result<String, String> {
+        let destination_label = params
+            .get("destination")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.current_viewer_label(window_label).map(str::to_string))
+            .ok_or_else(|| "a destination image is required for Insert".to_string())?;
+        let source_label = params
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.next_dataset_viewer_label(&destination_label))
+            .ok_or_else(|| "a source image is required for Insert".to_string())?;
+        if source_label == destination_label {
+            return Err("Insert requires different source and destination images".to_string());
+        }
+        let x = params.get("x").and_then(Value::as_i64).unwrap_or(0) as isize;
+        let y = params.get("y").and_then(Value::as_i64).unwrap_or(0) as isize;
+        let source = self.ensure_viewer_dataset(&source_label)?;
+        let destination = self.ensure_viewer_dataset(&destination_label)?;
+        let inserted = insert_stack_dataset(source.as_ref(), destination.as_ref(), x, y)?;
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&destination_label)
+            .ok_or_else(|| format!("no viewer session for `{destination_label}`"))?;
+        session.commit_dataset(Arc::new(inserted));
+        if let Some(viewer) = self.viewers_ui.get_mut(&destination_label) {
+            viewer.last_request = None;
+            viewer.last_generation = 0;
+            viewer.status_message = "stack insert complete".to_string();
+        }
+        self.set_active_viewer(Some(destination_label.clone()));
+        Ok(format!("inserted {source_label} into {destination_label}"))
+    }
+
+    fn ensure_viewer_dataset(&mut self, label: &str) -> Result<Arc<DatasetF32>, String> {
+        self.state
+            .label_to_session
+            .get_mut(label)
+            .ok_or_else(|| format!("no viewer session for `{label}`"))?
+            .ensure_committed_dataset()
+    }
+
+    fn next_dataset_viewer_label(&self, first_label: &str) -> Option<String> {
+        let mut labels = self
+            .state
+            .label_to_session
+            .keys()
+            .filter(|label| label.as_str() != first_label)
+            .cloned()
+            .collect::<Vec<_>>();
+        labels.sort_by_key(|label| viewer_sort_key(label));
+        labels.into_iter().next()
     }
 
     fn summarize_results(&mut self) -> Result<String, String> {
@@ -1705,6 +2171,221 @@ impl ImageUiApp {
             viewer.rois.selected_roi_id = original;
         }
         Ok("measured all ROIs".to_string())
+    }
+
+    fn label_active_selection(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for label".to_string())?
+            .to_string();
+        let label_number = self.results_table.rows.len();
+        if label_number == 0 {
+            return Err("measurement counter is zero".to_string());
+        }
+
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        if viewer.rois.selected_roi_id.is_none() && viewer.rois.active_roi.is_some() {
+            viewer.rois.commit_active(true);
+        }
+
+        let (anchor, position) = {
+            let roi = viewer
+                .rois
+                .selected_roi_id
+                .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
+                .or(viewer.rois.active_roi.as_ref())
+                .ok_or_else(|| "a selection is required for label".to_string())?;
+            let anchor = roi_label_anchor(&roi.kind)
+                .ok_or_else(|| "a valid selection is required for label".to_string())?;
+            (anchor, roi.position)
+        };
+
+        viewer.rois.begin_active(
+            RoiKind::Text {
+                at: anchor,
+                text: label_number.to_string(),
+            },
+            position,
+        );
+        if let Some(active) = viewer.rois.active_roi.as_mut() {
+            active.name = format!("Label {label_number}");
+        }
+        viewer.rois.commit_active(true);
+        viewer.tool_message = Some(format!("labeled selection {label_number}"));
+
+        Ok(format!("selection labeled {label_number}"))
+    }
+
+    fn add_selection_to_overlay(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay add".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        add_selection_to_overlay(&mut viewer.rois).map(str::to_string)
+    }
+
+    fn overlay_from_roi_manager(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay import".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let count = overlay_from_roi_manager(&mut viewer.rois)?;
+        self.desktop_state.utility_windows.roi_manager_open = true;
+        self.persist_desktop_state();
+        Ok(format!("loaded {count} ROI Manager elements into overlay"))
+    }
+
+    fn overlay_to_roi_manager(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay export".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let count = overlay_to_roi_manager(&mut viewer.rois)?;
+        self.desktop_state.utility_windows.roi_manager_open = true;
+        self.persist_desktop_state();
+        Ok(format!("{count} overlay elements available in ROI Manager"))
+    }
+
+    fn flatten_overlay(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay flatten".to_string())?
+            .to_string();
+        let (request, rois) = {
+            let viewer = self
+                .viewers_ui
+                .get(&viewer_label)
+                .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+            let position = interaction::roi::RoiPosition {
+                channel: viewer.channel,
+                z: viewer.z,
+                t: viewer.t,
+            };
+            let rois = viewer
+                .rois
+                .visible_rois(position)
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                ViewerFrameRequest {
+                    z: viewer.z,
+                    t: viewer.t,
+                    channel: viewer.channel,
+                },
+                rois,
+            )
+        };
+        let slice = self.active_dataset_slice(&viewer_label, &request)?;
+        let dataset = flatten_overlay_slice(&slice, &rois)?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "Flattened-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
+        Ok(format!("created flattened overlay image in {label}"))
+    }
+
+    fn apply_lookup_table(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for apply LUT".to_string())?
+            .to_string();
+        let (request, lut) = {
+            let viewer = self
+                .viewers_ui
+                .get(&viewer_label)
+                .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+            (
+                ViewerFrameRequest {
+                    z: viewer.z,
+                    t: viewer.t,
+                    channel: viewer.channel,
+                },
+                viewer.lookup_table,
+            )
+        };
+        let slice = self.active_dataset_slice(&viewer_label, &request)?;
+        let dataset = lookup_table_slice_to_rgb(&slice, lut)?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "Applied LUT-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
+        Ok(format!("created LUT-applied RGB image in {label}"))
+    }
+
+    fn remove_overlay(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay removal".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let count = viewer.rois.overlay_rois.len();
+        if count == 0 {
+            return Err("no overlay elements".to_string());
+        }
+        viewer.rois.overlay_rois.clear();
+        viewer.rois.selected_roi_id = None;
+        Ok(format!("removed {count} overlay elements"))
+    }
+
+    fn set_overlay_visibility(
+        &mut self,
+        window_label: &str,
+        mode: OverlayVisibility,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay visibility".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let count = apply_overlay_visibility(&mut viewer.rois.overlay_rois, mode)?;
+        Ok(match mode {
+            OverlayVisibility::Show => format!("showing {count} overlay elements"),
+            OverlayVisibility::Hide => format!("hid {count} overlay elements"),
+            OverlayVisibility::Toggle => format!("toggled {count} overlay elements"),
+        })
+    }
+
+    fn list_overlay_elements(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay list".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let rows = overlay_element_rows(&viewer.rois.overlay_rois)?;
+        let count = rows.len();
+        self.results_table.clear();
+        for row in rows {
+            self.results_table.add_row(row);
+        }
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(format!("listed {count} overlay elements"))
     }
 
     fn analyze_particles(&mut self, window_label: &str) -> Result<String, String> {
@@ -1994,6 +2675,17 @@ impl ImageUiApp {
         target
     }
 
+    fn show_all_windows(&mut self) -> Result<String, String> {
+        if self.viewers_ui.is_empty() {
+            self.focus_launcher = true;
+            return Err("no viewers are open".to_string());
+        }
+
+        self.show_all_windows_requested = true;
+        self.focus_launcher = true;
+        Ok("all windows shown".to_string())
+    }
+
     fn dispatch_command(
         &mut self,
         window_label: &str,
@@ -2009,6 +2701,54 @@ impl ImageUiApp {
             params,
         };
         self.execute_command(window_label, request)
+    }
+
+    fn remember_repeatable_command(
+        &mut self,
+        command_id: &str,
+        params: Option<&Value>,
+        result: &command_registry::CommandExecuteResult,
+    ) {
+        if command_id == "process.repeat_command"
+            || !matches!(result.status, command_registry::CommandExecuteStatus::Ok)
+        {
+            return;
+        }
+
+        let metadata = command_registry::metadata(command_id);
+        if !metadata.implemented || metadata.frontend_only {
+            return;
+        }
+
+        self.last_repeatable_command = Some(StoredCommand {
+            command_id: command_id.to_string(),
+            params: params.cloned(),
+        });
+    }
+
+    fn repeat_last_command(
+        &mut self,
+        window_label: &str,
+    ) -> command_registry::CommandExecuteResult {
+        let Some(command) = self.last_repeatable_command.clone() else {
+            return command_registry::CommandExecuteResult::blocked("no command to repeat");
+        };
+
+        let metadata = command_registry::metadata(&command.command_id);
+        let target_label = if metadata.requires_image && window_label == LAUNCHER_LABEL {
+            match self.active_viewer_label.clone() {
+                Some(label) => label,
+                None => {
+                    return command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required to repeat this command",
+                    );
+                }
+            }
+        } else {
+            window_label.to_string()
+        };
+
+        self.dispatch_command(&target_label, &command.command_id, command.params)
     }
 
     fn handle_local_command(
@@ -2037,12 +2777,19 @@ impl ImageUiApp {
             ));
         }
 
-        if command_id == "file.new" {
+        if command_id == "file.new" || command_id == "image.hyperstacks.new" {
             if let Some(params) = params {
                 return Some(match self.create_new_image(params) {
                     Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 });
+            }
+            if command_id == "image.hyperstacks.new" {
+                self.new_image_dialog.width = 400;
+                self.new_image_dialog.height = 300;
+                self.new_image_dialog.slices = 4;
+                self.new_image_dialog.channels = 3;
+                self.new_image_dialog.frames = 5;
             }
             self.new_image_dialog.open = true;
             return Some(command_registry::CommandExecuteResult::ok(
@@ -2517,6 +3264,28 @@ impl ImageUiApp {
                 viewer.pending_zoom = Some(ZoomCommand::Maximize);
                 Some(command_registry::CommandExecuteResult::ok("zoom maximized"))
             }
+            "image.lookup.invert_lut"
+            | "image.lookup.fire"
+            | "image.lookup.grays"
+            | "image.lookup.ice"
+            | "image.lookup.spectrum"
+            | "image.lookup.rgb332"
+            | "image.lookup.red"
+            | "image.lookup.green"
+            | "image.lookup.blue"
+            | "image.lookup.cyan"
+            | "image.lookup.magenta"
+            | "image.lookup.yellow"
+            | "image.lookup.red_green" => {
+                let lut = lookup_table_from_command(command_id).expect("lookup command");
+                viewer.lookup_table = lut;
+                viewer.texture = None;
+                viewer.last_request = None;
+                Some(command_registry::CommandExecuteResult::ok(format!(
+                    "{} LUT applied",
+                    lut.label()
+                )))
+            }
             "viewer.roi.clear" => {
                 viewer.rois.clear_all();
                 Some(command_registry::CommandExecuteResult::ok(
@@ -2561,6 +3330,7 @@ impl ImageUiApp {
         }
 
         match request.command_id.as_str() {
+            "process.repeat_command" => self.repeat_last_command(window_label),
             "file.close" => {
                 if window_label == LAUNCHER_LABEL {
                     command_registry::CommandExecuteResult::blocked(
@@ -2650,6 +3420,17 @@ impl ImageUiApp {
                     json!({ "target": target }),
                 )
             }
+            "window.main" => {
+                self.focus_launcher = true;
+                command_registry::CommandExecuteResult::ok("main window focused")
+            }
+            "window.put_behind" => {
+                let target = self.cycle_window(window_label, 1);
+                command_registry::CommandExecuteResult::with_payload(
+                    "window put behind",
+                    json!({ "target": target }),
+                )
+            }
             "edit.invert" => match self.viewer_start_op(
                 window_label,
                 ViewerOpRequest {
@@ -2726,6 +3507,10 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
+            "image.stacks.images_to_stack" => match self.images_to_stack() {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
             "image.stacks.plot_z_profile" => {
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
@@ -2740,6 +3525,54 @@ impl ImageUiApp {
                         "Z-axis profile started",
                         json!({ "job_id": ticket.job_id, "op": "image.stack.z_profile" }),
                     ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.measure_stack" => match self.measure_stack(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.stacks.plot_xy_profile" => {
+                let viewer_label = match self.current_viewer_label(window_label) {
+                    Some(label) => label.to_string(),
+                    None => {
+                        return command_registry::CommandExecuteResult::blocked(
+                            "a loaded image is required for Plot XY Profile",
+                        );
+                    }
+                };
+                let params = match self
+                    .viewers_ui
+                    .get(&viewer_label)
+                    .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))
+                    .and_then(|viewer| selected_roi_profile_params(viewer, request.params.as_ref()))
+                {
+                    Ok(params) => params,
+                    Err(error) => return command_registry::CommandExecuteResult::blocked(error),
+                };
+                match self.plot_stack_xy_profile(&viewer_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.set_label" => {
+                if request.params.is_none() {
+                    match self.open_stack_label_dialog(window_label) {
+                        Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    }
+                } else {
+                    let params =
+                        command_registry::merge_params(&request.command_id, request.params);
+                    match self.set_stack_slice_label(window_label, &params) {
+                        Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    }
+                }
+            }
+            "image.stacks.remove_slice_labels" => {
+                match self.remove_stack_slice_labels(window_label) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
@@ -2794,6 +3627,10 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
+            "image.stacks.stack_to_images" => match self.stack_to_images(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
             "image.stacks.z_project" => {
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
@@ -2808,6 +3645,27 @@ impl ImageUiApp {
                         "Z projection started",
                         json!({ "job_id": ticket.job_id, "op": "image.stack.z_project" }),
                     ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.combine" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.combine_stacks(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.concatenate" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.concatenate_stacks(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.insert" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.insert_stack(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
@@ -2875,6 +3733,87 @@ impl ImageUiApp {
                     Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
                         "stack reduction started",
                         json!({ "job_id": ticket.job_id, "op": "image.stack.reduce" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.hyperstacks.stack_to_hyperstack" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.to_hyperstack".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "stack-to-hyperstack started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.to_hyperstack" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.hyperstacks.hyperstack_to_stack" => {
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.hyperstack.to_stack".to_string(),
+                        params: json!({}),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "hyperstack-to-stack started",
+                        json!({ "job_id": ticket.job_id, "op": "image.hyperstack.to_stack" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.hyperstacks.reduce_dimensionality" => {
+                let mut params =
+                    command_registry::merge_params(&request.command_id, request.params);
+                if let Some(viewer) = self.viewers_ui.get(window_label)
+                    && let Some(map) = params.as_object_mut()
+                {
+                    if map.get("channel").map_or(true, Value::is_null) {
+                        map.insert("channel".to_string(), json!(viewer.channel));
+                    }
+                    if map.get("z").map_or(true, Value::is_null) {
+                        map.insert("z".to_string(), json!(viewer.z));
+                    }
+                    if map.get("time").map_or(true, Value::is_null) {
+                        map.insert("time".to_string(), json!(viewer.t));
+                    }
+                }
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.hyperstack.reduce_dimensionality".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "hyperstack dimensionality reduction started",
+                        json!({ "job_id": ticket.job_id, "op": "image.hyperstack.reduce_dimensionality" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.hyperstacks.make_subset" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.hyperstack.subset".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "hyperstack subset started",
+                        json!({ "job_id": ticket.job_id, "op": "image.hyperstack.subset" }),
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
@@ -3051,6 +3990,79 @@ impl ImageUiApp {
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
             "process.filters.show_circular_masks" => match self.show_circular_masks() {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.overlay.add_selection" => match self.add_selection_to_overlay(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.overlay.flatten" => match self.flatten_overlay(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.lookup.apply_lut" => match self.apply_lookup_table(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.binary.options" => {
+                if let Some(params) = request.params.as_ref() {
+                    update_binary_options_from_params(
+                        &mut self.desktop_state.binary_options,
+                        params,
+                    );
+                } else {
+                    clamp_binary_options(&mut self.desktop_state.binary_options);
+                }
+                self.desktop_state.utility_windows.binary_options_open = true;
+                self.persist_desktop_state();
+                command_registry::CommandExecuteResult::ok("binary options opened")
+            }
+            "image.overlay.labels" => {
+                self.desktop_state.utility_windows.overlay_labels_open = true;
+                self.persist_desktop_state();
+                command_registry::CommandExecuteResult::ok("overlay labels opened")
+            }
+            "image.overlay.from_roi_manager" => match self.overlay_from_roi_manager(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.overlay.to_roi_manager" => match self.overlay_to_roi_manager(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.overlay.hide" => {
+                match self.set_overlay_visibility(window_label, OverlayVisibility::Hide) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.overlay.show" => {
+                match self.set_overlay_visibility(window_label, OverlayVisibility::Show) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.overlay.toggle" => {
+                match self.set_overlay_visibility(window_label, OverlayVisibility::Toggle) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.overlay.remove" => match self.remove_overlay(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.overlay.options" => {
+                self.desktop_state.utility_windows.overlay_options_open = true;
+                self.persist_desktop_state();
+                command_registry::CommandExecuteResult::ok("overlay options opened")
+            }
+            "image.overlay.list" => match self.list_overlay_elements(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.overlay.measure" => match self.measure_all_rois(window_label) {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
@@ -3243,7 +4255,11 @@ impl ImageUiApp {
                     window_label,
                     ViewerOpRequest {
                         op: op.to_string(),
-                        params: json!({}),
+                        params: binary_morphology_params(
+                            &request.command_id,
+                            request.params,
+                            &self.desktop_state.binary_options,
+                        ),
                         mode: OpRunMode::Apply,
                     },
                 ) {
@@ -3412,7 +4428,7 @@ impl ImageUiApp {
                 window_label,
                 ViewerOpRequest {
                     op: "image.median_filter".to_string(),
-                    params: json!({ "radius": 2.0 }),
+                    params: command_registry::merge_params(&request.command_id, request.params),
                     mode: OpRunMode::Apply,
                 },
             ) {
@@ -3426,12 +4442,7 @@ impl ImageUiApp {
                 window_label,
                 ViewerOpRequest {
                     op: "image.convolve".to_string(),
-                    params: json!({
-                        "width": 3,
-                        "height": 3,
-                        "kernel": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-                        "normalize": false
-                    }),
+                    params: command_registry::merge_params(&request.command_id, request.params),
                     mode: OpRunMode::Apply,
                 },
             ) {
@@ -3476,7 +4487,7 @@ impl ImageUiApp {
                 window_label,
                 ViewerOpRequest {
                     op: "image.unsharp_mask".to_string(),
-                    params: json!({ "sigma": 1.0, "weight": 0.6 }),
+                    params: command_registry::merge_params(&request.command_id, request.params),
                     mode: OpRunMode::Apply,
                 },
             ) {
@@ -3491,11 +4502,16 @@ impl ImageUiApp {
                     .strip_prefix("process.filters.")
                     .unwrap_or_default()
                     .to_string();
+                let mut params =
+                    command_registry::merge_params(&request.command_id, request.params);
+                if let Some(params) = params.as_object_mut() {
+                    params.insert("filter".to_string(), json!(filter));
+                }
                 match self.viewer_start_op(
                     window_label,
                     ViewerOpRequest {
                         op: "image.rank_filter".to_string(),
-                        params: json!({ "filter": filter, "radius": 2.0 }),
+                        params,
                         mode: OpRunMode::Apply,
                     },
                 ) {
@@ -3610,6 +4626,23 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
+            "analyze.calibrate" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.calibrate".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "calibrate started",
+                        json!({ "job_id": ticket.job_id, "op": "image.calibrate" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "analyze.histogram" => {
                 let Some(viewer) = self.viewers_ui.get(window_label) else {
                     return command_registry::CommandExecuteResult::blocked(
@@ -3663,10 +4696,42 @@ impl ImageUiApp {
             "analyze.clear_results" => {
                 command_registry::CommandExecuteResult::ok(self.clear_results())
             }
+            "analyze.label" => match self.label_active_selection(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "analyze.surface_plot" => {
+                let Some(viewer) = self.viewers_ui.get(window_label) else {
+                    return command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required for surface plot",
+                    );
+                };
+                let mut params =
+                    command_registry::merge_params(&request.command_id, request.params);
+                if let Some(map) = params.as_object_mut() {
+                    map.entry("z".to_string())
+                        .or_insert_with(|| json!(viewer.z));
+                    map.entry("time".to_string())
+                        .or_insert_with(|| json!(viewer.t));
+                    map.entry("channel".to_string())
+                        .or_insert_with(|| json!(viewer.channel));
+                }
+                match self.surface_plot_viewer(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "analyze.tools.results" => {
                 self.desktop_state.utility_windows.results_open = true;
                 self.persist_desktop_state();
                 command_registry::CommandExecuteResult::ok("results table opened")
+            }
+            "analyze.tools.save_xy_coordinates" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.save_xy_coordinates(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
             }
             "analyze.tools.roi_manager" => {
                 self.desktop_state.utility_windows.roi_manager_open = true;
@@ -3719,6 +4784,10 @@ impl ImageUiApp {
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
             "window.cascade" => match self.layout_viewers(LayoutMode::Cascade) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "window.show_all" => match self.show_all_windows() {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
@@ -3865,7 +4934,7 @@ impl ImageUiApp {
 
         match compute_viewer_frame(&mut self.state, label, &request, None) {
             Ok(frame) => {
-                let color = to_color_image(&frame);
+                let color = to_color_image(&frame, viewer.lookup_table);
                 let viewer_state = self
                     .viewers_ui
                     .get_mut(label)
@@ -3897,6 +4966,9 @@ impl ImageUiApp {
     fn command_is_enabled(&self, window_label: &str, command_id: &str, menu_enabled: bool) -> bool {
         if !menu_enabled {
             return false;
+        }
+        if command_id == "process.repeat_command" {
+            return self.last_repeatable_command.is_some();
         }
         let metadata = command_registry::metadata(command_id);
         if !metadata.implemented || !metadata.scope.contains(window_label) {
@@ -4483,12 +5555,15 @@ impl ImageUiApp {
         self.draw_resize_dialog(ctx, actions, false);
         self.draw_resize_dialog(ctx, actions, true);
         self.draw_stack_position_dialog(ctx, actions);
+        self.draw_stack_label_dialog(ctx, actions);
         self.draw_zoom_set_dialog(ctx, actions);
         self.draw_color_dialog(ctx);
         self.draw_raw_import_dialog(ctx);
         self.draw_url_import_dialog(ctx, actions);
         self.draw_results_window(ctx);
         self.draw_measurement_settings_window(ctx);
+        self.draw_binary_options_window(ctx);
+        self.draw_overlay_settings_windows(ctx);
         self.draw_roi_manager_window(ctx, actions);
         self.draw_profile_plot_window(ctx);
         self.draw_help_windows(ctx);
@@ -4509,6 +5584,7 @@ impl ImageUiApp {
                 ui.add(
                     egui::DragValue::new(&mut self.new_image_dialog.channels).prefix("Channels "),
                 );
+                ui.add(egui::DragValue::new(&mut self.new_image_dialog.frames).prefix("Frames "));
                 ui.add(egui::DragValue::new(&mut self.new_image_dialog.fill).prefix("Fill "));
                 pixel_type_selector(ui, &mut self.new_image_dialog.pixel_type, "Pixel Type");
                 if ui.button("Create").clicked() {
@@ -4520,6 +5596,7 @@ impl ImageUiApp {
                             "height": self.new_image_dialog.height,
                             "slices": self.new_image_dialog.slices,
                             "channels": self.new_image_dialog.channels,
+                            "frames": self.new_image_dialog.frames,
                             "fill": self.new_image_dialog.fill,
                             "pixelType": pixel_type_id(self.new_image_dialog.pixel_type),
                         })),
@@ -4624,6 +5701,34 @@ impl ImageUiApp {
                 }
             });
         self.stack_position_dialog.open = open && self.stack_position_dialog.open;
+    }
+
+    fn draw_stack_label_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.stack_label_dialog.open {
+            return;
+        }
+        let target = self.stack_label_dialog.window_label.clone();
+        let mut open = self.stack_label_dialog.open;
+        egui::Window::new(format!(
+            "Set Slice Label ({})",
+            self.stack_label_dialog.slice
+        ))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.text_edit_singleline(&mut self.stack_label_dialog.label);
+            if ui.button("Apply").clicked() {
+                actions.push(UiAction::Command {
+                    window_label: target.clone(),
+                    command_id: "image.stacks.set_label".to_string(),
+                    params: Some(json!({
+                        "slice": self.stack_label_dialog.slice,
+                        "label": self.stack_label_dialog.label,
+                    })),
+                });
+                self.stack_label_dialog.open = false;
+            }
+        });
+        self.stack_label_dialog.open = open && self.stack_label_dialog.open;
     }
 
     fn draw_zoom_set_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -4904,6 +6009,62 @@ impl ImageUiApp {
                 );
             });
         self.desktop_state.utility_windows.measurements_open = open;
+    }
+
+    fn draw_binary_options_window(&mut self, ctx: &egui::Context) {
+        if !self.desktop_state.utility_windows.binary_options_open {
+            return;
+        }
+
+        let mut open = self.desktop_state.utility_windows.binary_options_open;
+        let was_open = open;
+        let mut changed = false;
+        egui::Window::new("Binary Options")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.desktop_state.binary_options.iterations)
+                            .prefix("Iterations ")
+                            .range(1..=BINARY_MAX_ITERATIONS),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.desktop_state.binary_options.count)
+                            .prefix("Count ")
+                            .range(1..=BINARY_MAX_COUNT),
+                    )
+                    .changed();
+            });
+
+        self.desktop_state.utility_windows.binary_options_open = open;
+        clamp_binary_options(&mut self.desktop_state.binary_options);
+        if changed || open != was_open {
+            self.persist_desktop_state();
+        }
+    }
+
+    fn draw_overlay_settings_windows(&mut self, ctx: &egui::Context) {
+        if self.desktop_state.utility_windows.overlay_labels_open {
+            let mut open = self.desktop_state.utility_windows.overlay_labels_open;
+            egui::Window::new("Labels").open(&mut open).show(ctx, |ui| {
+                overlay_settings_controls(ui, &mut self.desktop_state.overlay_settings);
+            });
+            self.desktop_state.utility_windows.overlay_labels_open = open;
+            self.persist_desktop_state();
+        }
+
+        if self.desktop_state.utility_windows.overlay_options_open {
+            let mut open = self.desktop_state.utility_windows.overlay_options_open;
+            egui::Window::new("Overlay Options")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    overlay_settings_controls(ui, &mut self.desktop_state.overlay_settings);
+                });
+            self.desktop_state.utility_windows.overlay_options_open = open;
+            self.persist_desktop_state();
+        }
     }
 
     fn draw_roi_manager_window(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -5486,6 +6647,7 @@ impl ImageUiApp {
                         viewer,
                         image_rect,
                         self.tool_options.line_width_px,
+                        &self.desktop_state.overlay_settings,
                         interaction::roi::RoiPosition {
                             channel: viewer.channel,
                             z: viewer.z,
@@ -5535,6 +6697,7 @@ impl ImageUiApp {
                     command_id,
                     params,
                 } => {
+                    let repeat_params = params.clone();
                     let label = self
                         .command_catalog
                         .entries
@@ -5543,6 +6706,7 @@ impl ImageUiApp {
                         .map(|entry| entry.label.clone())
                         .unwrap_or_else(|| command_id.clone());
                     let result = self.dispatch_command(&window_label, &command_id, params);
+                    self.remember_repeatable_command(&command_id, repeat_params.as_ref(), &result);
                     if window_label == LAUNCHER_LABEL {
                         self.set_fallback_status(format!("{label}: {}", result.message));
                     } else if let Some(viewer) = self.viewers_ui.get_mut(&window_label) {
@@ -5562,6 +6726,21 @@ impl ImageUiApp {
     }
 
     fn maybe_focus_windows(&mut self, ctx: &egui::Context) {
+        if self.show_all_windows_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            let viewer_ids = self
+                .viewers_ui
+                .values()
+                .map(|viewer| viewer.viewport_id)
+                .collect::<Vec<_>>();
+            for viewport_id in viewer_ids {
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
+            }
+            self.show_all_windows_requested = false;
+        }
+
         if self.focus_launcher {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_launcher = false;
@@ -6231,6 +7410,10 @@ fn roi_bounds(kind: &RoiKind) -> Option<egui::Rect> {
     }
 }
 
+fn roi_label_anchor(kind: &RoiKind) -> Option<egui::Pos2> {
+    Some(roi_bounds(kind)?.center())
+}
+
 fn centered_circular_roi(shape: &[usize], radius: Option<f32>) -> Result<RoiKind, String> {
     if shape.len() < 2 {
         return Err("circular selection requires X/Y dimensions".to_string());
@@ -6314,9 +7497,10 @@ fn draw_rois(
     viewer: &ViewerUiState,
     canvas_rect: egui::Rect,
     line_width_px: f32,
+    overlay_settings: &OverlaySettings,
     position: interaction::roi::RoiPosition,
 ) {
-    for roi in viewer.rois.visible_rois(position) {
+    for (index, roi) in viewer.rois.visible_rois(position).enumerate() {
         let selected = viewer.rois.selected_roi_id == Some(roi.id);
         let width = roi_stroke_width(line_width_px, selected);
         let stroke = if selected {
@@ -6391,6 +7575,24 @@ fn draw_rois(
                     stroke.color,
                 );
             }
+        }
+
+        if let Some((anchor, text)) = overlay_label_for_roi(roi, index, overlay_settings) {
+            let point = viewer.transform.image_to_screen(canvas_rect, anchor);
+            let font_id = if overlay_settings.bold {
+                egui::FontId::proportional(overlay_settings.font_size + 1.0)
+            } else {
+                egui::FontId::proportional(overlay_settings.font_size)
+            };
+            let color = imagej_color_from_name(&overlay_settings.label_color)
+                .unwrap_or(egui::Color32::WHITE);
+            if overlay_settings.draw_backgrounds {
+                let width = text.chars().count() as f32 * overlay_settings.font_size * 0.62;
+                let height = overlay_settings.font_size * 1.25;
+                let bg = egui::Rect::from_min_size(point, egui::vec2(width, height));
+                painter.rect_filled(bg, 0.0, egui::Color32::from_black_alpha(180));
+            }
+            painter.text(point, egui::Align2::LEFT_TOP, text, font_id, color);
         }
     }
 }
@@ -6600,7 +7802,6 @@ fn imagej_named_colors() -> [(&'static str, egui::Color32); 13] {
     ]
 }
 
-#[cfg(test)]
 fn imagej_color_from_name(name: &str) -> Option<egui::Color32> {
     let name = name.to_ascii_lowercase();
     if name.contains("black") {
@@ -6674,6 +7875,28 @@ fn pixel_type_selector(ui: &mut egui::Ui, pixel_type: &mut PixelType, label: &st
 
 fn measurement_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) {
     ui.checkbox(value, label);
+}
+
+fn overlay_settings_controls(ui: &mut egui::Ui, settings: &mut OverlaySettings) {
+    named_overlay_color_combo(ui, &mut settings.label_color);
+    ui.add(egui::Slider::new(&mut settings.font_size, 7.0..=72.0).text("Font size"));
+    ui.checkbox(&mut settings.show_labels, "Show labels");
+    ui.checkbox(&mut settings.use_names_as_labels, "Use names as labels");
+    ui.checkbox(&mut settings.draw_backgrounds, "Draw backgrounds");
+    ui.checkbox(&mut settings.bold, "Bold");
+    if settings.use_names_as_labels {
+        settings.show_labels = true;
+    }
+}
+
+fn named_overlay_color_combo(ui: &mut egui::Ui, color: &mut String) {
+    egui::ComboBox::from_label("Color")
+        .selected_text(color.as_str())
+        .show_ui(ui, |ui| {
+            for (name, _) in imagej_named_colors() {
+                ui.selectable_value(color, name.to_string(), name);
+            }
+        });
 }
 
 fn draw_simple_window(
@@ -6750,6 +7973,568 @@ fn selected_roi_profile_params(
     }
 
     Ok(Value::Object(params))
+}
+
+fn stack_to_image_datasets(dataset: &DatasetF32) -> Result<Vec<DatasetF32>, String> {
+    let z_axis = dataset
+        .axis_index(AxisKind::Z)
+        .ok_or_else(|| "Stack to Images requires a Z stack".to_string())?;
+    let slices = dataset.shape()[z_axis];
+    if slices <= 1 {
+        return Err("Stack to Images requires more than one Z slice".to_string());
+    }
+
+    let mut output = Vec::with_capacity(slices);
+    for z in 0..slices {
+        let data = dataset.data.view().index_axis(Axis(z_axis), z).to_owned();
+        let mut metadata = dataset.metadata.clone();
+        metadata.dims.remove(z_axis);
+        metadata.extras.insert(
+            "stack_to_images_source_slice".to_string(),
+            json!(z.saturating_add(1)),
+        );
+        metadata.extras.insert(
+            "stack_to_images_source_shape".to_string(),
+            json!(dataset.shape().to_vec()),
+        );
+        output.push(
+            Dataset::new(data.into_dyn(), metadata)
+                .map_err(|error| format!("failed to create stack slice image: {error}"))?,
+        );
+    }
+    Ok(output)
+}
+
+fn stack_slice_path(source_path: &Path, one_based_slice: usize) -> PathBuf {
+    let stem = source_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Stack");
+    let extension = source_path.extension().and_then(|name| name.to_str());
+    let file_name = match extension {
+        Some(extension) if !extension.is_empty() => {
+            format!("{stem}-slice-{one_based_slice:03}.{extension}")
+        }
+        _ => format!("{stem}-slice-{one_based_slice:03}.tif"),
+    };
+    source_path.with_file_name(file_name)
+}
+
+fn images_to_stack_dataset(images: &[(&str, &DatasetF32)]) -> Result<DatasetF32, String> {
+    if images.len() < 2 {
+        return Err("Images to Stack requires at least two open 2D images".to_string());
+    }
+
+    let first = images[0].1;
+    if first.axis_index(AxisKind::Z).is_some() {
+        return Err("Images to Stack requires 2D images, not stacks".to_string());
+    }
+    let first_shape = first.shape().to_vec();
+    let first_axes = first
+        .metadata
+        .dims
+        .iter()
+        .map(|dim| dim.axis)
+        .collect::<Vec<_>>();
+
+    for (title, dataset) in images {
+        if dataset.axis_index(AxisKind::Z).is_some() {
+            return Err(format!("`{title}` is already a stack"));
+        }
+        if dataset.shape() != first_shape.as_slice() {
+            return Err("Images to Stack requires images with matching dimensions".to_string());
+        }
+        let axes = dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>();
+        if axes != first_axes {
+            return Err("Images to Stack requires images with matching axis order".to_string());
+        }
+    }
+
+    let z_axis = images_to_stack_z_axis(&first.metadata);
+    let views = images
+        .iter()
+        .map(|(_, dataset)| dataset.data.view())
+        .collect::<Vec<_>>();
+    let data = stack(Axis(z_axis), &views)
+        .map_err(|error| format!("failed to build image stack: {error}"))?;
+
+    let mut metadata = first.metadata.clone();
+    metadata
+        .dims
+        .insert(z_axis, Dim::new(AxisKind::Z, images.len()));
+    metadata.extras.insert(
+        "images_to_stack_titles".to_string(),
+        json!(images.iter().map(|(title, _)| *title).collect::<Vec<_>>()),
+    );
+    Ok(Dataset::new(data, metadata)
+        .map_err(|error| format!("failed to create image stack dataset: {error}"))?)
+}
+
+fn images_to_stack_z_axis(metadata: &Metadata) -> usize {
+    metadata
+        .axis_index(AxisKind::Channel)
+        .or_else(|| metadata.axis_index(AxisKind::Time))
+        .unwrap_or(metadata.dims.len())
+}
+
+fn combine_stack_datasets(
+    first: &DatasetF32,
+    second: &DatasetF32,
+    vertical: bool,
+    fill: f32,
+) -> Result<DatasetF32, String> {
+    if first.axis_index(AxisKind::Channel).is_some()
+        || second.axis_index(AxisKind::Channel).is_some()
+        || first.axis_index(AxisKind::Time).is_some()
+        || second.axis_index(AxisKind::Time).is_some()
+    {
+        return Err("Combine currently supports X/Y/Z images only".to_string());
+    }
+    if first.metadata.pixel_type != second.metadata.pixel_type {
+        return Err("Combine requires images with matching pixel types".to_string());
+    }
+
+    let (first_width, first_height, first_depth) = stack_xyz_extent(first)?;
+    let (second_width, second_height, second_depth) = stack_xyz_extent(second)?;
+    let output_width = if vertical {
+        first_width.max(second_width)
+    } else {
+        first_width + second_width
+    };
+    let output_height = if vertical {
+        first_height + second_height
+    } else {
+        first_height.max(second_height)
+    };
+    let output_depth = first_depth.max(second_depth);
+    let mut values = vec![fill; output_width * output_height * output_depth];
+
+    copy_stack_into(
+        &mut values,
+        output_width,
+        output_height,
+        first,
+        0,
+        0,
+        output_depth,
+    )?;
+    let second_x = if vertical { 0 } else { first_width };
+    let second_y = if vertical { first_height } else { 0 };
+    copy_stack_into(
+        &mut values,
+        output_width,
+        output_height,
+        second,
+        second_x,
+        second_y,
+        output_depth,
+    )?;
+
+    let data = ArrayD::from_shape_vec(IxDyn(&[output_height, output_width, output_depth]), values)
+        .map_err(|error| format!("combined stack shape error: {error}"))?;
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, output_height),
+            Dim::new(AxisKind::X, output_width),
+            Dim::new(AxisKind::Z, output_depth),
+        ],
+        pixel_type: first.metadata.pixel_type,
+        ..Metadata::default()
+    };
+    metadata.extras.insert(
+        "stack_combine_orientation".to_string(),
+        json!(if vertical { "vertical" } else { "horizontal" }),
+    );
+    metadata
+        .extras
+        .insert("stack_combine_fill".to_string(), json!(fill));
+    Ok(Dataset::new(data, metadata)
+        .map_err(|error| format!("failed to create combined stack: {error}"))?)
+}
+
+fn stack_xyz_extent(dataset: &DatasetF32) -> Result<(usize, usize, usize), String> {
+    let y_axis = dataset
+        .axis_index(AxisKind::Y)
+        .ok_or_else(|| "Combine requires a Y axis".to_string())?;
+    let x_axis = dataset
+        .axis_index(AxisKind::X)
+        .ok_or_else(|| "Combine requires an X axis".to_string())?;
+    let width = dataset.shape()[x_axis];
+    let height = dataset.shape()[y_axis];
+    let depth = stack_slice_count(dataset);
+    Ok((width, height, depth))
+}
+
+fn copy_stack_into(
+    output: &mut [f32],
+    output_width: usize,
+    output_height: usize,
+    dataset: &DatasetF32,
+    x_offset: usize,
+    y_offset: usize,
+    output_depth: usize,
+) -> Result<(), String> {
+    let (width, height, depth) = stack_xyz_extent(dataset)?;
+    for z in 0..depth.min(output_depth) {
+        let slice = extract_slice(dataset, z, 0, 0)?;
+        for y in 0..height {
+            for x in 0..width {
+                let out_x = x + x_offset;
+                let out_y = y + y_offset;
+                if out_x < output_width && out_y < output_height {
+                    let index = (out_y * output_width + out_x) * output_depth + z;
+                    output[index] = slice.values[y * width + x];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn concatenate_stack_datasets(
+    datasets: &[(&str, &DatasetF32)],
+    fill: f32,
+) -> Result<DatasetF32, String> {
+    if datasets.len() < 2 {
+        return Err("Concatenate requires at least two open images or stacks".to_string());
+    }
+    let first_pixel_type = datasets[0].1.metadata.pixel_type;
+    let mut output_width = 0usize;
+    let mut output_height = 0usize;
+    let mut output_depth = 0usize;
+    for (title, dataset) in datasets {
+        if dataset.axis_index(AxisKind::Channel).is_some()
+            || dataset.axis_index(AxisKind::Time).is_some()
+        {
+            return Err(format!("`{title}` is not an X/Y/Z image"));
+        }
+        if dataset.metadata.pixel_type != first_pixel_type {
+            return Err("Concatenate requires images with matching pixel types".to_string());
+        }
+        let (width, height, depth) = stack_xyz_extent(dataset)?;
+        output_width = output_width.max(width);
+        output_height = output_height.max(height);
+        output_depth += depth;
+    }
+
+    let mut values = vec![fill; output_width * output_height * output_depth];
+    let mut z_offset = 0usize;
+    for (_, dataset) in datasets {
+        let (_, _, depth) = stack_xyz_extent(dataset)?;
+        copy_stack_into_z_offset(
+            &mut values,
+            output_width,
+            output_height,
+            output_depth,
+            dataset,
+            z_offset,
+        )?;
+        z_offset += depth;
+    }
+
+    let data = ArrayD::from_shape_vec(IxDyn(&[output_height, output_width, output_depth]), values)
+        .map_err(|error| format!("concatenated stack shape error: {error}"))?;
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, output_height),
+            Dim::new(AxisKind::X, output_width),
+            Dim::new(AxisKind::Z, output_depth),
+        ],
+        pixel_type: first_pixel_type,
+        ..Metadata::default()
+    };
+    metadata.extras.insert(
+        "stack_concatenate_titles".to_string(),
+        json!(datasets.iter().map(|(title, _)| *title).collect::<Vec<_>>()),
+    );
+    metadata
+        .extras
+        .insert("stack_concatenate_fill".to_string(), json!(fill));
+    Ok(Dataset::new(data, metadata)
+        .map_err(|error| format!("failed to create concatenated stack: {error}"))?)
+}
+
+fn copy_stack_into_z_offset(
+    output: &mut [f32],
+    output_width: usize,
+    output_height: usize,
+    output_depth: usize,
+    dataset: &DatasetF32,
+    z_offset: usize,
+) -> Result<(), String> {
+    let (width, height, depth) = stack_xyz_extent(dataset)?;
+    for z in 0..depth {
+        let slice = extract_slice(dataset, z, 0, 0)?;
+        for y in 0..height {
+            for x in 0..width {
+                let out_z = z + z_offset;
+                if out_z < output_depth && x < output_width && y < output_height {
+                    let index = (y * output_width + x) * output_depth + out_z;
+                    output[index] = slice.values[y * width + x];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn insert_stack_dataset(
+    source: &DatasetF32,
+    destination: &DatasetF32,
+    x_offset: isize,
+    y_offset: isize,
+) -> Result<DatasetF32, String> {
+    ensure_xyz_only(source, "source")?;
+    ensure_xyz_only(destination, "destination")?;
+    if source.metadata.pixel_type != destination.metadata.pixel_type {
+        return Err(
+            "Insert requires source and destination to have matching pixel types".to_string(),
+        );
+    }
+
+    let (source_width, source_height, source_depth) = stack_xyz_extent(source)?;
+    let (dest_width, dest_height, dest_depth) = stack_xyz_extent(destination)?;
+    let dest_x_axis = destination
+        .axis_index(AxisKind::X)
+        .ok_or_else(|| "Insert destination requires an X axis".to_string())?;
+    let dest_y_axis = destination
+        .axis_index(AxisKind::Y)
+        .ok_or_else(|| "Insert destination requires a Y axis".to_string())?;
+    let dest_z_axis = destination.axis_index(AxisKind::Z);
+    let mut data = destination.data.clone();
+
+    for dest_z in 0..dest_depth {
+        let source_z = dest_z.min(source_depth.saturating_sub(1));
+        let source_slice = extract_slice(source, source_z, 0, 0)?;
+        for sy in 0..source_height {
+            let dy = sy as isize + y_offset;
+            if !(0..dest_height as isize).contains(&dy) {
+                continue;
+            }
+            for sx in 0..source_width {
+                let dx = sx as isize + x_offset;
+                if !(0..dest_width as isize).contains(&dx) {
+                    continue;
+                }
+                let mut coord = vec![0usize; destination.ndim()];
+                coord[dest_y_axis] = dy as usize;
+                coord[dest_x_axis] = dx as usize;
+                if let Some(axis) = dest_z_axis {
+                    coord[axis] = dest_z;
+                }
+                data[IxDyn(&coord)] = source_slice.values[sy * source_width + sx];
+            }
+        }
+    }
+
+    let mut metadata = destination.metadata.clone();
+    metadata.extras.insert(
+        "stack_insert_offset".to_string(),
+        json!([x_offset, y_offset]),
+    );
+    Ok(Dataset::new(data, metadata)
+        .map_err(|error| format!("failed to create inserted stack: {error}"))?)
+}
+
+fn ensure_xyz_only(dataset: &DatasetF32, label: &str) -> Result<(), String> {
+    if dataset.axis_index(AxisKind::Channel).is_some()
+        || dataset.axis_index(AxisKind::Time).is_some()
+    {
+        return Err(format!("Insert {label} must be an X/Y/Z image"));
+    }
+    Ok(())
+}
+
+fn stack_measurement_rows(
+    dataset: &DatasetF32,
+    settings: &MeasurementSettings,
+    bbox: Option<(usize, usize, usize, usize)>,
+    channel: usize,
+    time: usize,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    let z_axis = dataset
+        .axis_index(AxisKind::Z)
+        .ok_or_else(|| "Measure Stack requires a Z stack".to_string())?;
+    let slices = dataset.shape()[z_axis];
+    if slices <= 1 {
+        return Err("Measure Stack requires more than one Z slice".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(slices);
+    for z in 0..slices {
+        let slice = extract_slice(dataset, z, time, channel)?;
+        let (values, width, height) = if let Some((min_x, min_y, max_x, max_y)) =
+            clamped_bbox(slice.width, slice.height, bbox)
+        {
+            let width = max_x.saturating_sub(min_x).saturating_add(1);
+            let height = max_y.saturating_sub(min_y).saturating_add(1);
+            let mut values = Vec::with_capacity(width * height);
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    values.push(slice.values[x + y * slice.width]);
+                }
+            }
+            (values, width, height)
+        } else {
+            (slice.values, slice.width, slice.height)
+        };
+        rows.push(measurement_row_from_slice(
+            &values, width, height, bbox, settings, z, time, channel,
+        ));
+    }
+    Ok(rows)
+}
+
+fn stack_xy_profile_rows(
+    dataset: &DatasetF32,
+    params: &Value,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    let z_axis = dataset
+        .axis_index(AxisKind::Z)
+        .ok_or_else(|| "Plot XY Profile requires a Z stack".to_string())?;
+    let slices = dataset.shape()[z_axis];
+    if slices <= 1 {
+        return Err("Plot XY Profile requires more than one Z slice".to_string());
+    }
+    let base_params = params
+        .as_object()
+        .ok_or_else(|| "Plot XY Profile requires profile parameters".to_string())?;
+
+    let mut rows = Vec::with_capacity(slices);
+    for z in 0..slices {
+        let mut slice_params = base_params.clone();
+        slice_params.insert("z".to_string(), json!(z));
+        let measurements = crate::commands::execute_operation(
+            "measurements.profile",
+            dataset,
+            &Value::Object(slice_params),
+        )
+        .map_err(|error| error.to_string())?
+        .measurements
+        .ok_or_else(|| "Plot XY Profile produced no profile data".to_string())?;
+        let samples = profile_samples_from_table(&measurements)
+            .ok_or_else(|| "Plot XY Profile produced no profile samples".to_string())?;
+
+        let mut row = BTreeMap::new();
+        row.insert("slice".to_string(), json!(z));
+        row.insert(
+            "profile_axis".to_string(),
+            measurements
+                .values
+                .get("profile_axis")
+                .cloned()
+                .unwrap_or_else(|| json!("profile")),
+        );
+        row.insert("sample_count".to_string(), json!(samples.len()));
+        for (index, sample) in samples.into_iter().enumerate() {
+            row.insert(format!("P{index}"), json!(sample));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn stack_slice_label(dataset: &DatasetF32, slice: usize) -> Option<String> {
+    let labels = stack_slice_labels(dataset, stack_slice_count(dataset));
+    labels.get(slice).cloned().flatten()
+}
+
+fn set_stack_slice_label_dataset(
+    dataset: &DatasetF32,
+    slice: usize,
+    label: &str,
+) -> Result<DatasetF32, String> {
+    let slices = stack_slice_count(dataset);
+    if slice >= slices {
+        return Err(format!(
+            "slice {} is outside the stack range 1-{slices}",
+            slice + 1
+        ));
+    }
+
+    let mut metadata = dataset.metadata.clone();
+    let mut labels = stack_slice_labels(dataset, slices);
+    let trimmed = label.trim();
+    labels[slice] = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    write_stack_slice_labels(&mut metadata, labels);
+    Dataset::new(dataset.data.clone(), metadata)
+        .map_err(|error| format!("failed to set slice label: {error}"))
+}
+
+fn remove_stack_slice_labels_dataset(dataset: &DatasetF32) -> Result<DatasetF32, String> {
+    let mut metadata = dataset.metadata.clone();
+    metadata.extras.remove(SLICE_LABELS_KEY);
+    metadata.extras.remove(CURRENT_SLICE_LABEL_KEY);
+    Dataset::new(dataset.data.clone(), metadata)
+        .map_err(|error| format!("failed to remove slice labels: {error}"))
+}
+
+fn stack_slice_count(dataset: &DatasetF32) -> usize {
+    dataset
+        .axis_index(AxisKind::Z)
+        .map(|axis| dataset.shape()[axis])
+        .unwrap_or(1)
+}
+
+fn stack_slice_labels(dataset: &DatasetF32, slices: usize) -> Vec<Option<String>> {
+    let mut labels = vec![None; slices];
+    if let Some(array) = dataset
+        .metadata
+        .extras
+        .get(SLICE_LABELS_KEY)
+        .and_then(Value::as_array)
+    {
+        for (index, value) in array.iter().take(slices).enumerate() {
+            labels[index] = value
+                .as_str()
+                .filter(|label| !label.is_empty())
+                .map(str::to_string);
+        }
+    } else if slices == 1 {
+        labels[0] = dataset
+            .metadata
+            .extras
+            .get(CURRENT_SLICE_LABEL_KEY)
+            .and_then(Value::as_str)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string);
+    }
+    labels
+}
+
+fn write_stack_slice_labels(metadata: &mut Metadata, labels: Vec<Option<String>>) {
+    metadata.extras.remove(CURRENT_SLICE_LABEL_KEY);
+    if labels.iter().all(Option::is_none) {
+        metadata.extras.remove(SLICE_LABELS_KEY);
+        return;
+    }
+    if labels.len() == 1 {
+        if let Some(label) = labels.into_iter().next().flatten() {
+            metadata
+                .extras
+                .insert(CURRENT_SLICE_LABEL_KEY.to_string(), json!(label));
+        }
+        metadata.extras.remove(SLICE_LABELS_KEY);
+        return;
+    }
+    metadata.extras.insert(
+        SLICE_LABELS_KEY.to_string(),
+        Value::Array(
+            labels
+                .into_iter()
+                .map(|label| label.map(Value::String).unwrap_or(Value::Null))
+                .collect(),
+        ),
+    );
 }
 
 fn stack_position_from_params(
@@ -6893,6 +8678,330 @@ fn roi_kind_bbox(kind: &RoiKind) -> Option<(usize, usize, usize, usize)> {
         RoiKind::Angle { a, b, c } => bounds(&[*a, *b, *c]),
         RoiKind::Text { at, .. } => bounds(&[*at]),
     }
+}
+
+fn add_selection_to_overlay(rois: &mut RoiStore) -> Result<&'static str, String> {
+    if rois.active_roi.is_some() {
+        rois.commit_active(true);
+        return Ok("selection added to overlay");
+    }
+
+    if let Some(selected) = rois.selected_roi_id {
+        if let Some(roi) = rois.overlay_rois.iter_mut().find(|roi| roi.id == selected) {
+            roi.visible = true;
+            return Ok("selection already in overlay");
+        }
+    }
+
+    Err("a selection is required for overlay add".to_string())
+}
+
+fn overlay_from_roi_manager(rois: &mut RoiStore) -> Result<usize, String> {
+    if rois.overlay_rois.is_empty() {
+        return Err("ROI Manager has no elements".to_string());
+    }
+    for roi in &mut rois.overlay_rois {
+        roi.visible = true;
+    }
+    if rois.selected_roi_id.is_none() {
+        rois.selected_roi_id = rois.overlay_rois.first().map(|roi| roi.id);
+    }
+    Ok(rois.overlay_rois.len())
+}
+
+fn overlay_to_roi_manager(rois: &mut RoiStore) -> Result<usize, String> {
+    if rois.overlay_rois.is_empty() {
+        return Err("no overlay elements".to_string());
+    }
+    if rois
+        .selected_roi_id
+        .is_none_or(|id| rois.overlay_rois.iter().all(|roi| roi.id != id))
+    {
+        rois.selected_roi_id = rois.overlay_rois.first().map(|roi| roi.id);
+    }
+    Ok(rois.overlay_rois.len())
+}
+
+fn flatten_overlay_slice(slice: &SliceImage, rois: &[RoiModel]) -> Result<DatasetF32, String> {
+    if rois.is_empty() {
+        return Err("overlay required".to_string());
+    }
+    let mut values = slice.values.clone();
+    let (min, max) = min_max(&values);
+    let draw_value = if max > min { max } else { 1.0 };
+    for roi in rois {
+        rasterize_roi_outline(
+            &mut values,
+            slice.width,
+            slice.height,
+            &roi.kind,
+            draw_value,
+        );
+    }
+    let data = ArrayD::from_shape_vec(IxDyn(&[slice.height, slice.width]), values)
+        .map_err(|error| format!("flattened overlay shape error: {error}"))?;
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, slice.height),
+            Dim::new(AxisKind::X, slice.width),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
+fn rasterize_roi_outline(
+    values: &mut [f32],
+    width: usize,
+    height: usize,
+    kind: &RoiKind,
+    draw_value: f32,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    match kind {
+        RoiKind::Rect { .. } => {
+            if let Some((min_x, min_y, max_x, max_y)) = roi_kind_bbox(kind) {
+                let max_x = max_x.min(width.saturating_sub(1));
+                let max_y = max_y.min(height.saturating_sub(1));
+                for x in min_x.min(width)..=max_x {
+                    put_flatten_pixel(
+                        values,
+                        width,
+                        height,
+                        x as isize,
+                        min_y as isize,
+                        draw_value,
+                    );
+                    put_flatten_pixel(
+                        values,
+                        width,
+                        height,
+                        x as isize,
+                        max_y as isize,
+                        draw_value,
+                    );
+                }
+                for y in min_y.min(height)..=max_y {
+                    put_flatten_pixel(
+                        values,
+                        width,
+                        height,
+                        min_x as isize,
+                        y as isize,
+                        draw_value,
+                    );
+                    put_flatten_pixel(
+                        values,
+                        width,
+                        height,
+                        max_x as isize,
+                        y as isize,
+                        draw_value,
+                    );
+                }
+            }
+        }
+        RoiKind::Oval { start, end, .. } => {
+            let rect = egui::Rect::from_two_pos(*start, *end);
+            let center = rect.center();
+            let radius = rect.width().abs().min(rect.height().abs()) * 0.5;
+            let steps = ((radius * std::f32::consts::TAU).ceil() as usize).max(16);
+            for step in 0..steps {
+                let theta = step as f32 / steps as f32 * std::f32::consts::TAU;
+                let x = center.x + radius * theta.cos();
+                let y = center.y + radius * theta.sin();
+                put_flatten_pixel(
+                    values,
+                    width,
+                    height,
+                    x.round() as isize,
+                    y.round() as isize,
+                    draw_value,
+                );
+            }
+        }
+        RoiKind::Line { start, end, .. } => {
+            draw_flatten_line(values, width, height, *start, *end, draw_value);
+        }
+        RoiKind::Polygon { points, closed } => {
+            for pair in points.windows(2) {
+                draw_flatten_line(values, width, height, pair[0], pair[1], draw_value);
+            }
+            if *closed && points.len() > 2 {
+                draw_flatten_line(
+                    values,
+                    width,
+                    height,
+                    *points.last().unwrap(),
+                    points[0],
+                    draw_value,
+                );
+            }
+        }
+        RoiKind::Freehand { points } | RoiKind::WandTrace { points } => {
+            for pair in points.windows(2) {
+                draw_flatten_line(values, width, height, pair[0], pair[1], draw_value);
+            }
+        }
+        RoiKind::Angle { a, b, c } => {
+            draw_flatten_line(values, width, height, *a, *b, draw_value);
+            draw_flatten_line(values, width, height, *b, *c, draw_value);
+        }
+        RoiKind::Point { points, .. } => {
+            for point in points {
+                let x = point.x.round() as isize;
+                let y = point.y.round() as isize;
+                put_flatten_pixel(values, width, height, x, y, draw_value);
+                put_flatten_pixel(values, width, height, x - 1, y, draw_value);
+                put_flatten_pixel(values, width, height, x + 1, y, draw_value);
+                put_flatten_pixel(values, width, height, x, y - 1, draw_value);
+                put_flatten_pixel(values, width, height, x, y + 1, draw_value);
+            }
+        }
+        RoiKind::Text { at, .. } => {
+            put_flatten_pixel(
+                values,
+                width,
+                height,
+                at.x.round() as isize,
+                at.y.round() as isize,
+                draw_value,
+            );
+        }
+    }
+}
+
+fn draw_flatten_line(
+    values: &mut [f32],
+    width: usize,
+    height: usize,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    draw_value: f32,
+) {
+    let mut x0 = start.x.round() as isize;
+    let mut y0 = start.y.round() as isize;
+    let x1 = end.x.round() as isize;
+    let y1 = end.y.round() as isize;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    loop {
+        put_flatten_pixel(values, width, height, x0, y0, draw_value);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = error * 2;
+        if e2 >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+}
+
+fn put_flatten_pixel(
+    values: &mut [f32],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    draw_value: f32,
+) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let (x, y) = (x as usize, y as usize);
+    if x >= width || y >= height {
+        return;
+    }
+    values[x + y * width] = draw_value;
+}
+
+fn overlay_label_for_roi(
+    roi: &RoiModel,
+    index: usize,
+    settings: &OverlaySettings,
+) -> Option<(egui::Pos2, String)> {
+    if !settings.show_labels {
+        return None;
+    }
+    let anchor = roi_label_anchor(&roi.kind)?;
+    let text = if settings.use_names_as_labels {
+        roi.name.clone()
+    } else {
+        (index + 1).to_string()
+    };
+    Some((anchor, text))
+}
+
+fn roi_kind_name(kind: &RoiKind) -> &'static str {
+    match kind {
+        RoiKind::Rect { .. } => "Rectangle",
+        RoiKind::Oval { .. } => "Oval",
+        RoiKind::Polygon { .. } => "Polygon",
+        RoiKind::Freehand { .. } => "Freehand",
+        RoiKind::Line { .. } => "Line",
+        RoiKind::Angle { .. } => "Angle",
+        RoiKind::Point { .. } => "Point",
+        RoiKind::Text { .. } => "Text",
+        RoiKind::WandTrace { .. } => "Wand",
+    }
+}
+
+fn apply_overlay_visibility(
+    rois: &mut [RoiModel],
+    mode: OverlayVisibility,
+) -> Result<usize, String> {
+    if rois.is_empty() {
+        return Err("no overlay elements".to_string());
+    }
+    let visible = match mode {
+        OverlayVisibility::Show => true,
+        OverlayVisibility::Hide => false,
+        OverlayVisibility::Toggle => !rois.iter().any(|roi| roi.visible),
+    };
+    for roi in rois.iter_mut() {
+        roi.visible = visible;
+    }
+    Ok(rois.len())
+}
+
+fn overlay_element_rows(rois: &[RoiModel]) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    if rois.is_empty() {
+        return Err("no overlay elements".to_string());
+    }
+    Ok(rois
+        .iter()
+        .enumerate()
+        .map(|(index, roi)| {
+            let bbox = roi_kind_bbox(&roi.kind);
+            let mut row = BTreeMap::new();
+            row.insert("Index".to_string(), json!(index + 1));
+            row.insert("Name".to_string(), json!(roi.name));
+            row.insert("Type".to_string(), json!(roi_kind_name(&roi.kind)));
+            if let Some((min_x, min_y, max_x, max_y)) = bbox {
+                row.insert("X".to_string(), json!(min_x));
+                row.insert("Y".to_string(), json!(min_y));
+                row.insert("Width".to_string(), json!(max_x - min_x + 1));
+                row.insert("Height".to_string(), json!(max_y - min_y + 1));
+            }
+            row.insert("Channel".to_string(), json!(roi.position.channel + 1));
+            row.insert("Slice".to_string(), json!(roi.position.z + 1));
+            row.insert("Frame".to_string(), json!(roi.position.t + 1));
+            row.insert("Visible".to_string(), json!(roi.visible));
+            row.insert("Locked".to_string(), json!(roi.locked));
+            row
+        })
+        .collect())
 }
 
 fn threshold_slice_otsu(values: &[f32]) -> Vec<u8> {
@@ -7096,6 +9205,52 @@ fn image_slice_to_results_rows(
             row.insert(format!("X{x}"), json!(slice.values[x + y * slice.width]));
         }
         rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn xy_coordinate_rows(
+    slice: &SliceImage,
+    bbox: Option<(usize, usize, usize, usize)>,
+    params: &Value,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    let (min_x, min_y, max_x, max_y) = clamped_bbox(slice.width, slice.height, bbox)
+        .ok_or_else(|| "image slice is empty".to_string())?;
+    let has_selection = bbox.is_some();
+    let background = params
+        .get("background")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or_else(|| slice.values.first().copied().unwrap_or(f32::NAN));
+    let invert_y = params
+        .get("invert_y")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut rows = Vec::new();
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let value = slice.values[x + y * slice.width];
+            let matches_background = if background.is_nan() {
+                value.is_nan()
+            } else {
+                value == background
+            };
+            if !has_selection && matches_background {
+                continue;
+            }
+
+            let output_y = if invert_y { y } else { slice.height - 1 - y };
+            let mut row = BTreeMap::new();
+            row.insert("X".to_string(), json!(x));
+            row.insert("Y".to_string(), json!(output_y));
+            row.insert("Value".to_string(), json!(value));
+            rows.push(row);
+        }
+    }
+
+    if rows.is_empty() {
+        return Err("no non-background pixels found".to_string());
     }
     Ok(rows)
 }
@@ -7648,10 +9803,127 @@ fn min_max(values: &[f32]) -> (f32, f32) {
     (min, max)
 }
 
-fn to_color_image(frame: &ViewerFrameBuffer) -> egui::ColorImage {
+impl LookupTable {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Grays => "Grays",
+            Self::Inverted => "Invert",
+            Self::Fire => "Fire",
+            Self::Ice => "Ice",
+            Self::Spectrum => "Spectrum",
+            Self::Rgb332 => "3-3-2 RGB",
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Cyan => "Cyan",
+            Self::Magenta => "Magenta",
+            Self::Yellow => "Yellow",
+            Self::RedGreen => "Red/Green",
+        }
+    }
+}
+
+fn lookup_table_from_command(command_id: &str) -> Option<LookupTable> {
+    Some(match command_id {
+        "image.lookup.invert_lut" => LookupTable::Inverted,
+        "image.lookup.fire" => LookupTable::Fire,
+        "image.lookup.grays" => LookupTable::Grays,
+        "image.lookup.ice" => LookupTable::Ice,
+        "image.lookup.spectrum" => LookupTable::Spectrum,
+        "image.lookup.rgb332" => LookupTable::Rgb332,
+        "image.lookup.red" => LookupTable::Red,
+        "image.lookup.green" => LookupTable::Green,
+        "image.lookup.blue" => LookupTable::Blue,
+        "image.lookup.cyan" => LookupTable::Cyan,
+        "image.lookup.magenta" => LookupTable::Magenta,
+        "image.lookup.yellow" => LookupTable::Yellow,
+        "image.lookup.red_green" => LookupTable::RedGreen,
+        _ => return None,
+    })
+}
+
+fn lookup_table_color(lut: LookupTable, gray: u8) -> egui::Color32 {
+    let g = gray;
+    match lut {
+        LookupTable::Grays => egui::Color32::from_rgb(g, g, g),
+        LookupTable::Inverted => {
+            let inv = 255 - g;
+            egui::Color32::from_rgb(inv, inv, inv)
+        }
+        LookupTable::Red => egui::Color32::from_rgb(g, 0, 0),
+        LookupTable::Green => egui::Color32::from_rgb(0, g, 0),
+        LookupTable::Blue => egui::Color32::from_rgb(0, 0, g),
+        LookupTable::Cyan => egui::Color32::from_rgb(0, g, g),
+        LookupTable::Magenta => egui::Color32::from_rgb(g, 0, g),
+        LookupTable::Yellow => egui::Color32::from_rgb(g, g, 0),
+        LookupTable::RedGreen => egui::Color32::from_rgb(255 - g, g, 0),
+        LookupTable::Rgb332 => {
+            let r = (g & 0b1110_0000) | ((g & 0b1110_0000) >> 3) | ((g & 0b1110_0000) >> 6);
+            let green = ((g & 0b0001_1100) << 3) | (g & 0b0001_1100) | ((g & 0b0001_1100) >> 3);
+            let b = ((g & 0b0000_0011) << 6)
+                | ((g & 0b0000_0011) << 4)
+                | ((g & 0b0000_0011) << 2)
+                | (g & 0b0000_0011);
+            egui::Color32::from_rgb(r, green, b)
+        }
+        LookupTable::Fire => {
+            let r = g.saturating_mul(2);
+            let green = g.saturating_sub(64).saturating_mul(2);
+            let b = g.saturating_sub(160).saturating_mul(3);
+            egui::Color32::from_rgb(r, green, b)
+        }
+        LookupTable::Ice => {
+            let r = g.saturating_sub(160).saturating_mul(3);
+            let green = g.saturating_sub(32).saturating_mul(2);
+            let b = 96u8.saturating_add(g / 2);
+            egui::Color32::from_rgb(r, green, b)
+        }
+        LookupTable::Spectrum => {
+            let segment = g as u16 * 6 / 256;
+            let offset = ((g as u16 * 6) % 256) as u8;
+            match segment {
+                0 => egui::Color32::from_rgb(255, offset, 0),
+                1 => egui::Color32::from_rgb(255 - offset, 255, 0),
+                2 => egui::Color32::from_rgb(0, 255, offset),
+                3 => egui::Color32::from_rgb(0, 255 - offset, 255),
+                4 => egui::Color32::from_rgb(offset, 0, 255),
+                _ => egui::Color32::from_rgb(255, 0, 255 - offset),
+            }
+        }
+    }
+}
+
+fn lookup_table_slice_to_rgb(slice: &SliceImage, lut: LookupTable) -> Result<DatasetF32, String> {
+    let mut values = Vec::with_capacity(slice.width * slice.height * 3);
+    for gray in to_u8_samples(&slice.values) {
+        let color = lookup_table_color(lut, gray);
+        values.push(f32::from(color.r()) / 255.0);
+        values.push(f32::from(color.g()) / 255.0);
+        values.push(f32::from(color.b()) / 255.0);
+    }
+    let data = ArrayD::from_shape_vec(IxDyn(&[slice.height, slice.width, 3]), values)
+        .map_err(|error| format!("LUT-applied image shape error: {error}"))?;
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, slice.height),
+            Dim::new(AxisKind::X, slice.width),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        channel_names: vec!["R".to_string(), "G".to_string(), "B".to_string()],
+        ..Metadata::default()
+    };
+    metadata
+        .extras
+        .insert("applied_lut".to_string(), json!(lut.label()));
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
+fn to_color_image(frame: &ViewerFrameBuffer, lut: LookupTable) -> egui::ColorImage {
     let mut rgba = Vec::with_capacity(frame.pixels_u8.len() * 4);
     for gray in &frame.pixels_u8 {
-        rgba.extend_from_slice(&[*gray, *gray, *gray, 255]);
+        let color = lookup_table_color(lut, *gray);
+        rgba.extend_from_slice(&[color.r(), color.g(), color.b(), 255]);
     }
     egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &rgba)
 }
@@ -7747,6 +10019,52 @@ fn sanitize_image_title(title: &str) -> String {
     }
 }
 
+fn new_image_dataset(params: &Value) -> Result<DatasetF32, String> {
+    let width = params.get("width").and_then(Value::as_u64).unwrap_or(512) as usize;
+    let height = params.get("height").and_then(Value::as_u64).unwrap_or(512) as usize;
+    let slices = params.get("slices").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let channels = params.get("channels").and_then(Value::as_u64).unwrap_or(1) as usize;
+    let frames = params.get("frames").and_then(Value::as_u64).unwrap_or(1) as usize;
+    if width == 0 || height == 0 || slices == 0 || channels == 0 || frames == 0 {
+        return Err("new image dimensions must be positive".to_string());
+    }
+    let fill = params.get("fill").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    let pixel_type = match params
+        .get("pixelType")
+        .and_then(Value::as_str)
+        .unwrap_or("f32")
+    {
+        "u8" => PixelType::U8,
+        "u16" => PixelType::U16,
+        _ => PixelType::F32,
+    };
+
+    let mut shape = vec![height, width];
+    let mut dims = vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)];
+    if slices > 1 {
+        shape.push(slices);
+        dims.push(Dim::new(AxisKind::Z, slices));
+    }
+    if channels > 1 {
+        shape.push(channels);
+        dims.push(Dim::new(AxisKind::Channel, channels));
+    }
+    if frames > 1 {
+        shape.push(frames);
+        dims.push(Dim::new(AxisKind::Time, frames));
+    }
+
+    let len: usize = shape.iter().product();
+    let data = ArrayD::from_shape_vec(IxDyn(&shape), vec![fill; len])
+        .map_err(|error| format!("new image shape error: {error}"))?;
+    let metadata = Metadata {
+        dims,
+        pixel_type,
+        ..Metadata::default()
+    };
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
 fn viewport_id_for_label(label: &str) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(format!("viewport-{label}"))
 }
@@ -7787,25 +10105,36 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use crate::model::{AxisKind, DatasetF32, PixelType};
+    use crate::model::{AxisKind, DatasetF32, Dim, Metadata, PixelType};
+    use crate::ui::interaction::roi::{RoiPosition, RoiStore};
     use crate::ui::interaction::transform::ViewerTransformState;
+    use crate::ui::state::{BinaryOptions, MeasurementSettings, OverlaySettings};
     use eframe::egui;
     use ndarray::{Array, IxDyn};
     use serde_json::{Value, json};
 
     use super::{
-        HoverInfo, ImageSummary, LauncherStatusModel, NativeRasterImage, ProgressState,
-        RepaintDecisionInputs, RoiKind, SliceImage, ToolId, UiState, ViewerFrameBuffer,
-        ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState,
-        ZoomCommand, apply_zoom_command, build_frame, canonical_json, centered_circular_roi,
-        compute_initial_viewport_size, compute_viewer_frame, create_circular_masks_dataset,
-        dominant_scroll_component, effective_scroll_delta, format_launcher_status, image_draw_rect,
+        HoverInfo, ImageSummary, LauncherStatusModel, LookupTable, NativeRasterImage,
+        OverlayVisibility, ProgressState, RepaintDecisionInputs, RoiKind, RoiModel, SliceImage,
+        ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest, ViewerImageSource, ViewerSession,
+        ViewerTelemetry, ViewerUiState, ZoomCommand, add_selection_to_overlay,
+        apply_overlay_visibility, apply_zoom_command, binary_morphology_params, build_frame,
+        canonical_json, centered_circular_roi, combine_stack_datasets,
+        compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
+        create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
+        flatten_overlay_slice, format_launcher_status, image_draw_rect,
         image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
-        initialize_view_to_open_state, line_width_from_params, preview_cache_key,
-        renamed_image_path, results_distribution, results_rows_to_dataset, results_summary_rows,
-        roi_stroke_width, sanitize_image_title, should_request_periodic_repaint,
-        should_request_repaint_now, source_ptr_eq, stack_position_from_params,
-        tool_from_command_id, tool_shortcut_command, viewer_sort_key, zoom_set_params,
+        images_to_stack_dataset, initialize_view_to_open_state, insert_stack_dataset,
+        line_width_from_params, lookup_table_color, lookup_table_from_command,
+        lookup_table_slice_to_rgb, new_image_dataset, overlay_element_rows,
+        overlay_from_roi_manager, overlay_label_for_roi, overlay_to_roi_manager, preview_cache_key,
+        remove_stack_slice_labels_dataset, renamed_image_path, results_distribution,
+        results_rows_to_dataset, results_summary_rows, roi_label_anchor, roi_stroke_width,
+        sanitize_image_title, set_stack_slice_label_dataset, should_request_periodic_repaint,
+        should_request_repaint_now, source_ptr_eq, stack_measurement_rows,
+        stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
+        stack_xy_profile_rows, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
+        xy_coordinate_rows, zoom_set_params,
     };
 
     fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
@@ -7855,6 +10184,656 @@ mod tests {
         let right = preview_cache_key("gaussian.blur", &json!({"radius": 2, "sigma": 1.0}))
             .expect("right key");
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn binary_morphology_params_use_saved_options() {
+        let options = BinaryOptions {
+            iterations: 3,
+            count: 4,
+        };
+
+        assert_eq!(
+            binary_morphology_params("process.binary.erode", None, &options),
+            json!({
+                "iterations": 3,
+                "count": 4
+            })
+        );
+    }
+
+    #[test]
+    fn binary_morphology_params_allow_request_overrides() {
+        let options = BinaryOptions {
+            iterations: 3,
+            count: 4,
+        };
+
+        assert_eq!(
+            binary_morphology_params(
+                "process.binary.open",
+                Some(json!({
+                    "iterations": 2,
+                    "radius": 1
+                })),
+                &options
+            ),
+            json!({
+                "iterations": 2,
+                "count": 4,
+                "radius": 1
+            })
+        );
+    }
+
+    #[test]
+    fn binary_morphology_params_skip_options_for_other_binary_ops() {
+        let options = BinaryOptions {
+            iterations: 3,
+            count: 4,
+        };
+
+        assert_eq!(
+            binary_morphology_params("process.binary.median", None, &options),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn images_to_stack_dataset_combines_matching_2d_images() {
+        let first = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+        let second = dataset_2x2([4.0, 5.0, 6.0, 7.0]);
+
+        let stack = images_to_stack_dataset(&[
+            ("first.tif", first.as_ref()),
+            ("second.tif", second.as_ref()),
+        ])
+        .expect("images to stack");
+
+        assert_eq!(stack.shape(), &[2, 2, 2]);
+        assert_eq!(stack.metadata.dims[2].axis, AxisKind::Z);
+        assert_eq!(
+            stack.data.iter().copied().collect::<Vec<_>>(),
+            vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]
+        );
+        assert_eq!(
+            stack.metadata.extras.get("images_to_stack_titles"),
+            Some(&json!(["first.tif", "second.tif"]))
+        );
+    }
+
+    #[test]
+    fn images_to_stack_dataset_inserts_z_before_channels() {
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 2),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        };
+        let first = DatasetF32::new(
+            Array::from_shape_vec((1, 2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .expect("first shape")
+                .into_dyn(),
+            metadata.clone(),
+        )
+        .expect("first dataset");
+        let second = DatasetF32::new(
+            Array::from_shape_vec((1, 2, 3), vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+                .expect("second shape")
+                .into_dyn(),
+            metadata,
+        )
+        .expect("second dataset");
+
+        let stack = images_to_stack_dataset(&[("first", &first), ("second", &second)])
+            .expect("images to stack");
+
+        assert_eq!(stack.shape(), &[1, 2, 2, 3]);
+        assert_eq!(
+            stack
+                .metadata
+                .dims
+                .iter()
+                .map(|dim| dim.axis)
+                .collect::<Vec<_>>(),
+            vec![AxisKind::Y, AxisKind::X, AxisKind::Z, AxisKind::Channel]
+        );
+        assert_eq!(stack.data[IxDyn(&[0, 0, 0, 1])], 2.0);
+        assert_eq!(stack.data[IxDyn(&[0, 0, 1, 1])], 8.0);
+    }
+
+    #[test]
+    fn images_to_stack_dataset_rejects_single_or_mismatched_images() {
+        let first = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+        let different = DatasetF32::from_data_with_default_metadata(
+            Array::from_shape_vec((1, 4), vec![0.0, 1.0, 2.0, 3.0])
+                .expect("shape")
+                .into_dyn(),
+            PixelType::F32,
+        );
+
+        assert!(
+            images_to_stack_dataset(&[("first", first.as_ref())])
+                .expect_err("single image")
+                .contains("at least two")
+        );
+        assert!(
+            images_to_stack_dataset(&[("first", first.as_ref()), ("different", &different)])
+                .expect_err("mismatched")
+                .contains("matching dimensions")
+        );
+    }
+
+    #[test]
+    fn combine_stack_datasets_combines_horizontally_and_fills_missing_depth() {
+        let first_data =
+            Array::from_shape_vec((2, 2, 2), vec![1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0])
+                .expect("first shape")
+                .into_dyn();
+        let second_data = Array::from_shape_vec((1, 1, 1), vec![9.0])
+            .expect("second shape")
+            .into_dyn();
+        let first = DatasetF32::from_data_with_default_metadata(first_data, PixelType::F32);
+        let second = DatasetF32::from_data_with_default_metadata(second_data, PixelType::F32);
+
+        let combined = combine_stack_datasets(&first, &second, false, -1.0).expect("combine");
+
+        assert_eq!(combined.shape(), &[2, 3, 2]);
+        assert_eq!(combined.data[IxDyn(&[0, 0, 0])], 1.0);
+        assert_eq!(combined.data[IxDyn(&[0, 0, 1])], 10.0);
+        assert_eq!(combined.data[IxDyn(&[0, 2, 0])], 9.0);
+        assert_eq!(combined.data[IxDyn(&[0, 2, 1])], -1.0);
+        assert_eq!(combined.data[IxDyn(&[1, 2, 0])], -1.0);
+        assert_eq!(
+            combined.metadata.extras.get("stack_combine_orientation"),
+            Some(&json!("horizontal"))
+        );
+    }
+
+    #[test]
+    fn combine_stack_datasets_combines_vertically() {
+        let first = dataset_2x2([1.0, 2.0, 3.0, 4.0]);
+        let second = dataset_2x2([5.0, 6.0, 7.0, 8.0]);
+
+        let combined =
+            combine_stack_datasets(first.as_ref(), second.as_ref(), true, 0.0).expect("combine");
+
+        assert_eq!(combined.shape(), &[4, 2, 1]);
+        assert_eq!(combined.data[IxDyn(&[0, 0, 0])], 1.0);
+        assert_eq!(combined.data[IxDyn(&[1, 1, 0])], 4.0);
+        assert_eq!(combined.data[IxDyn(&[2, 0, 0])], 5.0);
+        assert_eq!(combined.data[IxDyn(&[3, 1, 0])], 8.0);
+        assert_eq!(
+            combined.metadata.extras.get("stack_combine_orientation"),
+            Some(&json!("vertical"))
+        );
+    }
+
+    #[test]
+    fn combine_stack_datasets_rejects_channel_images() {
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        };
+        let rgb = DatasetF32::new(
+            Array::from_shape_vec((1, 1, 3), vec![1.0, 0.0, 0.0])
+                .expect("shape")
+                .into_dyn(),
+            metadata,
+        )
+        .expect("dataset");
+        let gray = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+
+        let error =
+            combine_stack_datasets(&rgb, gray.as_ref(), false, 0.0).expect_err("channels rejected");
+
+        assert!(error.contains("X/Y/Z"));
+    }
+
+    #[test]
+    fn concatenate_stack_datasets_appends_depth_and_pads_larger_canvas() {
+        let first_data = Array::from_shape_vec((1, 2), vec![1.0, 2.0])
+            .expect("first shape")
+            .into_dyn();
+        let second_data = Array::from_shape_vec((2, 1, 2), vec![3.0, 30.0, 4.0, 40.0])
+            .expect("second shape")
+            .into_dyn();
+        let first = DatasetF32::from_data_with_default_metadata(first_data, PixelType::F32);
+        let second = DatasetF32::from_data_with_default_metadata(second_data, PixelType::F32);
+
+        let output = concatenate_stack_datasets(&[("first", &first), ("second", &second)], -1.0)
+            .expect("concatenate");
+
+        assert_eq!(output.shape(), &[2, 2, 3]);
+        assert_eq!(output.data[IxDyn(&[0, 0, 0])], 1.0);
+        assert_eq!(output.data[IxDyn(&[0, 1, 0])], 2.0);
+        assert_eq!(output.data[IxDyn(&[1, 0, 0])], -1.0);
+        assert_eq!(output.data[IxDyn(&[0, 0, 1])], 3.0);
+        assert_eq!(output.data[IxDyn(&[0, 0, 2])], 30.0);
+        assert_eq!(output.data[IxDyn(&[1, 0, 1])], 4.0);
+        assert_eq!(output.data[IxDyn(&[1, 0, 2])], 40.0);
+        assert_eq!(output.data[IxDyn(&[0, 1, 1])], -1.0);
+        assert_eq!(
+            output.metadata.extras.get("stack_concatenate_titles"),
+            Some(&json!(["first", "second"]))
+        );
+    }
+
+    #[test]
+    fn concatenate_stack_datasets_rejects_single_or_channel_images() {
+        let first = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+        assert!(
+            concatenate_stack_datasets(&[("first", first.as_ref())], 0.0)
+                .expect_err("single image")
+                .contains("at least two")
+        );
+
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        };
+        let rgb = DatasetF32::new(
+            Array::from_shape_vec((1, 1, 3), vec![1.0, 0.0, 0.0])
+                .expect("shape")
+                .into_dyn(),
+            metadata,
+        )
+        .expect("dataset");
+        assert!(
+            concatenate_stack_datasets(&[("first", first.as_ref()), ("rgb", &rgb)], 0.0)
+                .expect_err("channel image")
+                .contains("X/Y/Z")
+        );
+    }
+
+    #[test]
+    fn insert_stack_dataset_inserts_2d_source_with_clipping() {
+        let source = dataset_2x2([1.0, 2.0, 3.0, 4.0]);
+        let destination = DatasetF32::from_data_with_default_metadata(
+            Array::from_shape_vec((3, 3), vec![0.0; 9])
+                .expect("shape")
+                .into_dyn(),
+            PixelType::F32,
+        );
+
+        let inserted =
+            insert_stack_dataset(source.as_ref(), &destination, 1, 1).expect("insert stack");
+
+        assert_eq!(inserted.shape(), &[3, 3]);
+        assert_eq!(inserted.data[IxDyn(&[1, 1])], 1.0);
+        assert_eq!(inserted.data[IxDyn(&[1, 2])], 2.0);
+        assert_eq!(inserted.data[IxDyn(&[2, 1])], 3.0);
+        assert_eq!(inserted.data[IxDyn(&[2, 2])], 4.0);
+        assert_eq!(
+            inserted.metadata.extras.get("stack_insert_offset"),
+            Some(&json!([1, 1]))
+        );
+
+        let clipped =
+            insert_stack_dataset(source.as_ref(), &destination, -1, -1).expect("clipped insert");
+        assert_eq!(clipped.data[IxDyn(&[0, 0])], 4.0);
+        assert_eq!(clipped.data[IxDyn(&[0, 1])], 0.0);
+    }
+
+    #[test]
+    fn insert_stack_dataset_repeats_source_last_slice() {
+        let source = DatasetF32::from_data_with_default_metadata(
+            Array::from_shape_vec((1, 1, 2), vec![5.0, 6.0])
+                .expect("source shape")
+                .into_dyn(),
+            PixelType::F32,
+        );
+        let destination = DatasetF32::from_data_with_default_metadata(
+            Array::from_shape_vec((1, 2, 3), vec![0.0; 6])
+                .expect("destination shape")
+                .into_dyn(),
+            PixelType::F32,
+        );
+
+        let inserted = insert_stack_dataset(&source, &destination, 1, 0).expect("insert stack");
+
+        assert_eq!(inserted.data[IxDyn(&[0, 1, 0])], 5.0);
+        assert_eq!(inserted.data[IxDyn(&[0, 1, 1])], 6.0);
+        assert_eq!(inserted.data[IxDyn(&[0, 1, 2])], 6.0);
+    }
+
+    #[test]
+    fn insert_stack_dataset_rejects_channel_images() {
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        };
+        let source = DatasetF32::new(
+            Array::from_shape_vec((1, 1, 3), vec![1.0, 0.0, 0.0])
+                .expect("shape")
+                .into_dyn(),
+            metadata,
+        )
+        .expect("dataset");
+        let destination = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+
+        let error =
+            insert_stack_dataset(&source, destination.as_ref(), 0, 0).expect_err("channel image");
+
+        assert!(error.contains("X/Y/Z"));
+    }
+
+    #[test]
+    fn stack_measurement_rows_reports_each_z_slice() {
+        let data = Array::from_shape_vec(
+            (2, 2, 2),
+            vec![
+                0.0, 10.0, //
+                2.0, 12.0, //
+                4.0, 14.0, //
+                6.0, 16.0,
+            ],
+        )
+        .expect("shape")
+        .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+
+        let rows = stack_measurement_rows(&dataset, &MeasurementSettings::default(), None, 0, 0)
+            .expect("measure stack");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("slice"), Some(&json!(0)));
+        assert_eq!(rows[1].get("slice"), Some(&json!(1)));
+        assert_eq!(rows[0].get("mean"), Some(&json!(3.0)));
+        assert_eq!(rows[1].get("mean"), Some(&json!(13.0)));
+        assert_eq!(rows[0].get("area"), Some(&json!(3)));
+        assert_eq!(rows[1].get("area"), Some(&json!(4)));
+    }
+
+    #[test]
+    fn stack_measurement_rows_applies_selection_to_each_slice() {
+        let data = Array::from_shape_vec(
+            (2, 2, 2),
+            vec![
+                0.0, 10.0, //
+                2.0, 12.0, //
+                4.0, 14.0, //
+                6.0, 16.0,
+            ],
+        )
+        .expect("shape")
+        .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+
+        let rows = stack_measurement_rows(
+            &dataset,
+            &MeasurementSettings::default(),
+            Some((1, 0, 1, 1)),
+            0,
+            0,
+        )
+        .expect("measure selected stack");
+
+        assert_eq!(rows[0].get("mean"), Some(&json!(4.0)));
+        assert_eq!(rows[1].get("mean"), Some(&json!(14.0)));
+        assert_eq!(rows[0].get("bbox"), Some(&json!([1, 0, 1, 1])));
+    }
+
+    #[test]
+    fn stack_measurement_rows_rejects_non_stack_images() {
+        let dataset = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+
+        let error = stack_measurement_rows(
+            dataset.as_ref(),
+            &MeasurementSettings::default(),
+            None,
+            0,
+            0,
+        )
+        .expect_err("not a stack");
+
+        assert!(error.contains("Z stack"));
+    }
+
+    #[test]
+    fn stack_xy_profile_rows_reports_rect_profile_for_each_z_slice() {
+        let data = Array::from_shape_vec(
+            (2, 3, 2),
+            vec![
+                1.0, 11.0, //
+                2.0, 12.0, //
+                3.0, 13.0, //
+                4.0, 14.0, //
+                5.0, 15.0, //
+                6.0, 16.0,
+            ],
+        )
+        .expect("shape")
+        .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+        let params = json!({
+            "left": 0,
+            "top": 0,
+            "width": 3,
+            "height": 2,
+            "vertical": false
+        });
+
+        let rows = stack_xy_profile_rows(&dataset, &params).expect("stack xy profile");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("slice"), Some(&json!(0)));
+        assert_eq!(rows[1].get("slice"), Some(&json!(1)));
+        assert_eq!(rows[0].get("profile_axis"), Some(&json!("x")));
+        assert_eq!(rows[0].get("sample_count"), Some(&json!(3)));
+        assert_eq!(rows[0].get("P0"), Some(&json!(2.5)));
+        assert_eq!(rows[0].get("P1"), Some(&json!(3.5)));
+        assert_eq!(rows[0].get("P2"), Some(&json!(4.5)));
+        assert_eq!(rows[1].get("P0"), Some(&json!(12.5)));
+        assert_eq!(rows[1].get("P1"), Some(&json!(13.5)));
+        assert_eq!(rows[1].get("P2"), Some(&json!(14.5)));
+    }
+
+    #[test]
+    fn stack_xy_profile_rows_reports_line_profile_for_each_z_slice() {
+        let data = Array::from_shape_vec(
+            (2, 2, 2),
+            vec![
+                1.0, 10.0, //
+                2.0, 20.0, //
+                3.0, 30.0, //
+                4.0, 40.0,
+            ],
+        )
+        .expect("shape")
+        .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+        let params = json!({
+            "x0": 0.0,
+            "y0": 0.0,
+            "x1": 1.0,
+            "y1": 1.0
+        });
+
+        let rows = stack_xy_profile_rows(&dataset, &params).expect("stack xy profile");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("profile_axis"), Some(&json!("line")));
+        assert_eq!(rows[0].get("P0"), Some(&json!(1.0)));
+        assert_eq!(rows[0].get("P1"), Some(&json!(4.0)));
+        assert_eq!(rows[1].get("P0"), Some(&json!(10.0)));
+        assert_eq!(rows[1].get("P1"), Some(&json!(40.0)));
+    }
+
+    #[test]
+    fn stack_xy_profile_rows_rejects_non_stack_or_missing_selection() {
+        let dataset = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+        let non_stack_error = stack_xy_profile_rows(
+            dataset.as_ref(),
+            &json!({
+                "left": 0,
+                "top": 0,
+                "width": 1,
+                "height": 1
+            }),
+        )
+        .expect_err("not a stack");
+        assert!(non_stack_error.contains("Z stack"));
+
+        let stack = DatasetF32::from_data_with_default_metadata(
+            Array::from_shape_vec((1, 1, 2), vec![1.0, 2.0])
+                .expect("shape")
+                .into_dyn(),
+            PixelType::F32,
+        );
+        let selection_error =
+            stack_xy_profile_rows(&stack, &json!({})).expect_err("missing selection");
+        assert!(selection_error.contains("line or rectangular selection"));
+    }
+
+    #[test]
+    fn set_stack_slice_label_dataset_writes_per_slice_labels() {
+        let data = Array::from_shape_vec((2, 2, 3), (0..12).map(|value| value as f32).collect())
+            .expect("shape")
+            .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+
+        let labeled =
+            set_stack_slice_label_dataset(&dataset, 1, "middle").expect("set slice label");
+
+        assert_eq!(labeled.shape(), dataset.shape());
+        assert_eq!(stack_slice_label(&labeled, 0), None);
+        assert_eq!(stack_slice_label(&labeled, 1), Some("middle".to_string()));
+        assert_eq!(stack_slice_label(&labeled, 2), None);
+        assert_eq!(
+            labeled.metadata.extras.get("slice_labels"),
+            Some(&json!([null, "middle", null]))
+        );
+    }
+
+    #[test]
+    fn set_stack_slice_label_dataset_clears_empty_labels_and_validates_range() {
+        let data = Array::from_shape_vec((2, 2, 2), (0..8).map(|value| value as f32).collect())
+            .expect("shape")
+            .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+        let labeled = set_stack_slice_label_dataset(&dataset, 0, "first").expect("set label");
+        let cleared = set_stack_slice_label_dataset(&labeled, 0, "").expect("clear label");
+
+        assert!(cleared.metadata.extras.get("slice_labels").is_none());
+        assert!(
+            set_stack_slice_label_dataset(&dataset, 4, "bad")
+                .expect_err("slice out of range")
+                .contains("outside")
+        );
+    }
+
+    #[test]
+    fn stack_slice_labels_support_single_image_label_property() {
+        let dataset = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+        let labeled =
+            set_stack_slice_label_dataset(dataset.as_ref(), 0, "single").expect("single label");
+
+        assert_eq!(stack_slice_label(&labeled, 0), Some("single".to_string()));
+        assert_eq!(
+            labeled.metadata.extras.get("Slice_Label"),
+            Some(&json!("single"))
+        );
+        assert!(labeled.metadata.extras.get("slice_labels").is_none());
+    }
+
+    #[test]
+    fn remove_stack_slice_labels_dataset_removes_label_metadata() {
+        let data = Array::from_shape_vec((2, 2, 2), (0..8).map(|value| value as f32).collect())
+            .expect("shape")
+            .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+        let labeled = set_stack_slice_label_dataset(&dataset, 1, "second").expect("set label");
+
+        let cleaned = remove_stack_slice_labels_dataset(&labeled).expect("remove labels");
+
+        assert!(cleaned.metadata.extras.get("slice_labels").is_none());
+        assert!(cleaned.metadata.extras.get("Slice_Label").is_none());
+        assert_eq!(
+            cleaned.data.iter().copied().collect::<Vec<_>>(),
+            dataset.data.iter().copied().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stack_to_image_datasets_splits_z_stack_into_2d_images() {
+        let data = Array::from_shape_vec((2, 2, 3), (0..12).map(|value| value as f32).collect())
+            .expect("shape")
+            .into_dyn();
+        let dataset = DatasetF32::from_data_with_default_metadata(data, PixelType::F32);
+
+        let images = stack_to_image_datasets(&dataset).expect("stack to images");
+
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0].shape(), &[2, 2]);
+        assert!(
+            images[0]
+                .metadata
+                .dims
+                .iter()
+                .all(|dim| dim.axis != AxisKind::Z)
+        );
+        assert_eq!(
+            images[0].data.iter().copied().collect::<Vec<_>>(),
+            vec![0.0, 3.0, 6.0, 9.0]
+        );
+        assert_eq!(
+            images[2].data.iter().copied().collect::<Vec<_>>(),
+            vec![2.0, 5.0, 8.0, 11.0]
+        );
+        assert_eq!(
+            images[2]
+                .metadata
+                .extras
+                .get("stack_to_images_source_slice"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            images[2]
+                .metadata
+                .extras
+                .get("stack_to_images_source_shape"),
+            Some(&json!([2, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn stack_to_image_datasets_rejects_non_stack_images() {
+        let dataset = dataset_2x2([0.0, 1.0, 2.0, 3.0]);
+
+        let error = stack_to_image_datasets(dataset.as_ref()).expect_err("not a stack");
+
+        assert!(error.contains("Z stack"));
+    }
+
+    #[test]
+    fn stack_slice_path_preserves_extension_and_adds_slice_number() {
+        assert_eq!(
+            stack_slice_path(Path::new("/tmp/source.tif"), 7),
+            PathBuf::from("/tmp/source-slice-007.tif")
+        );
+        assert_eq!(
+            stack_slice_path(Path::new("/tmp/source"), 2),
+            PathBuf::from("/tmp/source-slice-002.tif")
+        );
     }
 
     #[test]
@@ -7931,10 +10910,321 @@ mod tests {
     }
 
     #[test]
+    fn lookup_table_commands_map_to_display_colors() {
+        assert_eq!(
+            lookup_table_from_command("image.lookup.red"),
+            Some(LookupTable::Red)
+        );
+        assert_eq!(lookup_table_from_command("image.lookup.unknown"), None);
+        assert_eq!(
+            lookup_table_color(LookupTable::Grays, 128),
+            egui::Color32::from_rgb(128, 128, 128)
+        );
+        assert_eq!(
+            lookup_table_color(LookupTable::Inverted, 10),
+            egui::Color32::from_rgb(245, 245, 245)
+        );
+        assert_eq!(
+            lookup_table_color(LookupTable::Cyan, 200),
+            egui::Color32::from_rgb(0, 200, 200)
+        );
+        assert_eq!(
+            lookup_table_color(LookupTable::RedGreen, 0),
+            egui::Color32::from_rgb(255, 0, 0)
+        );
+        assert_eq!(
+            lookup_table_color(LookupTable::RedGreen, 255),
+            egui::Color32::from_rgb(0, 255, 0)
+        );
+    }
+
+    #[test]
+    fn lookup_table_slice_to_rgb_bakes_display_lut() {
+        let slice = SliceImage {
+            width: 2,
+            height: 1,
+            values: vec![0.0, 1.0],
+        };
+
+        let dataset = lookup_table_slice_to_rgb(&slice, LookupTable::RedGreen).expect("apply lut");
+
+        assert_eq!(dataset.shape(), &[1, 2, 3]);
+        assert_eq!(dataset.metadata.pixel_type, PixelType::U8);
+        assert_eq!(dataset.metadata.channel_names, ["R", "G", "B"]);
+        assert_eq!(
+            dataset.metadata.extras.get("applied_lut"),
+            Some(&json!("Red/Green"))
+        );
+        assert_eq!(dataset.data[IxDyn(&[0, 0, 0])], 1.0);
+        assert_eq!(dataset.data[IxDyn(&[0, 0, 1])], 0.0);
+        assert_eq!(dataset.data[IxDyn(&[0, 1, 0])], 0.0);
+        assert_eq!(dataset.data[IxDyn(&[0, 1, 1])], 1.0);
+    }
+
+    #[test]
     fn roi_stroke_width_uses_line_width_and_selection_emphasis() {
         assert_eq!(roi_stroke_width(3.0, false), 3.0);
         assert_eq!(roi_stroke_width(3.0, true), 3.5);
         assert_eq!(roi_stroke_width(0.0, false), 1.0);
+    }
+
+    #[test]
+    fn roi_label_anchor_uses_selection_center() {
+        let rect = RoiKind::Rect {
+            start: egui::pos2(2.0, 4.0),
+            end: egui::pos2(10.0, 12.0),
+            rounded: false,
+            rotated: false,
+        };
+        assert_eq!(roi_label_anchor(&rect), Some(egui::pos2(6.0, 8.0)));
+
+        let polygon = RoiKind::Polygon {
+            points: vec![
+                egui::pos2(1.0, 2.0),
+                egui::pos2(7.0, 4.0),
+                egui::pos2(3.0, 10.0),
+            ],
+            closed: true,
+        };
+        assert_eq!(roi_label_anchor(&polygon), Some(egui::pos2(4.0, 6.0)));
+    }
+
+    #[test]
+    fn add_selection_to_overlay_commits_active_roi_and_preserves_existing() {
+        let mut rois = RoiStore::default();
+        rois.begin_active(
+            RoiKind::Rect {
+                start: egui::pos2(0.0, 0.0),
+                end: egui::pos2(2.0, 2.0),
+                rounded: false,
+                rotated: false,
+            },
+            RoiPosition::default(),
+        );
+
+        assert_eq!(
+            add_selection_to_overlay(&mut rois).expect("add active"),
+            "selection added to overlay"
+        );
+        assert_eq!(rois.overlay_rois.len(), 1);
+        assert!(rois.active_roi.is_none());
+        assert_eq!(rois.selected_roi_id, Some(rois.overlay_rois[0].id));
+
+        rois.begin_active(
+            RoiKind::Point {
+                points: vec![egui::pos2(4.0, 4.0)],
+                multi: false,
+            },
+            RoiPosition::default(),
+        );
+        add_selection_to_overlay(&mut rois).expect("add second");
+        assert_eq!(rois.overlay_rois.len(), 2);
+    }
+
+    #[test]
+    fn add_selection_to_overlay_marks_existing_selection_visible() {
+        let mut rois = RoiStore::default();
+        rois.begin_active(
+            RoiKind::Point {
+                points: vec![egui::pos2(1.0, 1.0)],
+                multi: false,
+            },
+            RoiPosition::default(),
+        );
+        rois.commit_active(true);
+        rois.overlay_rois[0].visible = false;
+
+        assert_eq!(
+            add_selection_to_overlay(&mut rois).expect("existing"),
+            "selection already in overlay"
+        );
+        assert_eq!(rois.overlay_rois.len(), 1);
+        assert!(rois.overlay_rois[0].visible);
+
+        rois.selected_roi_id = None;
+        assert!(add_selection_to_overlay(&mut rois).is_err());
+    }
+
+    #[test]
+    fn overlay_roi_manager_bridge_uses_shared_store() {
+        let mut rois = RoiStore::default();
+        rois.begin_active(
+            RoiKind::Point {
+                points: vec![egui::pos2(1.0, 1.0)],
+                multi: false,
+            },
+            RoiPosition::default(),
+        );
+        rois.commit_active(true);
+        rois.overlay_rois[0].visible = false;
+        rois.selected_roi_id = None;
+
+        assert_eq!(
+            overlay_from_roi_manager(&mut rois).expect("from manager"),
+            1
+        );
+        assert!(rois.overlay_rois[0].visible);
+        assert_eq!(rois.selected_roi_id, Some(rois.overlay_rois[0].id));
+
+        rois.selected_roi_id = Some(999);
+        assert_eq!(overlay_to_roi_manager(&mut rois).expect("to manager"), 1);
+        assert_eq!(rois.selected_roi_id, Some(rois.overlay_rois[0].id));
+
+        let mut empty = RoiStore::default();
+        assert!(overlay_from_roi_manager(&mut empty).is_err());
+        assert!(overlay_to_roi_manager(&mut empty).is_err());
+    }
+
+    #[test]
+    fn overlay_label_for_roi_uses_index_or_name() {
+        let roi = RoiModel {
+            id: 1,
+            name: "Nucleus".to_string(),
+            kind: RoiKind::Rect {
+                start: egui::pos2(2.0, 4.0),
+                end: egui::pos2(6.0, 8.0),
+                rounded: false,
+                rotated: false,
+            },
+            position: RoiPosition::default(),
+            visible: true,
+            locked: false,
+        };
+        let mut settings = OverlaySettings {
+            show_labels: true,
+            ..OverlaySettings::default()
+        };
+
+        let (anchor, label) = overlay_label_for_roi(&roi, 4, &settings).expect("numbered label");
+        assert_eq!(anchor, egui::pos2(4.0, 6.0));
+        assert_eq!(label, "5");
+
+        settings.use_names_as_labels = true;
+        let (_, label) = overlay_label_for_roi(&roi, 4, &settings).expect("named label");
+        assert_eq!(label, "Nucleus");
+
+        settings.show_labels = false;
+        assert!(overlay_label_for_roi(&roi, 4, &settings).is_none());
+    }
+
+    #[test]
+    fn flatten_overlay_slice_burns_visible_roi_outlines() {
+        let slice = SliceImage {
+            width: 4,
+            height: 3,
+            values: vec![0.0; 12],
+        };
+        let rois = vec![RoiModel {
+            id: 1,
+            name: "Box".to_string(),
+            kind: RoiKind::Rect {
+                start: egui::pos2(1.0, 0.0),
+                end: egui::pos2(3.0, 2.0),
+                rounded: false,
+                rotated: false,
+            },
+            position: RoiPosition::default(),
+            visible: true,
+            locked: false,
+        }];
+
+        let flattened = flatten_overlay_slice(&slice, &rois).expect("flatten");
+
+        assert_eq!(flattened.shape(), &[3, 4]);
+        assert_eq!(flattened.data[IxDyn(&[0, 1])], 1.0);
+        assert_eq!(flattened.data[IxDyn(&[0, 2])], 1.0);
+        assert_eq!(flattened.data[IxDyn(&[0, 3])], 1.0);
+        assert_eq!(flattened.data[IxDyn(&[1, 1])], 1.0);
+        assert_eq!(flattened.data[IxDyn(&[1, 2])], 0.0);
+        assert_eq!(flattened.data[IxDyn(&[2, 3])], 1.0);
+    }
+
+    #[test]
+    fn flatten_overlay_slice_rejects_empty_overlay() {
+        let slice = SliceImage {
+            width: 1,
+            height: 1,
+            values: vec![0.0],
+        };
+
+        assert!(flatten_overlay_slice(&slice, &[]).is_err());
+    }
+
+    #[test]
+    fn overlay_element_rows_report_imagej_style_metadata() {
+        let rois = vec![RoiModel {
+            id: 7,
+            name: "Cell 7".to_string(),
+            kind: RoiKind::Rect {
+                start: egui::pos2(2.2, 4.0),
+                end: egui::pos2(5.0, 8.6),
+                rounded: false,
+                rotated: false,
+            },
+            position: RoiPosition {
+                channel: 1,
+                z: 2,
+                t: 3,
+            },
+            visible: true,
+            locked: false,
+        }];
+
+        let rows = overlay_element_rows(&rois).expect("overlay rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("Index"), Some(&json!(1)));
+        assert_eq!(rows[0].get("Name"), Some(&json!("Cell 7")));
+        assert_eq!(rows[0].get("Type"), Some(&json!("Rectangle")));
+        assert_eq!(rows[0].get("X"), Some(&json!(2)));
+        assert_eq!(rows[0].get("Y"), Some(&json!(4)));
+        assert_eq!(rows[0].get("Width"), Some(&json!(4)));
+        assert_eq!(rows[0].get("Height"), Some(&json!(6)));
+        assert_eq!(rows[0].get("Channel"), Some(&json!(2)));
+        assert_eq!(rows[0].get("Slice"), Some(&json!(3)));
+        assert_eq!(rows[0].get("Frame"), Some(&json!(4)));
+        assert_eq!(rows[0].get("Visible"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn apply_overlay_visibility_toggles_all_elements() {
+        let mut rois = vec![
+            RoiModel {
+                id: 1,
+                name: "A".to_string(),
+                kind: RoiKind::Point {
+                    points: vec![egui::pos2(1.0, 1.0)],
+                    multi: false,
+                },
+                position: RoiPosition::default(),
+                visible: true,
+                locked: false,
+            },
+            RoiModel {
+                id: 2,
+                name: "B".to_string(),
+                kind: RoiKind::Point {
+                    points: vec![egui::pos2(2.0, 2.0)],
+                    multi: false,
+                },
+                position: RoiPosition::default(),
+                visible: false,
+                locked: false,
+            },
+        ];
+
+        assert_eq!(
+            apply_overlay_visibility(&mut rois, OverlayVisibility::Toggle).expect("toggle"),
+            2
+        );
+        assert!(rois.iter().all(|roi| !roi.visible));
+
+        apply_overlay_visibility(&mut rois, OverlayVisibility::Toggle).expect("toggle");
+        assert!(rois.iter().all(|roi| roi.visible));
+
+        apply_overlay_visibility(&mut rois, OverlayVisibility::Hide).expect("hide");
+        assert!(rois.iter().all(|roi| !roi.visible));
+        assert!(apply_overlay_visibility(&mut [], OverlayVisibility::Show).is_err());
     }
 
     #[test]
@@ -7958,6 +11248,55 @@ mod tests {
         assert_eq!(rows[1].get("Label"), Some(&json!("Y1")));
         assert_eq!(rows[1].get("X1"), Some(&json!(5.0)));
         assert_eq!(rows[1].get("X2"), Some(&json!(6.0)));
+    }
+
+    #[test]
+    fn xy_coordinate_rows_skip_background_without_selection() {
+        let slice = SliceImage {
+            width: 3,
+            height: 2,
+            values: vec![
+                0.0, 2.0, 0.0, //
+                4.0, 0.0, 6.0,
+            ],
+        };
+
+        let rows = xy_coordinate_rows(&slice, None, &json!({})).expect("xy rows");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get("X"), Some(&json!(1)));
+        assert_eq!(rows[0].get("Y"), Some(&json!(1)));
+        assert_eq!(rows[0].get("Value"), Some(&json!(2.0)));
+        assert_eq!(rows[1].get("X"), Some(&json!(0)));
+        assert_eq!(rows[1].get("Y"), Some(&json!(0)));
+        assert_eq!(rows[2].get("Value"), Some(&json!(6.0)));
+    }
+
+    #[test]
+    fn xy_coordinate_rows_include_selection_and_invert_y() {
+        let slice = SliceImage {
+            width: 3,
+            height: 2,
+            values: vec![
+                0.0, 2.0, 0.0, //
+                4.0, 0.0, 6.0,
+            ],
+        };
+
+        let rows = xy_coordinate_rows(
+            &slice,
+            Some((1, 0, 2, 0)),
+            &json!({"background": 0.0, "invert_y": true}),
+        )
+        .expect("xy rows");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("X"), Some(&json!(1)));
+        assert_eq!(rows[0].get("Y"), Some(&json!(0)));
+        assert_eq!(rows[0].get("Value"), Some(&json!(2.0)));
+        assert_eq!(rows[1].get("X"), Some(&json!(2)));
+        assert_eq!(rows[1].get("Y"), Some(&json!(0)));
+        assert_eq!(rows[1].get("Value"), Some(&json!(0.0)));
     }
 
     #[test]
@@ -8073,6 +11412,53 @@ mod tests {
     fn sanitize_image_title_replaces_path_separators() {
         assert_eq!(sanitize_image_title("a/b\\c:d"), "a_b_c_d");
         assert_eq!(sanitize_image_title("   "), "Untitled");
+    }
+
+    #[test]
+    fn new_image_dataset_creates_time_hyperstack() {
+        let dataset = new_image_dataset(&json!({
+            "width": 2,
+            "height": 3,
+            "slices": 4,
+            "channels": 2,
+            "frames": 5,
+            "fill": 7.0,
+            "pixelType": "u16"
+        }))
+        .expect("new hyperstack");
+
+        assert_eq!(dataset.shape(), &[3, 2, 4, 2, 5]);
+        assert_eq!(
+            dataset
+                .metadata
+                .dims
+                .iter()
+                .map(|dim| dim.axis)
+                .collect::<Vec<_>>(),
+            vec![
+                AxisKind::Y,
+                AxisKind::X,
+                AxisKind::Z,
+                AxisKind::Channel,
+                AxisKind::Time
+            ]
+        );
+        assert_eq!(dataset.metadata.pixel_type, PixelType::U16);
+        assert_eq!(dataset.data[IxDyn(&[2, 1, 3, 1, 4])], 7.0);
+    }
+
+    #[test]
+    fn new_image_dataset_rejects_zero_dimensions() {
+        let error = new_image_dataset(&json!({
+            "width": 0,
+            "height": 3,
+            "slices": 1,
+            "channels": 1,
+            "frames": 1
+        }))
+        .expect_err("zero width");
+
+        assert!(error.contains("positive"));
     }
 
     #[test]

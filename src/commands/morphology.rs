@@ -17,6 +17,7 @@ fn apply_morphology(
     dataset: &DatasetF32,
     radius: usize,
     kind: MorphologyKind,
+    count: usize,
 ) -> Result<ndarray::ArrayD<f32>> {
     let axes = spatial_axes(dataset);
     if axes.is_empty() {
@@ -29,12 +30,12 @@ fn apply_morphology(
     let mut output = dataset.data.clone();
 
     for (index, value) in output.indexed_iter_mut() {
-        let mut aggregate = match kind {
-            MorphologyKind::Erode => 1.0_f32,
-            MorphologyKind::Dilate => 0.0_f32,
-        };
-
+        let center_is_foreground = dataset.data[index.clone()] > 0.5;
+        let mut neighbor_matches = 0_usize;
         for offset in &offsets {
+            if offset.iter().all(|axis_offset| *axis_offset == 0) {
+                continue;
+            }
             let mut coord = index.slice().to_vec();
             for (offset_axis, data_axis) in axes.iter().enumerate() {
                 let axis_size = shape[*data_axis] as isize;
@@ -42,20 +43,68 @@ fn apply_morphology(
                 let clamped = candidate.clamp(0, axis_size - 1) as usize;
                 coord[*data_axis] = clamped;
             }
-            let binary = if dataset.data[IxDyn(&coord)] > 0.5 {
-                1.0_f32
-            } else {
-                0.0_f32
+            let neighbor_is_foreground = dataset.data[IxDyn(&coord)] > 0.5;
+            let matches = match kind {
+                MorphologyKind::Erode => !neighbor_is_foreground,
+                MorphologyKind::Dilate => neighbor_is_foreground,
             };
-            match kind {
-                MorphologyKind::Erode => aggregate = aggregate.min(binary),
-                MorphologyKind::Dilate => aggregate = aggregate.max(binary),
+            if matches {
+                neighbor_matches += 1;
             }
         }
-        *value = aggregate;
+
+        *value = match kind {
+            MorphologyKind::Erode => {
+                if !center_is_foreground || neighbor_matches >= count {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            MorphologyKind::Dilate => {
+                if center_is_foreground || neighbor_matches >= count {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        };
     }
 
     Ok(output)
+}
+
+fn morphology_iterations(params: &Value) -> Result<usize> {
+    let iterations = get_optional_usize(params, "iterations", 1);
+    if iterations == 0 {
+        return Err(OpsError::InvalidParams(
+            "`iterations` must be > 0".to_string(),
+        ));
+    }
+    Ok(iterations.min(100))
+}
+
+fn morphology_count(params: &Value) -> Result<usize> {
+    let count = get_optional_usize(params, "count", 1);
+    if count == 0 {
+        return Err(OpsError::InvalidParams("`count` must be > 0".to_string()));
+    }
+    Ok(count.min(8))
+}
+
+fn apply_morphology_iterations(
+    dataset: &DatasetF32,
+    radius: usize,
+    kind: MorphologyKind,
+    iterations: usize,
+    count: usize,
+) -> Result<ndarray::ArrayD<f32>> {
+    let mut current = dataset.clone();
+    for _ in 0..iterations {
+        let data = apply_morphology(&current, radius, kind, count)?;
+        current = Dataset::new(data, dataset.metadata.clone())?;
+    }
+    Ok(current.data)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,18 +119,36 @@ impl Operation for MorphologyErodeOp {
         OpSchema {
             name: self.name().to_string(),
             description: "Binary erosion over spatial axes.".to_string(),
-            params: vec![ParamSpec {
-                name: "radius".to_string(),
-                description: "Neighborhood radius.".to_string(),
-                required: false,
-                kind: "int".to_string(),
-            }],
+            params: vec![
+                ParamSpec {
+                    name: "radius".to_string(),
+                    description: "Neighborhood radius.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "iterations".to_string(),
+                    description: "Number of repeated erosions.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "count".to_string(),
+                    description: "Minimum neighboring background pixels needed to erode."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
         }
     }
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
         let radius = get_optional_usize(params, "radius", 1);
-        let eroded = apply_morphology(dataset, radius, MorphologyKind::Erode)?;
+        let iterations = morphology_iterations(params)?;
+        let count = morphology_count(params)?;
+        let eroded =
+            apply_morphology_iterations(dataset, radius, MorphologyKind::Erode, iterations, count)?;
         let output_dataset = Dataset::new(eroded, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
     }
@@ -99,18 +166,41 @@ impl Operation for MorphologyDilateOp {
         OpSchema {
             name: self.name().to_string(),
             description: "Binary dilation over spatial axes.".to_string(),
-            params: vec![ParamSpec {
-                name: "radius".to_string(),
-                description: "Neighborhood radius.".to_string(),
-                required: false,
-                kind: "int".to_string(),
-            }],
+            params: vec![
+                ParamSpec {
+                    name: "radius".to_string(),
+                    description: "Neighborhood radius.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "iterations".to_string(),
+                    description: "Number of repeated dilations.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "count".to_string(),
+                    description: "Minimum neighboring foreground pixels needed to dilate."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
         }
     }
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
         let radius = get_optional_usize(params, "radius", 1);
-        let dilated = apply_morphology(dataset, radius, MorphologyKind::Dilate)?;
+        let iterations = morphology_iterations(params)?;
+        let count = morphology_count(params)?;
+        let dilated = apply_morphology_iterations(
+            dataset,
+            radius,
+            MorphologyKind::Dilate,
+            iterations,
+            count,
+        )?;
         let output_dataset = Dataset::new(dilated, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
     }
@@ -128,20 +218,42 @@ impl Operation for MorphologyOpenOp {
         OpSchema {
             name: self.name().to_string(),
             description: "Binary opening (erode then dilate).".to_string(),
-            params: vec![ParamSpec {
-                name: "radius".to_string(),
-                description: "Neighborhood radius.".to_string(),
-                required: false,
-                kind: "int".to_string(),
-            }],
+            params: vec![
+                ParamSpec {
+                    name: "radius".to_string(),
+                    description: "Neighborhood radius.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "iterations".to_string(),
+                    description: "Number of repeated opening cycles.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "count".to_string(),
+                    description: "Minimum neighboring pixels needed for each erosion/dilation."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
         }
     }
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
         let radius = get_optional_usize(params, "radius", 1);
-        let eroded = apply_morphology(dataset, radius, MorphologyKind::Erode)?;
-        let intermediate = Dataset::new(eroded, dataset.metadata.clone())?;
-        let opened = apply_morphology(&intermediate, radius, MorphologyKind::Dilate)?;
+        let iterations = morphology_iterations(params)?;
+        let count = morphology_count(params)?;
+        let mut current = dataset.clone();
+        for _ in 0..iterations {
+            let eroded = apply_morphology(&current, radius, MorphologyKind::Erode, count)?;
+            let intermediate = Dataset::new(eroded, dataset.metadata.clone())?;
+            let opened = apply_morphology(&intermediate, radius, MorphologyKind::Dilate, count)?;
+            current = Dataset::new(opened, dataset.metadata.clone())?;
+        }
+        let opened = current.data;
         let output_dataset = Dataset::new(opened, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
     }
@@ -183,20 +295,42 @@ impl Operation for MorphologyCloseOp {
         OpSchema {
             name: self.name().to_string(),
             description: "Binary closing (dilate then erode).".to_string(),
-            params: vec![ParamSpec {
-                name: "radius".to_string(),
-                description: "Neighborhood radius.".to_string(),
-                required: false,
-                kind: "int".to_string(),
-            }],
+            params: vec![
+                ParamSpec {
+                    name: "radius".to_string(),
+                    description: "Neighborhood radius.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "iterations".to_string(),
+                    description: "Number of repeated closing cycles.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "count".to_string(),
+                    description: "Minimum neighboring pixels needed for each dilation/erosion."
+                        .to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
         }
     }
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
         let radius = get_optional_usize(params, "radius", 1);
-        let dilated = apply_morphology(dataset, radius, MorphologyKind::Dilate)?;
-        let intermediate = Dataset::new(dilated, dataset.metadata.clone())?;
-        let closed = apply_morphology(&intermediate, radius, MorphologyKind::Erode)?;
+        let iterations = morphology_iterations(params)?;
+        let count = morphology_count(params)?;
+        let mut current = dataset.clone();
+        for _ in 0..iterations {
+            let dilated = apply_morphology(&current, radius, MorphologyKind::Dilate, count)?;
+            let intermediate = Dataset::new(dilated, dataset.metadata.clone())?;
+            let closed = apply_morphology(&intermediate, radius, MorphologyKind::Erode, count)?;
+            current = Dataset::new(closed, dataset.metadata.clone())?;
+        }
+        let closed = current.data;
         let output_dataset = Dataset::new(closed, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
     }

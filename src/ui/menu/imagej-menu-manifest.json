@@ -112,17 +112,39 @@
           { "type": "item", "id": "image.stacks.next", "label": "Next Slice", "shortcut": ">" },
           { "type": "item", "id": "image.stacks.previous", "label": "Previous Slice", "shortcut": "<" },
           { "type": "item", "id": "image.stacks.set", "label": "Set Slice..." },
+          { "type": "item", "id": "image.stacks.images_to_stack", "label": "Images to Stack" },
           { "type": "item", "id": "image.stacks.make_substack", "label": "Make Substack..." },
           { "type": "item", "id": "image.stacks.reslice", "label": "Reslice..." },
+          { "type": "item", "id": "image.stacks.stack_to_images", "label": "Stack to Images" },
           { "type": "separator" },
           { "type": "item", "id": "image.stacks.make_montage", "label": "Make Montage..." },
           { "type": "item", "id": "image.stacks.montage_to_stack", "label": "Montage to Stack..." },
           { "type": "item", "id": "image.stacks.plot_z_profile", "label": "Plot Z-axis Profile" },
+          { "type": "item", "id": "image.stacks.plot_xy_profile", "label": "Plot XY Profile" },
+          { "type": "item", "id": "image.stacks.measure_stack", "label": "Measure Stack..." },
           { "type": "item", "id": "image.stacks.statistics", "label": "Statistics" },
           { "type": "item", "id": "image.stacks.z_project", "label": "Z Project..." },
+          { "type": "item", "id": "image.stacks.combine", "label": "Combine..." },
+          { "type": "item", "id": "image.stacks.concatenate", "label": "Concatenate..." },
           { "type": "item", "id": "image.stacks.grouped_z_project", "label": "Grouped Z Project..." },
+          { "type": "item", "id": "image.stacks.insert", "label": "Insert..." },
           { "type": "item", "id": "image.stacks.reduce", "label": "Reduce..." },
-          { "type": "item", "id": "image.stacks.reverse", "label": "Reverse" }
+          { "type": "item", "id": "image.stacks.reverse", "label": "Reverse" },
+          { "type": "separator" },
+          { "type": "item", "id": "image.stacks.set_label", "label": "Set Label..." },
+          { "type": "item", "id": "image.stacks.remove_slice_labels", "label": "Remove Slice Labels" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.hyperstacks",
+        "label": "Hyperstacks",
+        "items": [
+          { "type": "item", "id": "image.hyperstacks.new", "label": "New Hyperstack..." },
+          { "type": "item", "id": "image.hyperstacks.stack_to_hyperstack", "label": "Stack to Hyperstack..." },
+          { "type": "item", "id": "image.hyperstacks.hyperstack_to_stack", "label": "Hyperstack to Stack" },
+          { "type": "item", "id": "image.hyperstacks.reduce_dimensionality", "label": "Reduce Dimensionality..." },
+          { "type": "item", "id": "image.hyperstacks.make_subset", "label": "Make Subset..." }
         ]
       },
       {
@@ -157,6 +179,47 @@
           { "type": "item", "id": "image.zoom.scale_to_fit", "label": "Scale to Fit" },
           { "type": "item", "id": "image.zoom.set", "label": "Set..." },
           { "type": "item", "id": "image.zoom.maximize", "label": "Maximize" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.overlay",
+        "label": "Overlay",
+        "items": [
+          { "type": "item", "id": "image.overlay.add_selection", "label": "Add Selection...", "shortcut": "B" },
+          { "type": "item", "id": "image.overlay.hide", "label": "Hide Overlay" },
+          { "type": "item", "id": "image.overlay.show", "label": "Show Overlay" },
+          { "type": "item", "id": "image.overlay.from_roi_manager", "label": "From ROI Manager" },
+          { "type": "item", "id": "image.overlay.to_roi_manager", "label": "To ROI Manager" },
+          { "type": "item", "id": "image.overlay.remove", "label": "Remove Overlay" },
+          { "type": "item", "id": "image.overlay.toggle", "label": "Toggle Overlay" },
+          { "type": "item", "id": "image.overlay.list", "label": "List Elements" },
+          { "type": "item", "id": "image.overlay.flatten", "label": "Flatten", "shortcut": "F" },
+          { "type": "item", "id": "image.overlay.labels", "label": "Labels..." },
+          { "type": "item", "id": "image.overlay.measure", "label": "Measure Overlay" },
+          { "type": "item", "id": "image.overlay.options", "label": "Overlay Options...", "shortcut": "Y" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.lookup_tables",
+        "label": "Lookup Tables",
+        "items": [
+          { "type": "item", "id": "image.lookup.invert_lut", "label": "Invert LUT" },
+          { "type": "item", "id": "image.lookup.apply_lut", "label": "Apply LUT" },
+          { "type": "separator" },
+          { "type": "item", "id": "image.lookup.fire", "label": "Fire" },
+          { "type": "item", "id": "image.lookup.grays", "label": "Grays" },
+          { "type": "item", "id": "image.lookup.ice", "label": "Ice" },
+          { "type": "item", "id": "image.lookup.spectrum", "label": "Spectrum" },
+          { "type": "item", "id": "image.lookup.rgb332", "label": "3-3-2 RGB" },
+          { "type": "item", "id": "image.lookup.red", "label": "Red" },
+          { "type": "item", "id": "image.lookup.green", "label": "Green" },
+          { "type": "item", "id": "image.lookup.blue", "label": "Blue" },
+          { "type": "item", "id": "image.lookup.cyan", "label": "Cyan" },
+          { "type": "item", "id": "image.lookup.magenta", "label": "Magenta" },
+          { "type": "item", "id": "image.lookup.yellow", "label": "Yellow" },
+          { "type": "item", "id": "image.lookup.red_green", "label": "Red/Green" }
         ]
       }
     ]
@@ -244,7 +307,9 @@
           { "type": "item", "id": "process.binary.distance_map", "label": "Distance Map" },
           { "type": "item", "id": "process.binary.ultimate_points", "label": "Ultimate Points" },
           { "type": "item", "id": "process.binary.watershed", "label": "Watershed" },
-          { "type": "item", "id": "process.binary.voronoi", "label": "Voronoi" }
+          { "type": "item", "id": "process.binary.voronoi", "label": "Voronoi" },
+          { "type": "separator" },
+          { "type": "item", "id": "process.binary.options", "label": "Options..." }
         ]
       },
       {
@@ -283,7 +348,9 @@
           { "type": "item", "id": "process.fft.swap_quadrants", "label": "Swap Quadrants" },
           { "type": "item", "id": "process.fft.make_circular_selection", "label": "Make Circular Selection..." }
         ]
-      }
+      },
+      { "type": "separator" },
+      { "type": "item", "id": "process.repeat_command", "label": "Repeat Command", "shortcut": "R" }
     ]
   },
   {
@@ -292,14 +359,18 @@
     "items": [
       { "type": "item", "id": "analyze.measure", "label": "Measure", "shortcut": "M" },
       { "type": "item", "id": "analyze.set_scale", "label": "Set Scale..." },
+      { "type": "item", "id": "analyze.calibrate", "label": "Calibrate..." },
       { "type": "item", "id": "analyze.set_measurements", "label": "Set Measurements..." },
       { "type": "item", "id": "analyze.analyze_particles", "label": "Analyze Particles..." },
       { "type": "item", "id": "analyze.summarize", "label": "Summarize" },
       { "type": "item", "id": "analyze.distribution", "label": "Distribution..." },
+      { "type": "item", "id": "analyze.label", "label": "Label" },
       { "type": "item", "id": "analyze.clear_results", "label": "Clear Results" },
       { "type": "item", "id": "analyze.histogram", "label": "Histogram" },
       { "type": "item", "id": "analyze.plot_profile", "label": "Plot Profile" },
+      { "type": "item", "id": "analyze.surface_plot", "label": "Surface Plot..." },
       { "type": "separator" },
+      { "type": "item", "id": "analyze.tools.save_xy_coordinates", "label": "Save XY Coordinates..." },
       { "type": "item", "id": "analyze.tools.roi_manager", "label": "ROI Manager..." },
       { "type": "item", "id": "analyze.tools.results", "label": "Results" }
     ]
@@ -326,6 +397,10 @@
     "id": "window",
     "label": "Window",
     "items": [
+      { "type": "item", "id": "window.show_all", "label": "Show All", "shortcut": "]" },
+      { "type": "item", "id": "window.main", "label": "Main Window" },
+      { "type": "item", "id": "window.put_behind", "label": "Put Behind", "shortcut": "Tab" },
+      { "type": "separator" },
       { "type": "item", "id": "window.next", "label": "Next Window", "shortcut": "Tab" },
       { "type": "item", "id": "window.previous", "label": "Previous Window", "shortcut": "Shift+Tab" },
       { "type": "separator" },

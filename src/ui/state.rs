@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 pub struct DesktopState {
     pub recent_files: Vec<PathBuf>,
     pub measurement_settings: MeasurementSettings,
+    #[serde(default)]
+    pub binary_options: BinaryOptions,
+    #[serde(default)]
+    pub overlay_settings: OverlaySettings,
     pub utility_windows: UtilityWindowsState,
 }
 
@@ -16,6 +20,8 @@ impl Default for DesktopState {
         Self {
             recent_files: Vec::new(),
             measurement_settings: MeasurementSettings::default(),
+            binary_options: BinaryOptions::default(),
+            overlay_settings: OverlaySettings::default(),
             utility_windows: UtilityWindowsState::default(),
         }
     }
@@ -52,11 +58,52 @@ impl Default for MeasurementSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BinaryOptions {
+    pub iterations: usize,
+    pub count: usize,
+}
+
+impl Default for BinaryOptions {
+    fn default() -> Self {
+        Self {
+            iterations: 1,
+            count: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlaySettings {
+    pub show_labels: bool,
+    pub use_names_as_labels: bool,
+    pub draw_backgrounds: bool,
+    pub label_color: String,
+    pub font_size: f32,
+    pub bold: bool,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            show_labels: false,
+            use_names_as_labels: false,
+            draw_backgrounds: false,
+            label_color: "White".to_string(),
+            font_size: 12.0,
+            bold: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UtilityWindowsState {
     pub results_open: bool,
     pub roi_manager_open: bool,
     pub measurements_open: bool,
+    pub binary_options_open: bool,
+    pub overlay_labels_open: bool,
+    pub overlay_options_open: bool,
     pub command_finder_open: bool,
     pub profile_plot_open: bool,
     pub help_about_open: bool,

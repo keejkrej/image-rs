@@ -5,22 +5,25 @@ use crate::model::DatasetF32;
 use serde_json::Value;
 
 use super::{
-    ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCanvasResizeOp, ImageConvertOp,
-    ImageConvolveOp, ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp,
-    ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp, ImageMedianFilterOp, ImageRankFilter3dOp,
-    ImageRankFilterOp, ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op,
-    ImageRotateOp, ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp,
-    ImageStackAddSliceOp, ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp,
-    ImageStackMontageOp, ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp,
-    ImageStackStatisticsOp, ImageStackSubstackOp, ImageStackZProfileOp, ImageStackZProjectOp,
-    ImageSubtractBackgroundOp, ImageSwapQuadrantsOp, ImageTranslateOp, ImageUnsharpMaskOp,
-    IntensityEnhanceContrastOp, IntensityInvertOp, IntensityMathOp, IntensityNaNBackgroundOp,
-    IntensityNormalizeOp, IntensityWindowOp, MeasurementsHistogramOp, MeasurementsProfileOp,
-    MeasurementsSummaryOp, MorphologyBinaryMedianOp, MorphologyCloseOp, MorphologyDilateOp,
-    MorphologyDistanceMapOp, MorphologyErodeOp, MorphologyFillHolesOp, MorphologyOpenOp,
-    MorphologyOutlineOp, MorphologySkeletonizeOp, MorphologyUltimatePointsOp, MorphologyVoronoiOp,
-    MorphologyWatershedOp, NoiseGaussianOp, NoiseSaltAndPepperOp, OpOutput, OpSchema, Operation,
-    OpsError, Result, ThresholdFixedOp, ThresholdMakeBinaryOp, ThresholdOtsuOp,
+    ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCalibrateOp, ImageCanvasResizeOp,
+    ImageConvertOp, ImageConvolveOp, ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp,
+    ImageFftPowerSpectrumOp, ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp,
+    ImageHyperstackReduceDimensionalityOp, ImageHyperstackSubsetOp, ImageHyperstackToStackOp,
+    ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp, ImageRemoveNaNsOp,
+    ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp, ImageScaleOp,
+    ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp, ImageStackAddSliceOp,
+    ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp, ImageStackMontageOp,
+    ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp, ImageStackStatisticsOp,
+    ImageStackSubstackOp, ImageStackToHyperstackOp, ImageStackZProfileOp, ImageStackZProjectOp,
+    ImageSubtractBackgroundOp, ImageSurfacePlotOp, ImageSwapQuadrantsOp, ImageTranslateOp,
+    ImageUnsharpMaskOp, IntensityEnhanceContrastOp, IntensityInvertOp, IntensityMathOp,
+    IntensityNaNBackgroundOp, IntensityNormalizeOp, IntensityWindowOp, MeasurementsHistogramOp,
+    MeasurementsProfileOp, MeasurementsSummaryOp, MorphologyBinaryMedianOp, MorphologyCloseOp,
+    MorphologyDilateOp, MorphologyDistanceMapOp, MorphologyErodeOp, MorphologyFillHolesOp,
+    MorphologyOpenOp, MorphologyOutlineOp, MorphologySkeletonizeOp, MorphologyUltimatePointsOp,
+    MorphologyVoronoiOp, MorphologyWatershedOp, NoiseGaussianOp, NoiseSaltAndPepperOp, OpOutput,
+    OpSchema, Operation, OpsError, Result, ThresholdFixedOp, ThresholdMakeBinaryOp,
+    ThresholdOtsuOp,
 };
 #[cfg(feature = "morpholib")]
 use super::{
@@ -57,6 +60,7 @@ fn registry() -> &'static Registry {
         register(&mut map, ImageCropOp);
         register(&mut map, ImageCoordinatesOp);
         register(&mut map, ImageSetScaleOp);
+        register(&mut map, ImageCalibrateOp);
         register(&mut map, ImageStackAddSliceOp);
         register(&mut map, ImageStackDeleteSliceOp);
         register(&mut map, ImageStackZProjectOp);
@@ -66,6 +70,10 @@ fn registry() -> &'static Registry {
         register(&mut map, ImageStackReduceOp);
         register(&mut map, ImageStackResliceOp);
         register(&mut map, ImageStackSubstackOp);
+        register(&mut map, ImageStackToHyperstackOp);
+        register(&mut map, ImageHyperstackToStackOp);
+        register(&mut map, ImageHyperstackReduceDimensionalityOp);
+        register(&mut map, ImageHyperstackSubsetOp);
         register(&mut map, ImageStackZProfileOp);
         register(&mut map, ImageStackStatisticsOp);
         register(&mut map, ImageBinOp);
@@ -89,6 +97,7 @@ fn registry() -> &'static Registry {
         register(&mut map, ImageSwapQuadrantsOp);
         register(&mut map, ImageFftPowerSpectrumOp);
         register(&mut map, ImageFftBandpassOp);
+        register(&mut map, ImageSurfacePlotOp);
         register(&mut map, ThresholdFixedOp);
         register(&mut map, ThresholdMakeBinaryOp);
         register(&mut map, ThresholdOtsuOp);

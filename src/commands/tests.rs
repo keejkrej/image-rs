@@ -37,6 +37,7 @@ fn contains_required_operations() {
     assert!(names.contains(&"image.crop".to_string()));
     assert!(names.contains(&"image.coordinates".to_string()));
     assert!(names.contains(&"image.set_scale".to_string()));
+    assert!(names.contains(&"image.calibrate".to_string()));
     assert!(names.contains(&"image.bin".to_string()));
     assert!(names.contains(&"image.flip".to_string()));
     assert!(names.contains(&"image.median_filter".to_string()));
@@ -52,6 +53,9 @@ fn contains_required_operations() {
     assert!(names.contains(&"image.stack.reslice".to_string()));
     assert!(names.contains(&"image.stack.statistics".to_string()));
     assert!(names.contains(&"image.stack.substack".to_string()));
+    assert!(names.contains(&"image.stack.to_hyperstack".to_string()));
+    assert!(names.contains(&"image.hyperstack.to_stack".to_string()));
+    assert!(names.contains(&"image.hyperstack.reduce_dimensionality".to_string()));
     assert!(names.contains(&"image.stack.z_profile".to_string()));
     assert!(names.contains(&"image.stack.z_project".to_string()));
     assert!(names.contains(&"image.rotate_90".to_string()));
@@ -63,6 +67,7 @@ fn contains_required_operations() {
     assert!(names.contains(&"image.swap_quadrants".to_string()));
     assert!(names.contains(&"image.fft_power_spectrum".to_string()));
     assert!(names.contains(&"image.fft_bandpass".to_string()));
+    assert!(names.contains(&"image.surface_plot".to_string()));
     assert!(names.contains(&"image.convolve".to_string()));
     assert!(names.contains(&"image.unsharp_mask".to_string()));
     assert!(names.contains(&"image.find_edges".to_string()));
@@ -79,6 +84,10 @@ fn contains_required_operations() {
     assert!(names.contains(&"noise.salt_and_pepper".to_string()));
     assert!(names.contains(&"measurements.summary".to_string()));
     assert!(names.contains(&"morphology.binary_median".to_string()));
+    assert!(names.contains(&"morphology.erode".to_string()));
+    assert!(names.contains(&"morphology.dilate".to_string()));
+    assert!(names.contains(&"morphology.open".to_string()));
+    assert!(names.contains(&"morphology.close".to_string()));
     assert!(names.contains(&"morphology.distance_map".to_string()));
     assert!(names.contains(&"morphology.ultimate_points".to_string()));
     assert!(names.contains(&"morphology.watershed".to_string()));
@@ -641,6 +650,99 @@ fn image_set_scale_resets_pixel_units_and_updates_default_z_spacing() {
 }
 
 #[test]
+fn image_calibrate_updates_value_unit_metadata() {
+    let dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+
+    let output = execute_operation(
+        "image.calibrate",
+        &dataset,
+        &json!({
+            "function": "None",
+            "unit": "OD",
+            "global": true
+        }),
+    )
+    .expect("calibrate");
+
+    assert_eq!(output.dataset.shape(), dataset.shape());
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        dataset.data.iter().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("value_unit"),
+        Some(&json!("OD"))
+    );
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("density_calibration_function"),
+        Some(&json!("none"))
+    );
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("global_density_calibration"),
+        Some(&json!(true))
+    );
+}
+
+#[test]
+fn image_calibrate_rejects_unsupported_curve_functions() {
+    let dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+
+    let error = execute_operation(
+        "image.calibrate",
+        &dataset,
+        &json!({"function": "Straight Line"}),
+    )
+    .expect_err("unsupported curve function");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported calibration function")
+    );
+}
+
+#[test]
+fn image_surface_plot_renders_grayscale_height_map() {
+    let dataset = test_dataset(vec![0.0, 1.0, 0.5, 0.25], (2, 2));
+
+    let output = execute_operation(
+        "image.surface_plot",
+        &dataset,
+        &json!({"plot_width": 8, "polygon_multiplier": 100}),
+    )
+    .expect("surface plot");
+
+    assert_eq!(output.dataset.ndim(), 2);
+    assert!(output.dataset.shape()[0] > 2);
+    assert!(output.dataset.shape()[1] >= 8);
+    assert!(output.dataset.data.iter().any(|value| *value < 1.0));
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("surface_plot_source_shape"),
+        Some(&json!([2, 2]))
+    );
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("surface_plot_polygon_multiplier"),
+        Some(&json!(100))
+    );
+}
+
+#[test]
 fn image_convert_rgb_adds_channel_axis() {
     let dataset = test_dataset(vec![0.0, 1.0, 0.5, 0.25], (2, 2));
     let output =
@@ -876,6 +978,347 @@ fn image_stack_delete_slice_removes_z_plane_and_validates_bounds() {
     )
     .expect_err("invalid delete index");
     assert!(error.to_string().contains("index"));
+}
+
+#[test]
+fn image_stack_to_hyperstack_maps_linear_stack_to_czt_axes() {
+    let data = Array::from_shape_vec(
+        (1, 1, 6),
+        vec![
+            1.0, // c0 z0 t0
+            2.0, // c1 z0 t0
+            3.0, // c0 z1 t0
+            4.0, // c1 z1 t0
+            5.0, // c0 z2 t0
+            6.0, // c1 z2 t0
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 6),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.to_hyperstack",
+        &dataset,
+        &json!({
+            "channels": 2,
+            "slices": 3,
+            "frames": 1,
+            "order": "czt"
+        }),
+    )
+    .expect("stack to hyperstack");
+
+    assert_eq!(output.dataset.shape(), &[1, 1, 3, 2]);
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>(),
+        vec![AxisKind::Y, AxisKind::X, AxisKind::Z, AxisKind::Channel]
+    );
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 0, 0])], 1.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 0, 1])], 2.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 2, 0])], 5.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 2, 1])], 6.0);
+    assert_eq!(
+        output.dataset.metadata.extras.get("hyperstack_dimensions"),
+        Some(&json!({"channels": 2, "slices": 3, "frames": 1}))
+    );
+}
+
+#[test]
+fn image_stack_to_hyperstack_honors_non_default_source_order() {
+    let data = Array::from_shape_vec(
+        (1, 1, 6),
+        vec![
+            1.0, // z0 t0 c0
+            2.0, // z1 t0 c0
+            3.0, // z2 t0 c0
+            4.0, // z0 t0 c1
+            5.0, // z1 t0 c1
+            6.0, // z2 t0 c1
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 6),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.to_hyperstack",
+        &dataset,
+        &json!({
+            "channels": 2,
+            "slices": 3,
+            "frames": 1,
+            "order": "ztc"
+        }),
+    )
+    .expect("stack to hyperstack");
+
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 0, 0])], 1.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 1, 0])], 2.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 2, 0])], 3.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 0, 1])], 4.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 1, 1])], 5.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0, 2, 1])], 6.0);
+}
+
+#[test]
+fn image_hyperstack_to_stack_flattens_czt_order() {
+    let data = Array::from_shape_vec(
+        (1, 1, 2, 2, 2),
+        vec![
+            1.0, 5.0, // z0 c0 t0,t1
+            2.0, 6.0, // z0 c1 t0,t1
+            3.0, 7.0, // z1 c0 t0,t1
+            4.0, 8.0, // z1 c1 t0,t1
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 2),
+            Dim::new(AxisKind::Channel, 2),
+            Dim::new(AxisKind::Time, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation("image.hyperstack.to_stack", &dataset, &json!({}))
+        .expect("hyperstack to stack");
+
+    assert_eq!(output.dataset.shape(), &[1, 1, 8]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    );
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>(),
+        vec![AxisKind::Y, AxisKind::X, AxisKind::Z]
+    );
+}
+
+#[test]
+fn image_stack_to_hyperstack_validates_dimensions() {
+    let data = Array::from_shape_vec((1, 1, 5), vec![1.0, 2.0, 3.0, 4.0, 5.0])
+        .expect("shape")
+        .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 5),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let error = execute_operation(
+        "image.stack.to_hyperstack",
+        &dataset,
+        &json!({"channels": 2, "slices": 3, "frames": 1}),
+    )
+    .expect_err("invalid hyperstack dimensions");
+
+    assert!(error.to_string().contains("stack size"));
+}
+
+#[test]
+fn image_hyperstack_reduce_dimensionality_keeps_selected_axes() {
+    let data = Array::from_shape_vec(
+        (1, 1, 2, 2, 2),
+        vec![
+            1.0, 5.0, // z0 c0 t0,t1
+            2.0, 6.0, // z0 c1 t0,t1
+            3.0, 7.0, // z1 c0 t0,t1
+            4.0, 8.0, // z1 c1 t0,t1
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 2),
+            Dim::new(AxisKind::Channel, 2),
+            Dim::new(AxisKind::Time, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.hyperstack.reduce_dimensionality",
+        &dataset,
+        &json!({
+            "keep_channels": true,
+            "keep_slices": false,
+            "keep_frames": true,
+            "z": 1,
+            "channel": 0,
+            "time": 0
+        }),
+    )
+    .expect("reduce dimensionality");
+
+    assert_eq!(output.dataset.shape(), &[1, 1, 2, 2]);
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>(),
+        vec![AxisKind::Y, AxisKind::X, AxisKind::Channel, AxisKind::Time]
+    );
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![3.0, 7.0, 4.0, 8.0]
+    );
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("reduced_hyperstack_source_position"),
+        Some(&json!({"channel": 0, "z": 1, "time": 0}))
+    );
+}
+
+#[test]
+fn image_hyperstack_reduce_dimensionality_can_create_single_plane() {
+    let data = Array::from_shape_vec(
+        (1, 2, 2, 2),
+        vec![
+            1.0, 5.0, // x0 z0 c0,c1
+            2.0, 6.0, // x0 z1 c0,c1
+            3.0, 7.0, // x1 z0 c0,c1
+            4.0, 8.0, // x1 z1 c0,c1
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 2),
+            Dim::new(AxisKind::Channel, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.hyperstack.reduce_dimensionality",
+        &dataset,
+        &json!({
+            "keep_channels": false,
+            "keep_slices": false,
+            "keep_frames": false,
+            "channel": 1,
+            "z": 0
+        }),
+    )
+    .expect("reduce to plane");
+
+    assert_eq!(output.dataset.shape(), &[1, 2]);
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>(),
+        vec![AxisKind::Y, AxisKind::X]
+    );
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![5.0, 7.0]
+    );
+}
+
+#[test]
+fn image_hyperstack_reduce_dimensionality_validates_inputs() {
+    let stack_data = Array::from_shape_vec((1, 1, 2), vec![1.0, 2.0])
+        .expect("shape")
+        .into_dyn();
+    let stack_metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let stack = Dataset::new(stack_data, stack_metadata).expect("stack");
+
+    let not_hyperstack =
+        execute_operation("image.hyperstack.reduce_dimensionality", &stack, &json!({}))
+            .expect_err("not a hyperstack");
+    assert!(not_hyperstack.to_string().contains("hyperstack"));
+
+    let hyper_data = Array::from_shape_vec((1, 1, 2), vec![1.0, 2.0])
+        .expect("shape")
+        .into_dyn();
+    let hyper_metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Channel, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let hyperstack = Dataset::new(hyper_data, hyper_metadata).expect("hyperstack");
+
+    let out_of_bounds = execute_operation(
+        "image.hyperstack.reduce_dimensionality",
+        &hyperstack,
+        &json!({"keep_channels": false, "channel": 2}),
+    )
+    .expect_err("channel out of bounds");
+    assert!(out_of_bounds.to_string().contains("channel"));
 }
 
 #[test]
@@ -3147,6 +3590,134 @@ fn connected_components_reports_regions() {
         .and_then(|value| value.as_u64())
         .expect("count");
     assert_eq!(count, 2);
+}
+
+#[test]
+fn morphology_erode_honors_iterations() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 1.0, 1.0, 0.0, //
+            0.0, 1.0, 1.0, 1.0, 0.0, //
+            0.0, 1.0, 1.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, 0.0,
+        ],
+        (5, 5),
+    );
+
+    let once = execute_operation(
+        "morphology.erode",
+        &dataset,
+        &json!({
+            "iterations": 1
+        }),
+    )
+    .expect("erode once");
+    assert_eq!(once.dataset.data[IxDyn(&[2, 2])], 1.0);
+
+    let twice = execute_operation(
+        "morphology.erode",
+        &dataset,
+        &json!({
+            "iterations": 2
+        }),
+    )
+    .expect("erode twice");
+    assert_eq!(twice.dataset.data[IxDyn(&[2, 2])], 0.0);
+}
+
+#[test]
+fn morphology_erode_rejects_zero_iterations() {
+    let dataset = test_dataset(vec![1.0; 9], (3, 3));
+    let error = execute_operation(
+        "morphology.erode",
+        &dataset,
+        &json!({
+            "iterations": 0
+        }),
+    )
+    .expect_err("zero iterations should fail");
+
+    assert!(error.to_string().contains("iterations"));
+}
+
+#[test]
+fn morphology_erode_honors_neighbor_count() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 1.0, 1.0, //
+            1.0, 1.0, 1.0, //
+            1.0, 1.0, 1.0,
+        ],
+        (3, 3),
+    );
+
+    let count_one = execute_operation(
+        "morphology.erode",
+        &dataset,
+        &json!({
+            "count": 1
+        }),
+    )
+    .expect("erode count one");
+    assert_eq!(count_one.dataset.data[IxDyn(&[1, 1])], 0.0);
+
+    let count_two = execute_operation(
+        "morphology.erode",
+        &dataset,
+        &json!({
+            "count": 2
+        }),
+    )
+    .expect("erode count two");
+    assert_eq!(count_two.dataset.data[IxDyn(&[1, 1])], 1.0);
+}
+
+#[test]
+fn morphology_dilate_honors_neighbor_count() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0,
+        ],
+        (3, 3),
+    );
+
+    let count_one = execute_operation(
+        "morphology.dilate",
+        &dataset,
+        &json!({
+            "count": 1
+        }),
+    )
+    .expect("dilate count one");
+    assert_eq!(count_one.dataset.data[IxDyn(&[1, 1])], 1.0);
+
+    let count_two = execute_operation(
+        "morphology.dilate",
+        &dataset,
+        &json!({
+            "count": 2
+        }),
+    )
+    .expect("dilate count two");
+    assert_eq!(count_two.dataset.data[IxDyn(&[1, 1])], 0.0);
+}
+
+#[test]
+fn morphology_erode_rejects_zero_count() {
+    let dataset = test_dataset(vec![1.0; 9], (3, 3));
+    let error = execute_operation(
+        "morphology.erode",
+        &dataset,
+        &json!({
+            "count": 0
+        }),
+    )
+    .expect_err("zero count should fail");
+
+    assert!(error.to_string().contains("count"));
 }
 
 #[test]

@@ -178,7 +178,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             false,
             Some(
-                json!({"width": 512, "height": 512, "slices": 1, "channels": 1, "fill": 0.0, "pixelType": "f32"}),
+                json!({"width": 512, "height": 512, "slices": 1, "channels": 1, "frames": 1, "fill": 0.0, "pixelType": "f32"}),
             ),
             Some("Create a new blank image via a native utility dialog."),
         ),
@@ -254,18 +254,26 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Open recently used files from persisted desktop state."),
         ),
-        "window.next" => CommandMetadata::with(
+        "window.next" | "window.put_behind" => CommandMetadata::with(
             CommandScope::Both,
             true,
-            false,
+            true,
             false,
             None,
             Some("Cycles active image windows."),
         ),
+        "window.main" | "window.show_all" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("ImageJ-style window management command handled by the native shell."),
+        ),
         "window.previous" => CommandMetadata::with(
             CommandScope::Both,
             true,
-            false,
+            true,
             false,
             None,
             Some("Cycles active image windows in reverse order."),
@@ -332,6 +340,46 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             Some(json!({"zoom_percent": null, "x": null, "y": null})),
             Some("Set ImageJ-style exact canvas zoom and optional image center."),
+        ),
+        "image.lookup.apply_lut"
+        | "image.lookup.invert_lut"
+        | "image.lookup.fire"
+        | "image.lookup.grays"
+        | "image.lookup.ice"
+        | "image.lookup.spectrum"
+        | "image.lookup.rgb332"
+        | "image.lookup.red"
+        | "image.lookup.green"
+        | "image.lookup.blue"
+        | "image.lookup.cyan"
+        | "image.lookup.magenta"
+        | "image.lookup.yellow"
+        | "image.lookup.red_green" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Apply an ImageJ-style display lookup table to the active viewer."),
+        ),
+        "image.overlay.add_selection"
+        | "image.overlay.flatten"
+        | "image.overlay.from_roi_manager"
+        | "image.overlay.hide"
+        | "image.overlay.labels"
+        | "image.overlay.show"
+        | "image.overlay.remove"
+        | "image.overlay.options"
+        | "image.overlay.to_roi_manager"
+        | "image.overlay.toggle"
+        | "image.overlay.list"
+        | "image.overlay.measure" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Manage ImageJ-style overlay ROI elements for the active image."),
         ),
         "launcher.tool.rect"
         | "launcher.tool.oval"
@@ -543,6 +591,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"slice": null, "channel": null, "frame": null})),
             Some("Set the active ImageJ-style stack or hyperstack position."),
         ),
+        "image.stacks.images_to_stack" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Combine open compatible 2D image windows into an ImageJ-style Z stack."),
+        ),
         "image.stacks.add_slice" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -575,6 +631,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"start": "top"})),
             Some("Create an ImageJ-style orthogonal reslice stack."),
         ),
+        "image.stacks.stack_to_images" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Split the active ImageJ-style Z stack into separate image windows."),
+        ),
         "image.stacks.z_project" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -597,6 +661,32 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                 "max_threshold": null
             })),
             Some("Plot the ImageJ-style mean gray-value profile along Z."),
+        ),
+        "image.stacks.plot_xy_profile" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({
+                "left": null,
+                "top": null,
+                "width": null,
+                "height": null,
+                "x0": null,
+                "y0": null,
+                "x1": null,
+                "y1": null,
+                "vertical": false
+            })),
+            Some("Plot ImageJ-style XY profiles for every Z slice into the Results table."),
+        ),
+        "image.stacks.measure_stack" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Measure every Z slice in the active ImageJ-style stack into the Results table."),
         ),
         "image.stacks.statistics" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -646,6 +736,30 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"method": "average", "group_size": 2})),
             Some("Project adjacent fixed-size Z groups into a shorter ImageJ-style stack."),
         ),
+        "image.stacks.combine" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"vertical": false, "fill": 0.0})),
+            Some("Combine two open ImageJ-style image stacks horizontally or vertically."),
+        ),
+        "image.stacks.concatenate" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"fill": 0.0})),
+            Some("Concatenate open ImageJ-style image stacks along Z."),
+        ),
+        "image.stacks.insert" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"x": 0, "y": 0, "source": null, "destination": null})),
+            Some("Insert one ImageJ-style image or stack into another at an X/Y offset."),
+        ),
         "image.stacks.reduce" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -661,6 +775,86 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             Some(json!({"axis": "z"})),
             Some("Reverse the active image stack along Z."),
+        ),
+        "image.stacks.set_label" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"label": "", "slice": null})),
+            Some("Set the ImageJ-style label for the active Z slice."),
+        ),
+        "image.stacks.remove_slice_labels" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Remove ImageJ-style labels from all slices in the active stack."),
+        ),
+        "image.hyperstacks.stack_to_hyperstack" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "channels": 1,
+                "slices": null,
+                "frames": 1,
+                "order": "czt"
+            })),
+            Some("Convert the active ImageJ-style stack into a C/Z/T hyperstack."),
+        ),
+        "image.hyperstacks.new" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({
+                "width": 400,
+                "height": 300,
+                "slices": 4,
+                "channels": 3,
+                "frames": 5,
+                "fill": 0.0,
+                "pixelType": "f32"
+            })),
+            Some("Create a new blank ImageJ-style C/Z/T hyperstack."),
+        ),
+        "image.hyperstacks.hyperstack_to_stack" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Flatten the active ImageJ-style hyperstack into a linear Z stack."),
+        ),
+        "image.hyperstacks.reduce_dimensionality" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "keep_channels": true,
+                "keep_slices": true,
+                "keep_frames": true,
+                "channel": null,
+                "z": null,
+                "time": null
+            })),
+            Some("Reduce an ImageJ-style hyperstack by keeping or collapsing C/Z/T axes."),
+        ),
+        "image.hyperstacks.make_subset" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "channels": null,
+                "slices": null,
+                "frames": null
+            })),
+            Some("Create an ImageJ-style hyperstack subset from C/Z/T range strings."),
         ),
         "image.transform.flip_horizontal"
         | "image.transform.flip_vertical"
@@ -742,6 +936,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             None,
             Some("Runs binary threshold or binary morphology on the active image."),
+        ),
+        "process.binary.options" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"iterations": 1, "count": 1})),
+            Some("Open ImageJ-style Process/Binary options for morphology commands."),
         ),
         "process.noise.add" | "process.noise.specified" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -991,6 +1193,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Create the ImageJ rank-filter circular mask demonstration stack."),
         ),
+        "process.repeat_command" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Repeat the last non-frontend command, matching ImageJ Process/Repeat Command."),
+        ),
         "process.sharpen" | "process.find_edges" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -1061,6 +1271,24 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Analyze the active image and surface results in shared utility windows."),
         ),
+        "analyze.tools.save_xy_coordinates" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"background": null, "invert_y": false})),
+            Some(
+                "Write ImageJ-style XY coordinate/value rows for the active image or selection into the results table.",
+            ),
+        ),
+        "analyze.label" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Add an ImageJ-style numeric label overlay to the selected ROI."),
+        ),
         "analyze.plot_profile" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -1087,6 +1315,19 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"bins": 256, "min": null, "max": null, "stack": false})),
             Some("Compute an ImageJ-style histogram for the active image."),
         ),
+        "analyze.surface_plot" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({
+                "plot_width": 350,
+                "polygon_multiplier": 100,
+                "source_background_lighter": false,
+                "black_fill": false
+            })),
+            Some("Create an ImageJ-style grayscale surface plot image from the active plane."),
+        ),
         "analyze.set_scale" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -1100,6 +1341,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                 "global": false
             })),
             Some("Apply ImageJ Analyze/Set Scale calibration metadata."),
+        ),
+        "analyze.calibrate" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"function": "none", "unit": "Gray Value", "global": false})),
+            Some("Apply ImageJ Analyze/Calibrate value-unit metadata."),
         ),
         "analyze.set_measurements" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -1234,7 +1483,19 @@ pub fn merge_params(command_id: &str, params: Option<Value>) -> Value {
         .default_params
         .unwrap_or_else(|| Value::Object(Map::new()));
     match params {
-        Some(Value::Object(map)) if !map.is_empty() => Value::Object(map),
+        Some(Value::Object(map)) if map.is_empty() => default,
+        Some(Value::Object(map)) if !map.is_empty() => {
+            let mut merged = match default {
+                Value::Object(map) => map,
+                other => return other,
+            };
+
+            for (key, value) in map {
+                merged.insert(key, value);
+            }
+
+            Value::Object(merged)
+        }
         Some(Value::Null) | None => default,
         Some(other) => other,
     }
@@ -1242,7 +1503,8 @@ pub fn merge_params(command_id: &str, params: Option<Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandScope, metadata};
+    use super::{CommandScope, merge_params, metadata};
+    use serde_json::json;
 
     #[test]
     fn command_scope_contains_expected_window_labels() {
@@ -1319,16 +1581,30 @@ mod tests {
             "image.stacks.set",
             "image.stacks.add_slice",
             "image.stacks.delete_slice",
+            "image.stacks.images_to_stack",
             "image.stacks.make_substack",
             "image.stacks.reslice",
+            "image.stacks.stack_to_images",
             "image.stacks.make_montage",
             "image.stacks.montage_to_stack",
             "image.stacks.plot_z_profile",
+            "image.stacks.plot_xy_profile",
+            "image.stacks.measure_stack",
             "image.stacks.statistics",
             "image.stacks.z_project",
+            "image.stacks.combine",
+            "image.stacks.concatenate",
             "image.stacks.grouped_z_project",
+            "image.stacks.insert",
             "image.stacks.reduce",
             "image.stacks.reverse",
+            "image.stacks.set_label",
+            "image.stacks.remove_slice_labels",
+            "image.hyperstacks.new",
+            "image.hyperstacks.stack_to_hyperstack",
+            "image.hyperstacks.hyperstack_to_stack",
+            "image.hyperstacks.reduce_dimensionality",
+            "image.hyperstacks.make_subset",
             "image.transform.flip_horizontal",
             "image.transform.flip_z",
             "image.transform.rotate",
@@ -1336,6 +1612,32 @@ mod tests {
             "image.transform.bin",
             "image.transform.image_to_results",
             "image.transform.results_to_image",
+            "image.lookup.apply_lut",
+            "image.lookup.invert_lut",
+            "image.lookup.fire",
+            "image.lookup.grays",
+            "image.lookup.ice",
+            "image.lookup.spectrum",
+            "image.lookup.rgb332",
+            "image.lookup.red",
+            "image.lookup.green",
+            "image.lookup.blue",
+            "image.lookup.cyan",
+            "image.lookup.magenta",
+            "image.lookup.yellow",
+            "image.lookup.red_green",
+            "image.overlay.add_selection",
+            "image.overlay.flatten",
+            "image.overlay.from_roi_manager",
+            "image.overlay.hide",
+            "image.overlay.labels",
+            "image.overlay.show",
+            "image.overlay.remove",
+            "image.overlay.options",
+            "image.overlay.to_roi_manager",
+            "image.overlay.toggle",
+            "image.overlay.list",
+            "image.overlay.measure",
             "process.noise.add",
             "process.noise.specified",
             "process.noise.salt_pepper",
@@ -1353,6 +1655,7 @@ mod tests {
             "process.binary.ultimate_points",
             "process.binary.watershed",
             "process.binary.voronoi",
+            "process.binary.options",
             "process.shadows.north",
             "process.shadows.southwest",
             "process.shadows.demo",
@@ -1369,6 +1672,7 @@ mod tests {
             "process.filters.maximum_3d",
             "process.filters.variance_3d",
             "process.filters.show_circular_masks",
+            "process.repeat_command",
             "process.math.sqrt",
             "process.math.nan_background",
             "process.fft.fft",
@@ -1380,12 +1684,19 @@ mod tests {
             "process.subtract_background",
             "process.sharpen",
             "analyze.set_scale",
+            "analyze.calibrate",
             "analyze.analyze_particles",
             "analyze.summarize",
             "analyze.distribution",
+            "analyze.label",
             "analyze.clear_results",
+            "analyze.surface_plot",
+            "analyze.tools.save_xy_coordinates",
             "analyze.tools.results",
             "plugins.commands.find",
+            "window.show_all",
+            "window.main",
+            "window.put_behind",
             "help.shortcuts",
         ] {
             assert!(
@@ -1415,5 +1726,71 @@ mod tests {
                 "{command} should provide default operation params"
             );
         }
+    }
+
+    #[test]
+    fn merge_params_uses_filter_defaults() {
+        assert_eq!(
+            merge_params("process.filters.median", None),
+            json!({"radius": 2.0})
+        );
+        assert_eq!(
+            merge_params("process.filters.median", Some(json!({ "radius": 4.0 }))),
+            json!({ "radius": 4.0 })
+        );
+        assert_eq!(
+            merge_params("process.filters.median", Some(json!({}))),
+            json!({ "radius": 2.0 })
+        );
+        assert_eq!(
+            merge_params(
+                "process.filters.top_hat",
+                Some(json!({ "dont_subtract": true }))
+            ),
+            json!({
+                "filter": "top_hat",
+                "radius": 2.0,
+                "light_background": false,
+                "dont_subtract": true
+            })
+        );
+        assert_eq!(
+            merge_params("process.filters.convolve", None,),
+            json!({
+                "width": 3,
+                "height": 3,
+                "kernel": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                "normalize": false
+            })
+        );
+        assert_eq!(
+            merge_params("process.filters.convolve", Some(json!({ "width": 5 })),),
+            json!({
+                "width": 5,
+                "height": 3,
+                "kernel": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                "normalize": false
+            })
+        );
+        assert_eq!(
+            merge_params("process.filters.top_hat", None),
+            json!({
+                "filter": "top_hat",
+                "radius": 2.0,
+                "light_background": false,
+                "dont_subtract": false
+            })
+        );
+        assert_eq!(
+            merge_params("process.math.sqrt", Some(json!({ "operation": "log" }))),
+            json!({"operation": "log"})
+        );
+        assert_eq!(
+            merge_params("process.math.sqrt", Some(json!({ "value": 0.125 }))),
+            json!({
+                "operation": "sqrt",
+                "value": 0.125
+            })
+        );
     }
 }
