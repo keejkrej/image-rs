@@ -317,7 +317,6 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
         | "image.zoom.view100"
         | "image.zoom.to_selection"
         | "image.zoom.scale_to_fit"
-        | "image.zoom.set"
         | "image.zoom.maximize" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -325,6 +324,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             None,
             Some("Canvas navigation controls are implemented in the shell."),
+        ),
+        "image.zoom.set" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"zoom_percent": null, "x": null, "y": null})),
+            Some("Set ImageJ-style exact canvas zoom and optional image center."),
         ),
         "launcher.tool.rect"
         | "launcher.tool.oval"
@@ -402,6 +409,26 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                 Some("Processes the active image using gaussian blur/ smooth path."),
             )
         }
+        "process.enhance_contrast" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"saturated_percent": 0.35, "normalize": true})),
+            Some("Run ImageJ Process/Enhance Contrast saturated-tail contrast stretching."),
+        ),
+        "process.subtract_background" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "radius": 50.0,
+                "light_background": true,
+                "create_background": false
+            })),
+            Some("Run ImageJ Process/Subtract Background using a grayscale background estimate."),
+        ),
         "process.filters.gaussian_3d" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -460,16 +487,173 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"x_unit": "pixel", "y_unit": "<same as x unit>"})),
             Some("Update ImageJ-style coordinate calibration metadata."),
         ),
-        "image.stacks.next" | "image.stacks.previous" | "image.stacks.set" => {
-            CommandMetadata::with(
-                CommandScope::Viewer,
-                true,
-                true,
-                true,
-                None,
-                Some("Image stack navigation is implemented in the viewer shell."),
-            )
-        }
+        "image.show_info" | "image.properties" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Return ImageJ-style active image information and metadata."),
+        ),
+        "image.crop" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Crop the active image to the selected ROI bounds."),
+        ),
+        "image.duplicate" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Duplicate the active image into a new viewer."),
+        ),
+        "image.rename" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"title": ""})),
+            Some("Rename the active image viewer title."),
+        ),
+        "image.scale" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"x_scale": 0.5, "y_scale": 0.5})),
+            Some("Scale the active image by X/Y factors."),
+        ),
+        "image.stacks.next" | "image.stacks.previous" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Image stack navigation is implemented in the viewer shell."),
+        ),
+        "image.stacks.set" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"slice": null, "channel": null, "frame": null})),
+            Some("Set the active ImageJ-style stack or hyperstack position."),
+        ),
+        "image.stacks.add_slice" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"index": null, "fill": 0.0})),
+            Some("Add a blank slice to the active image stack."),
+        ),
+        "image.stacks.delete_slice" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"index": null})),
+            Some("Delete the active slice from the image stack."),
+        ),
+        "image.stacks.make_substack" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"slices": null, "indices": null})),
+            Some("Create an ImageJ-style substack from selected Z slices."),
+        ),
+        "image.stacks.reslice" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"start": "top"})),
+            Some("Create an ImageJ-style orthogonal reslice stack."),
+        ),
+        "image.stacks.z_project" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"method": "average", "start": 0, "stop": null})),
+            Some("Project the active Z stack using ImageJ-style Z Project."),
+        ),
+        "image.stacks.plot_z_profile" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "left": null,
+                "top": null,
+                "width": null,
+                "height": null,
+                "min_threshold": null,
+                "max_threshold": null
+            })),
+            Some("Plot the ImageJ-style mean gray-value profile along Z."),
+        ),
+        "image.stacks.statistics" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "left": null,
+                "top": null,
+                "width": null,
+                "height": null,
+                "min_threshold": null,
+                "max_threshold": null
+            })),
+            Some("Compute ImageJ-style statistics for the active Z stack."),
+        ),
+        "image.stacks.make_montage" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "columns": null,
+                "rows": null,
+                "scale": 1.0,
+                "first": 0,
+                "last": null,
+                "increment": 1,
+                "border_width": 0,
+                "fill": 0.0
+            })),
+            Some("Create an ImageJ-style montage from the active Z stack."),
+        ),
+        "image.stacks.montage_to_stack" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"columns": null, "rows": null, "border_width": 0})),
+            Some("Convert an ImageJ-style montage image back to a Z stack."),
+        ),
+        "image.stacks.grouped_z_project" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"method": "average", "group_size": 2})),
+            Some("Project adjacent fixed-size Z groups into a shorter ImageJ-style stack."),
+        ),
+        "image.stacks.reduce" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"factor": 2})),
+            Some("Reduce the active Z stack by keeping every Nth slice."),
+        ),
         "image.stacks.reverse" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -532,9 +716,15 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Convert numeric results table columns to a float image."),
         ),
-        "process.binary.make"
-        | "process.binary.convert_mask"
-        | "process.binary.erode"
+        "process.binary.make" | "process.binary.convert_mask" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"method": "default", "background": "default"})),
+            Some("Convert the active image to an ImageJ-style binary mask."),
+        ),
+        "process.binary.erode"
         | "process.binary.dilate"
         | "process.binary.open"
         | "process.binary.close"
@@ -809,6 +999,19 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Run sharpen or edge-detection filters on the active image."),
         ),
+        "process.find_maxima" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "prominence": 0.0,
+                "strict": true,
+                "exclude_edges": false,
+                "light_background": false
+            })),
+            Some("Find local maxima and return an ImageJ-style maxima mask."),
+        ),
         "process.fft.swap_quadrants" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -848,10 +1051,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some("Create an ImageJ Process/FFT centered circular selection on the active image."),
         ),
         "analyze.measure"
-        | "analyze.histogram"
-        | "analyze.set_measurements"
         | "analyze.analyze_particles"
-        | "analyze.plot_profile"
         | "analyze.tools.roi_manager"
         | "analyze.tools.results" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -860,6 +1060,70 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             None,
             Some("Analyze the active image and surface results in shared utility windows."),
+        ),
+        "analyze.plot_profile" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "left": null,
+                "top": null,
+                "width": null,
+                "height": null,
+                "x0": null,
+                "y0": null,
+                "x1": null,
+                "y1": null,
+                "vertical": false
+            })),
+            Some("Compute an ImageJ-style profile plot from a line or rectangular selection."),
+        ),
+        "analyze.histogram" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"bins": 256, "min": null, "max": null, "stack": false})),
+            Some("Compute an ImageJ-style histogram for the active image."),
+        ),
+        "analyze.set_scale" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "distance_pixels": 0.0,
+                "known_distance": 0.0,
+                "pixel_aspect_ratio": 1.0,
+                "unit": "pixel",
+                "global": false
+            })),
+            Some("Apply ImageJ Analyze/Set Scale calibration metadata."),
+        ),
+        "analyze.set_measurements" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Open ImageJ-style measurement settings."),
+        ),
+        "analyze.summarize" | "analyze.clear_results" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Operate on the shared ImageJ-style results table."),
+        ),
+        "analyze.distribution" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"column": null, "bins": 10})),
+            Some("Compute a distribution from a numeric results-table column."),
         ),
         "plugins.commands.find"
         | "help.about"
@@ -1046,6 +1310,24 @@ mod tests {
             "image.adjust.size",
             "image.adjust.line_width",
             "image.adjust.coordinates",
+            "image.show_info",
+            "image.properties",
+            "image.crop",
+            "image.duplicate",
+            "image.rename",
+            "image.scale",
+            "image.stacks.set",
+            "image.stacks.add_slice",
+            "image.stacks.delete_slice",
+            "image.stacks.make_substack",
+            "image.stacks.reslice",
+            "image.stacks.make_montage",
+            "image.stacks.montage_to_stack",
+            "image.stacks.plot_z_profile",
+            "image.stacks.statistics",
+            "image.stacks.z_project",
+            "image.stacks.grouped_z_project",
+            "image.stacks.reduce",
             "image.stacks.reverse",
             "image.transform.flip_horizontal",
             "image.transform.flip_z",
@@ -1093,8 +1375,15 @@ mod tests {
             "process.fft.bandpass",
             "process.fft.swap_quadrants",
             "process.fft.make_circular_selection",
+            "process.enhance_contrast",
+            "process.find_maxima",
+            "process.subtract_background",
             "process.sharpen",
+            "analyze.set_scale",
             "analyze.analyze_particles",
+            "analyze.summarize",
+            "analyze.distribution",
+            "analyze.clear_results",
             "analyze.tools.results",
             "plugins.commands.find",
             "help.shortcuts",

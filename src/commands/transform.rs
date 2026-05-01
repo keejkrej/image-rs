@@ -15,10 +15,46 @@ pub struct ImageConvertOp;
 pub struct ImageResizeOp;
 
 #[derive(Debug, Clone, Copy)]
+pub struct ImageScaleOp;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImageCanvasResizeOp;
 
 #[derive(Debug, Clone, Copy)]
+pub struct ImageCropOp;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImageCoordinatesOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageSetScaleOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackAddSliceOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackDeleteSliceOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackSubstackOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackResliceOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackReduceOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackZProjectOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackGroupedZProjectOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackMontageOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStackMontageToStackOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageBinOp;
@@ -51,6 +87,9 @@ pub struct ImageSharpenOp;
 pub struct ImageFindEdgesOp;
 
 #[derive(Debug, Clone, Copy)]
+pub struct ImageFindMaximaOp;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImageShadowOp;
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +97,9 @@ pub struct ImageShadowDemoOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageRankFilterOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImageSubtractBackgroundOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageUnsharpMaskOp;
@@ -153,6 +195,59 @@ impl Operation for ImageResizeOp {
     }
 }
 
+impl Operation for ImageScaleOp {
+    fn name(&self) -> &'static str {
+        "image.scale"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Scale X/Y dimensions by ImageJ-style scale factors.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "x_scale".to_string(),
+                    description: "X scale factor.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "y_scale".to_string(),
+                    description: "Y scale factor; defaults to x_scale.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let x_scale = get_optional_f32(params, "x_scale", 1.0);
+        let y_scale = get_optional_f32(params, "y_scale", x_scale);
+        if !x_scale.is_finite() || !y_scale.is_finite() || x_scale <= 0.0 || y_scale <= 0.0 {
+            return Err(OpsError::InvalidParams(
+                "`x_scale` and `y_scale` must be finite and > 0".to_string(),
+            ));
+        }
+        let x_axis = axis_index(dataset, AxisKind::X)?;
+        let y_axis = axis_index(dataset, AxisKind::Y)?;
+        let width = ((dataset.shape()[x_axis] as f32) * x_scale)
+            .round()
+            .max(1.0) as usize;
+        let height = ((dataset.shape()[y_axis] as f32) * y_scale)
+            .round()
+            .max(1.0) as usize;
+        let mut output = resize_xy(dataset, width, height)?;
+        if let Some(spacing) = &mut output.metadata.dims[x_axis].spacing {
+            *spacing /= x_scale;
+        }
+        if let Some(spacing) = &mut output.metadata.dims[y_axis].spacing {
+            *spacing /= y_scale;
+        }
+        Ok(OpOutput::dataset_only(output))
+    }
+}
+
 impl Operation for ImageCanvasResizeOp {
     fn name(&self) -> &'static str {
         "image.canvas_resize"
@@ -196,6 +291,60 @@ impl Operation for ImageCanvasResizeOp {
         let fill = get_optional_f32(params, "fill", 0.0);
         Ok(OpOutput::dataset_only(canvas_resize_xy(
             dataset, width, height, fill,
+        )?))
+    }
+}
+
+impl Operation for ImageCropOp {
+    fn name(&self) -> &'static str {
+        "image.crop"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Crop the X/Y image bounds while preserving other axes.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "x".to_string(),
+                    description: "Left crop coordinate in pixels.".to_string(),
+                    required: true,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "y".to_string(),
+                    description: "Top crop coordinate in pixels.".to_string(),
+                    required: true,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "width".to_string(),
+                    description: "Crop width in pixels.".to_string(),
+                    required: true,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "height".to_string(),
+                    description: "Crop height in pixels.".to_string(),
+                    required: true,
+                    kind: "int".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let x = get_optional_usize(params, "x", 0);
+        let y = get_optional_usize(params, "y", 0);
+        let width = get_optional_usize(params, "width", 0);
+        let height = get_optional_usize(params, "height", 0);
+        if width == 0 || height == 0 {
+            return Err(OpsError::InvalidParams(
+                "`width` and `height` must be > 0".to_string(),
+            ));
+        }
+        Ok(OpOutput::dataset_only(crop_xy(
+            dataset, x, y, width, height,
         )?))
     }
 }
@@ -292,6 +441,379 @@ impl Operation for ImageCoordinatesOp {
             dataset.data.clone(),
             metadata,
         )?))
+    }
+}
+
+impl Operation for ImageSetScaleOp {
+    fn name(&self) -> &'static str {
+        "image.set_scale"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Apply ImageJ Analyze/Set Scale calibration metadata.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "distance_pixels".to_string(),
+                    description: "Measured distance in pixels.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "known_distance".to_string(),
+                    description: "Known calibrated distance.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "pixel_aspect_ratio".to_string(),
+                    description: "Pixel height divided by pixel width.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "unit".to_string(),
+                    description: "Unit of length; pixel or empty removes calibration.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "global".to_string(),
+                    description: "Record whether ImageJ global calibration was requested."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let mut metadata = dataset.metadata.clone();
+        apply_set_scale(&mut metadata, dataset, params)?;
+        Ok(OpOutput::dataset_only(Dataset::new(
+            dataset.data.clone(),
+            metadata,
+        )?))
+    }
+}
+
+impl Operation for ImageStackAddSliceOp {
+    fn name(&self) -> &'static str {
+        "image.stack.add_slice"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Add a blank ImageJ-style Z slice to the active image.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "index".to_string(),
+                    description: "Insertion index along Z; defaults to append.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "fill".to_string(),
+                    description: "Fill value for the inserted slice.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let z_axis = dataset.axis_index(AxisKind::Z);
+        let slices = z_axis.map(|axis| dataset.shape()[axis]).unwrap_or(1);
+        let index = get_optional_usize(params, "index", slices);
+        let fill = get_optional_f32(params, "fill", 0.0);
+        Ok(OpOutput::dataset_only(stack_add_slice(
+            dataset, index, fill,
+        )?))
+    }
+}
+
+impl Operation for ImageStackDeleteSliceOp {
+    fn name(&self) -> &'static str {
+        "image.stack.delete_slice"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Delete a Z slice from the active ImageJ-style stack.".to_string(),
+            params: vec![ParamSpec {
+                name: "index".to_string(),
+                description: "Slice index along Z.".to_string(),
+                required: false,
+                kind: "int".to_string(),
+            }],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let index = get_optional_usize(params, "index", 0);
+        Ok(OpOutput::dataset_only(stack_delete_slice(dataset, index)?))
+    }
+}
+
+impl Operation for ImageStackSubstackOp {
+    fn name(&self) -> &'static str {
+        "image.stack.substack"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Create an ImageJ-style substack from selected Z slices.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "slices".to_string(),
+                    description: "One-based slice range/list, e.g. `2-14`, `1-10-2`, or `7,9,25`."
+                        .to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "indices".to_string(),
+                    description:
+                        "Optional zero-based Z slice indices; used when `slices` is omitted."
+                            .to_string(),
+                    required: false,
+                    kind: "array<int>".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(stack_substack(dataset, params)?))
+    }
+}
+
+impl Operation for ImageStackResliceOp {
+    fn name(&self) -> &'static str {
+        "image.stack.reslice"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Create an ImageJ-style orthogonal reslice stack.".to_string(),
+            params: vec![ParamSpec {
+                name: "start".to_string(),
+                description: "Reslice orientation: top, bottom, left, or right.".to_string(),
+                required: false,
+                kind: "string".to_string(),
+            }],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(stack_reslice(dataset, params)?))
+    }
+}
+
+impl Operation for ImageStackReduceOp {
+    fn name(&self) -> &'static str {
+        "image.stack.reduce"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Reduce an ImageJ-style Z stack by keeping every Nth slice.".to_string(),
+            params: vec![ParamSpec {
+                name: "factor".to_string(),
+                description: "Z slice reduction factor.".to_string(),
+                required: false,
+                kind: "int".to_string(),
+            }],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let factor = get_optional_usize(params, "factor", 2);
+        Ok(OpOutput::dataset_only(stack_reduce(dataset, factor)?))
+    }
+}
+
+impl Operation for ImageStackZProjectOp {
+    fn name(&self) -> &'static str {
+        "image.stack.z_project"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Project an ImageJ-style Z stack into one image.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "method".to_string(),
+                    description: "Projection method: average, max, min, sum, sd, or median."
+                        .to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "start".to_string(),
+                    description: "First zero-based Z slice to include.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "stop".to_string(),
+                    description: "Last zero-based Z slice to include, inclusive.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(stack_z_project(dataset, params)?))
+    }
+}
+
+impl Operation for ImageStackMontageOp {
+    fn name(&self) -> &'static str {
+        "image.stack.montage"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Create an ImageJ-style montage from Z stack slices.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "columns".to_string(),
+                    description: "Number of montage columns; defaults from stack size.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "rows".to_string(),
+                    description: "Number of montage rows; defaults from stack size.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "scale".to_string(),
+                    description: "Scale factor applied to each tile.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "first".to_string(),
+                    description: "First zero-based Z slice to include.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "last".to_string(),
+                    description: "Last zero-based Z slice to include, inclusive.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "increment".to_string(),
+                    description: "Z slice step.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "border_width".to_string(),
+                    description: "Pixel width of borders between tiles.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "fill".to_string(),
+                    description: "Background value for empty grid cells and borders.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(stack_montage(dataset, params)?))
+    }
+}
+
+impl Operation for ImageStackGroupedZProjectOp {
+    fn name(&self) -> &'static str {
+        "image.stack.grouped_z_project"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Project fixed-size groups of ImageJ-style Z slices.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "method".to_string(),
+                    description: "Projection method: average, max, min, sum, sd, or median."
+                        .to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "group_size".to_string(),
+                    description: "Number of adjacent Z slices per output slice.".to_string(),
+                    required: true,
+                    kind: "int".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(stack_grouped_z_project(
+            dataset, params,
+        )?))
+    }
+}
+
+impl Operation for ImageStackMontageToStackOp {
+    fn name(&self) -> &'static str {
+        "image.stack.montage_to_stack"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Convert an ImageJ-style montage image back to a Z stack.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "columns".to_string(),
+                    description: "Number of montage columns.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "rows".to_string(),
+                    description: "Number of montage rows.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "border_width".to_string(),
+                    description: "Pixel width of borders between tiles.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(montage_to_stack(dataset, params)?))
     }
 }
 
@@ -714,6 +1236,76 @@ impl Operation for ImageFindEdgesOp {
     }
 }
 
+impl Operation for ImageFindMaximaOp {
+    fn name(&self) -> &'static str {
+        "image.find_maxima"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Find ImageJ-style local maxima on X/Y planes and return a mask."
+                .to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "prominence".to_string(),
+                    description: "Minimum difference from neighboring pixels.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "strict".to_string(),
+                    description: "Require maxima to be strictly greater than all neighbors."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "exclude_edges".to_string(),
+                    description: "Ignore maxima touching the image edge.".to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "light_background".to_string(),
+                    description: "Find local minima, matching ImageJ's light-background mode."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let prominence = get_optional_f32(params, "prominence", 0.0);
+        if !prominence.is_finite() || prominence < 0.0 {
+            return Err(OpsError::InvalidParams(
+                "`prominence` must be a finite non-negative value".to_string(),
+            ));
+        }
+        let strict = params
+            .get("strict")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let exclude_edges = params
+            .get("exclude_edges")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let light_background = params
+            .get("light_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(OpOutput::dataset_only(find_maxima_mask_xy(
+            dataset,
+            prominence,
+            strict,
+            exclude_edges,
+            light_background,
+        )?))
+    }
+}
+
 impl Operation for ImageShadowOp {
     fn name(&self) -> &'static str {
         "image.shadow"
@@ -840,6 +1432,64 @@ impl Operation for ImageRankFilterOp {
             radius,
             light_background,
             dont_subtract,
+        )?))
+    }
+}
+
+impl Operation for ImageSubtractBackgroundOp {
+    fn name(&self) -> &'static str {
+        "image.subtract_background"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Estimate and subtract ImageJ-style rolling-ball background.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "radius".to_string(),
+                    description: "Background radius in pixels; ImageJ default is 50.".to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "light_background".to_string(),
+                    description: "Use a closing background estimate for light backgrounds."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "create_background".to_string(),
+                    description: "Return the estimated background instead of subtracting it."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let radius = get_optional_f32(params, "radius", 50.0);
+        if !radius.is_finite() || radius < 0.0 {
+            return Err(OpsError::InvalidParams(
+                "`radius` must be a finite non-negative value".to_string(),
+            ));
+        }
+        let light_background = params
+            .get("light_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let create_background = params
+            .get("create_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(OpOutput::dataset_only(top_hat_xy(
+            dataset,
+            radius,
+            light_background,
+            create_background,
         )?))
     }
 }
@@ -1301,6 +1951,822 @@ fn canvas_resize_xy(
     Ok(Dataset::new(data, metadata)?)
 }
 
+fn crop_xy(
+    dataset: &DatasetF32,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let input_shape = dataset.shape().to_vec();
+    let Some(x_end) = x.checked_add(width) else {
+        return Err(OpsError::InvalidParams(
+            "crop bounds must fit within the X/Y image dimensions".to_string(),
+        ));
+    };
+    let Some(y_end) = y.checked_add(height) else {
+        return Err(OpsError::InvalidParams(
+            "crop bounds must fit within the X/Y image dimensions".to_string(),
+        ));
+    };
+    if x >= input_shape[x_axis]
+        || y >= input_shape[y_axis]
+        || x_end > input_shape[x_axis]
+        || y_end > input_shape[y_axis]
+    {
+        return Err(OpsError::InvalidParams(
+            "crop bounds must fit within the X/Y image dimensions".to_string(),
+        ));
+    }
+
+    let mut output_shape = input_shape.clone();
+    output_shape[x_axis] = width;
+    output_shape[y_axis] = height;
+    let output_len: usize = output_shape.iter().product();
+    let mut output = Vec::with_capacity(output_len);
+    iterate_indices(&output_shape, |coord| {
+        let mut src = coord.to_vec();
+        src[x_axis] += x;
+        src[y_axis] += y;
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build cropped dataset".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[x_axis].size = width;
+    metadata.dims[y_axis].size = height;
+    shift_origin(&mut metadata, x_axis, "x", x);
+    shift_origin(&mut metadata, y_axis, "y", y);
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn stack_add_slice(dataset: &DatasetF32, index: usize, fill: f32) -> Result<DatasetF32> {
+    let existing_z_axis = dataset.axis_index(AxisKind::Z);
+    let mut output_shape = dataset.shape().to_vec();
+    let z_axis = match existing_z_axis {
+        Some(axis) => {
+            let slices = output_shape[axis];
+            if index > slices {
+                return Err(OpsError::InvalidParams(
+                    "`index` must be within the Z stack bounds".to_string(),
+                ));
+            }
+            output_shape[axis] = slices + 1;
+            axis
+        }
+        None => {
+            if index > 1 {
+                return Err(OpsError::InvalidParams(
+                    "`index` must be 0 or 1 for a single-slice image".to_string(),
+                ));
+            }
+            output_shape.push(2);
+            output_shape.len() - 1
+        }
+    };
+
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let z = coord[z_axis];
+        if z == index {
+            output.push(fill);
+            return;
+        }
+        let mut src = coord.to_vec();
+        if existing_z_axis.is_some() {
+            src[z_axis] = if z < index { z } else { z - 1 };
+        } else {
+            src.pop();
+        }
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build stack dataset".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    if let Some(axis) = existing_z_axis {
+        metadata.dims[axis].size += 1;
+    } else {
+        metadata.dims.push(Dim::new(AxisKind::Z, 2));
+    }
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn stack_delete_slice(dataset: &DatasetF32, index: usize) -> Result<DatasetF32> {
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let slices = dataset.shape()[z_axis];
+    if slices <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Delete Slice requires a stack with more than one Z slice".to_string(),
+        ));
+    }
+    if index >= slices {
+        return Err(OpsError::InvalidParams(
+            "`index` must be within the Z stack bounds".to_string(),
+        ));
+    }
+
+    let mut output_shape = dataset.shape().to_vec();
+    output_shape[z_axis] = slices - 1;
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut src = coord.to_vec();
+        src[z_axis] = if coord[z_axis] < index {
+            coord[z_axis]
+        } else {
+            coord[z_axis] + 1
+        };
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build stack dataset".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[z_axis].size -= 1;
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn stack_substack(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let input_shape = dataset.shape().to_vec();
+    let slices = input_shape[z_axis];
+    if slices <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Make Substack requires a stack with more than one Z slice".to_string(),
+        ));
+    }
+
+    let selected = parse_substack_selection(params, slices)?;
+    if selected.is_empty() {
+        return Err(OpsError::InvalidParams(
+            "substack selection must include at least one slice".to_string(),
+        ));
+    }
+
+    let mut output_shape = input_shape.clone();
+    output_shape[z_axis] = selected.len();
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut src = coord.to_vec();
+        src[z_axis] = selected[coord[z_axis]];
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build substack".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[z_axis].size = selected.len();
+    metadata.extras.insert(
+        "substack_slices".to_string(),
+        json!(selected.iter().map(|slice| slice + 1).collect::<Vec<_>>()),
+    );
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn parse_substack_selection(params: &Value, slices: usize) -> Result<Vec<usize>> {
+    if let Some(selection) = params
+        .get("slices")
+        .or_else(|| params.get("range"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|selection| !selection.is_empty())
+    {
+        return parse_one_based_slice_selection(selection, slices);
+    }
+
+    if let Some(indices) = params.get("indices").and_then(Value::as_array) {
+        let mut selected = Vec::with_capacity(indices.len());
+        for value in indices {
+            let Some(index) = value.as_u64() else {
+                return Err(OpsError::InvalidParams(
+                    "`indices` must contain non-negative integers".to_string(),
+                ));
+            };
+            let index = index as usize;
+            if index >= slices {
+                return Err(OpsError::InvalidParams(
+                    "`indices` must be within the Z stack bounds".to_string(),
+                ));
+            }
+            selected.push(index);
+        }
+        return Ok(selected);
+    }
+
+    Ok((0..slices).collect())
+}
+
+fn parse_one_based_slice_selection(selection: &str, slices: usize) -> Result<Vec<usize>> {
+    let normalized = selection.replace(' ', "");
+    if normalized.is_empty() {
+        return Err(OpsError::InvalidParams(
+            "substack slice selection cannot be empty".to_string(),
+        ));
+    }
+    if normalized.contains(',') {
+        return normalized
+            .split(',')
+            .map(|part| parse_one_based_slice(part, slices))
+            .collect();
+    }
+
+    let parts = normalized.split('-').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [single] => Ok(vec![parse_one_based_slice(single, slices)?]),
+        [first, last] | [first, last, ""] => {
+            let first = parse_one_based_slice(first, slices)?;
+            let last = parse_one_based_slice(last, slices)?;
+            if first > last {
+                return Err(OpsError::InvalidParams(
+                    "substack range start must be <= range end".to_string(),
+                ));
+            }
+            Ok((first..=last).collect())
+        }
+        [first, last, increment] => {
+            let first = parse_one_based_slice(first, slices)?;
+            let last = parse_one_based_slice(last, slices)?;
+            let increment = increment.parse::<usize>().map_err(|_| {
+                OpsError::InvalidParams("substack range increment must be an integer".to_string())
+            })?;
+            if increment == 0 {
+                return Err(OpsError::InvalidParams(
+                    "substack range increment must be > 0".to_string(),
+                ));
+            }
+            if first > last {
+                return Err(OpsError::InvalidParams(
+                    "substack range start must be <= range end".to_string(),
+                ));
+            }
+            Ok((first..=last).step_by(increment).collect())
+        }
+        _ => Err(OpsError::InvalidParams(
+            "invalid substack slice selection".to_string(),
+        )),
+    }
+}
+
+fn parse_one_based_slice(value: &str, slices: usize) -> Result<usize> {
+    let slice = value
+        .parse::<usize>()
+        .map_err(|_| OpsError::InvalidParams("slice selection must be an integer".to_string()))?;
+    if slice == 0 || slice > slices {
+        return Err(OpsError::InvalidParams(
+            "slice selection must be within the Z stack bounds".to_string(),
+        ));
+    }
+    Ok(slice - 1)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResliceStart {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl ResliceStart {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "top" | "y" => Ok(Self::Top),
+            "bottom" => Ok(Self::Bottom),
+            "left" | "x" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
+            other => Err(OpsError::InvalidParams(format!(
+                "unsupported reslice start `{other}`"
+            ))),
+        }
+    }
+
+    fn is_horizontal(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom)
+    }
+}
+
+fn stack_reslice(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let input_shape = dataset.shape().to_vec();
+    if input_shape[z_axis] <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Reslice requires a stack with more than one Z slice".to_string(),
+        ));
+    }
+    if dataset.ndim() != 3 {
+        return Err(OpsError::UnsupportedLayout(
+            "Reslice currently supports X/Y/Z stacks".to_string(),
+        ));
+    }
+
+    let start = params
+        .get("start")
+        .or_else(|| params.get("start_at"))
+        .and_then(Value::as_str)
+        .map(ResliceStart::parse)
+        .transpose()?
+        .unwrap_or(ResliceStart::Top);
+
+    let x_size = input_shape[x_axis];
+    let y_size = input_shape[y_axis];
+    let z_size = input_shape[z_axis];
+    let (output_shape, output_x_source, output_z_source) = if start.is_horizontal() {
+        (vec![z_size, x_size, y_size], x_axis, y_axis)
+    } else {
+        (vec![z_size, y_size, x_size], y_axis, x_axis)
+    };
+
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut src = vec![0usize; input_shape.len()];
+        src[z_axis] = coord[0];
+        src[output_x_source] = coord[1];
+        let depth = coord[2];
+        src[output_z_source] = match start {
+            ResliceStart::Top | ResliceStart::Left => depth,
+            ResliceStart::Bottom | ResliceStart::Right => output_shape[2] - 1 - depth,
+        };
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build reslice stack".to_string()))?;
+    let mut metadata = Metadata {
+        dims: if start.is_horizontal() {
+            vec![
+                remapped_dim(&dataset.metadata.dims[z_axis], AxisKind::Y, z_size),
+                remapped_dim(&dataset.metadata.dims[x_axis], AxisKind::X, x_size),
+                remapped_dim(&dataset.metadata.dims[y_axis], AxisKind::Z, y_size),
+            ]
+        } else {
+            vec![
+                remapped_dim(&dataset.metadata.dims[z_axis], AxisKind::Y, z_size),
+                remapped_dim(&dataset.metadata.dims[y_axis], AxisKind::X, y_size),
+                remapped_dim(&dataset.metadata.dims[x_axis], AxisKind::Z, x_size),
+            ]
+        },
+        pixel_type: dataset.metadata.pixel_type,
+        channel_names: dataset.metadata.channel_names.clone(),
+        source: dataset.metadata.source.clone(),
+        extras: dataset.metadata.extras.clone(),
+    };
+    metadata
+        .extras
+        .insert("reslice_start".to_string(), json!(format!("{start:?}")));
+    metadata.extras.insert(
+        "reslice_source_axes".to_string(),
+        json!(["Z", "orthogonal", "depth"]),
+    );
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn remapped_dim(source: &Dim, axis: AxisKind, size: usize) -> Dim {
+    let mut dim = source.clone();
+    dim.axis = axis;
+    dim.size = size;
+    dim
+}
+
+fn stack_reduce(dataset: &DatasetF32, factor: usize) -> Result<DatasetF32> {
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let input_shape = dataset.shape().to_vec();
+    let slices = input_shape[z_axis];
+    if slices <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Reduce requires a stack with more than one Z slice".to_string(),
+        ));
+    }
+    if factor == 0 {
+        return Err(OpsError::InvalidParams(
+            "reduction factor must be > 0".to_string(),
+        ));
+    }
+
+    let reduced_slices = slices.div_ceil(factor);
+    let mut output_shape = input_shape.clone();
+    output_shape[z_axis] = reduced_slices;
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut src = coord.to_vec();
+        src[z_axis] = coord[z_axis] * factor;
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build reduced stack".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[z_axis].size = reduced_slices;
+    if let Some(spacing) = metadata.dims[z_axis].spacing {
+        metadata.dims[z_axis].spacing = Some(spacing * factor as f32);
+    }
+    metadata
+        .extras
+        .insert("stack_reduce_factor".to_string(), json!(factor));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn stack_z_project(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let slices = dataset.shape()[z_axis];
+    if slices <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Z Project requires a stack with more than one Z slice".to_string(),
+        ));
+    }
+    let start = get_optional_usize(params, "start", 0);
+    let stop = get_optional_usize(params, "stop", slices - 1);
+    if start > stop || stop >= slices {
+        return Err(OpsError::InvalidParams(
+            "Z Project start/stop must be ordered and within the Z stack bounds".to_string(),
+        ));
+    }
+    let method = projection_method(params)?;
+    let input_shape = dataset.shape().to_vec();
+    let mut output_shape = input_shape.clone();
+    output_shape.remove(z_axis);
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let mut values = Vec::with_capacity(stop - start + 1);
+        for z in start..=stop {
+            let mut src = Vec::with_capacity(input_shape.len());
+            for axis in 0..input_shape.len() {
+                if axis == z_axis {
+                    src.push(z);
+                } else {
+                    let output_axis = if axis < z_axis { axis } else { axis - 1 };
+                    src.push(coord[output_axis]);
+                }
+            }
+            values.push(dataset.data[IxDyn(&src)]);
+        }
+        output.push(project_values(&mut values, method));
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build Z projection".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims.remove(z_axis);
+    metadata
+        .extras
+        .insert("z_projection_method".to_string(), json!(method.name()));
+    metadata
+        .extras
+        .insert("z_projection_start".to_string(), json!(start));
+    metadata
+        .extras
+        .insert("z_projection_stop".to_string(), json!(stop));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionMethod {
+    Average,
+    Max,
+    Min,
+    Sum,
+    StandardDeviation,
+    Median,
+}
+
+impl ProjectionMethod {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Average => "average",
+            Self::Max => "max",
+            Self::Min => "min",
+            Self::Sum => "sum",
+            Self::StandardDeviation => "sd",
+            Self::Median => "median",
+        }
+    }
+}
+
+fn projection_method(params: &Value) -> Result<ProjectionMethod> {
+    let method = params
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("average")
+        .to_ascii_lowercase();
+    match method.as_str() {
+        "average" | "avg" | "average intensity" => Ok(ProjectionMethod::Average),
+        "max" | "maximum" | "max intensity" => Ok(ProjectionMethod::Max),
+        "min" | "minimum" | "min intensity" => Ok(ProjectionMethod::Min),
+        "sum" | "sum slices" => Ok(ProjectionMethod::Sum),
+        "sd" | "stddev" | "standard_deviation" | "standard deviation" => {
+            Ok(ProjectionMethod::StandardDeviation)
+        }
+        "median" => Ok(ProjectionMethod::Median),
+        other => Err(OpsError::InvalidParams(format!(
+            "unsupported Z projection method `{other}`"
+        ))),
+    }
+}
+
+fn project_values(values: &mut [f32], method: ProjectionMethod) -> f32 {
+    match method {
+        ProjectionMethod::Average => {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for value in values.iter().copied().filter(|value| value.is_finite()) {
+                sum += value;
+                count += 1;
+            }
+            if count == 0 {
+                f32::NAN
+            } else {
+                sum / count as f32
+            }
+        }
+        ProjectionMethod::Max => values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .reduce(f32::max)
+            .unwrap_or(f32::NAN),
+        ProjectionMethod::Min => values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .reduce(f32::min)
+            .unwrap_or(f32::NAN),
+        ProjectionMethod::Sum => values.iter().copied().sum(),
+        ProjectionMethod::StandardDeviation => {
+            if values.len() <= 1 {
+                return 0.0;
+            }
+            let count = values.len() as f32;
+            let sum = values.iter().copied().sum::<f32>();
+            let sum2 = values.iter().map(|value| value * value).sum::<f32>();
+            let variance = ((count * sum2 - sum * sum) / count / (count - 1.0)).max(0.0);
+            variance.sqrt()
+        }
+        ProjectionMethod::Median => {
+            values.sort_by(|left, right| left.total_cmp(right));
+            let mid = values.len() / 2;
+            if values.len() % 2 == 0 {
+                (values[mid - 1] + values[mid]) * 0.5
+            } else {
+                values[mid]
+            }
+        }
+    }
+}
+
+fn stack_grouped_z_project(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let input_shape = dataset.shape().to_vec();
+    let slices = input_shape[z_axis];
+    let group_size = get_optional_usize(params, "group_size", slices);
+    if group_size == 0 || group_size > slices || slices % group_size != 0 {
+        return Err(OpsError::InvalidParams(
+            "group_size must be a positive factor of the Z stack size".to_string(),
+        ));
+    }
+    let method = projection_method(params)?;
+    let groups = slices / group_size;
+    let mut output_shape = input_shape.clone();
+    output_shape[z_axis] = groups;
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let group_start = coord[z_axis] * group_size;
+        let mut values = Vec::with_capacity(group_size);
+        for offset in 0..group_size {
+            let mut src = coord.to_vec();
+            src[z_axis] = group_start + offset;
+            values.push(dataset.data[IxDyn(&src)]);
+        }
+        output.push(project_values(&mut values, method));
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build grouped Z projection".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[z_axis].size = groups;
+    if let Some(spacing) = metadata.dims[z_axis].spacing {
+        metadata.dims[z_axis].spacing = Some(spacing * group_size as f32);
+    }
+    metadata.extras.insert(
+        "grouped_z_projection_method".to_string(),
+        json!(method.name()),
+    );
+    metadata.extras.insert(
+        "grouped_z_projection_group_size".to_string(),
+        json!(group_size),
+    );
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn stack_montage(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let z_axis = axis_index(dataset, AxisKind::Z)?;
+    let input_shape = dataset.shape().to_vec();
+    let slices = input_shape[z_axis];
+    if slices <= 1 {
+        return Err(OpsError::InvalidParams(
+            "Make Montage requires a stack with more than one Z slice".to_string(),
+        ));
+    }
+
+    let first = get_optional_usize(params, "first", 0);
+    let last = get_optional_usize(params, "last", slices - 1);
+    let increment = get_optional_usize(params, "increment", 1);
+    if first > last || last >= slices || increment == 0 {
+        return Err(OpsError::InvalidParams(
+            "montage first/last/increment must describe a valid Z slice range".to_string(),
+        ));
+    }
+    let selected_count = ((last - first) / increment) + 1;
+    let (default_columns, default_rows) = default_montage_grid(selected_count);
+    let columns = get_optional_usize(params, "columns", default_columns);
+    let rows = get_optional_usize(params, "rows", default_rows);
+    if columns == 0 || rows == 0 {
+        return Err(OpsError::InvalidParams(
+            "montage columns and rows must be > 0".to_string(),
+        ));
+    }
+    let scale = get_optional_f32(params, "scale", 1.0);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(OpsError::InvalidParams(
+            "montage scale must be a positive finite value".to_string(),
+        ));
+    }
+    let border = get_optional_usize(params, "border_width", 0);
+    let fill = get_optional_f32(params, "fill", 0.0);
+    let tile_width = ((input_shape[x_axis] as f32) * scale).floor().max(1.0) as usize;
+    let tile_height = ((input_shape[y_axis] as f32) * scale).floor().max(1.0) as usize;
+    let output_width = tile_width * columns + border * columns.saturating_sub(1);
+    let output_height = tile_height * rows + border * rows.saturating_sub(1);
+
+    let mut output_shape = input_shape.clone();
+    output_shape.remove(z_axis);
+    let output_x_axis = if x_axis < z_axis { x_axis } else { x_axis - 1 };
+    let output_y_axis = if y_axis < z_axis { y_axis } else { y_axis - 1 };
+    output_shape[output_x_axis] = output_width;
+    output_shape[output_y_axis] = output_height;
+    let mut output = vec![fill; output_shape.iter().product()];
+    let output_capacity = columns * rows;
+
+    for (tile_index, z) in (first..=last)
+        .step_by(increment)
+        .take(output_capacity)
+        .enumerate()
+    {
+        let tile_column = tile_index % columns;
+        let tile_row = tile_index / columns;
+        let x_origin = tile_column * (tile_width + border);
+        let y_origin = tile_row * (tile_height + border);
+        iterate_indices(&output_shape, |coord| {
+            let x = coord[output_x_axis];
+            let y = coord[output_y_axis];
+            if x < x_origin
+                || x >= x_origin + tile_width
+                || y < y_origin
+                || y >= y_origin + tile_height
+            {
+                return;
+            }
+            let src_x = (((x - x_origin) as f32) / scale)
+                .floor()
+                .clamp(0.0, (input_shape[x_axis] - 1) as f32) as usize;
+            let src_y = (((y - y_origin) as f32) / scale)
+                .floor()
+                .clamp(0.0, (input_shape[y_axis] - 1) as f32) as usize;
+            let mut src = Vec::with_capacity(input_shape.len());
+            for axis in 0..input_shape.len() {
+                if axis == x_axis {
+                    src.push(src_x);
+                } else if axis == y_axis {
+                    src.push(src_y);
+                } else if axis == z_axis {
+                    src.push(z);
+                } else {
+                    let output_axis = if axis < z_axis { axis } else { axis - 1 };
+                    src.push(coord[output_axis]);
+                }
+            }
+            output[linear_offset(&output_shape, coord)] = dataset.data[IxDyn(&src)];
+        });
+    }
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
+        .map_err(|_| OpsError::UnsupportedLayout("failed to build montage".to_string()))?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims.remove(z_axis);
+    metadata.dims[output_x_axis].size = output_width;
+    metadata.dims[output_y_axis].size = output_height;
+    metadata
+        .extras
+        .insert("montage_columns".to_string(), json!(columns));
+    metadata
+        .extras
+        .insert("montage_rows".to_string(), json!(rows));
+    metadata
+        .extras
+        .insert("montage_first".to_string(), json!(first));
+    metadata
+        .extras
+        .insert("montage_last".to_string(), json!(last));
+    metadata
+        .extras
+        .insert("montage_increment".to_string(), json!(increment));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn default_montage_grid(slice_count: usize) -> (usize, usize) {
+    let rows = (slice_count as f64).sqrt().floor().max(1.0) as usize;
+    let columns = slice_count.div_ceil(rows);
+    (columns.max(1), rows.max(1))
+}
+
+fn montage_to_stack(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    if dataset.axis_index(AxisKind::Z).is_some() {
+        return Err(OpsError::InvalidParams(
+            "Montage to Stack requires a single montage image, not a Z stack".to_string(),
+        ));
+    }
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let input_shape = dataset.shape().to_vec();
+    let columns_default = metadata_usize(dataset, "montage_columns").unwrap_or(2);
+    let rows_default = metadata_usize(dataset, "montage_rows").unwrap_or(2);
+    let columns = get_optional_usize(params, "columns", columns_default);
+    let rows = get_optional_usize(params, "rows", rows_default);
+    let border = get_optional_usize(params, "border_width", 0);
+    if columns == 0 || rows == 0 {
+        return Err(OpsError::InvalidParams(
+            "montage columns and rows must be > 0".to_string(),
+        ));
+    }
+    let total_border_x = border * columns.saturating_sub(1);
+    let total_border_y = border * rows.saturating_sub(1);
+    if input_shape[x_axis] <= total_border_x || input_shape[y_axis] <= total_border_y {
+        return Err(OpsError::InvalidParams(
+            "montage border is too large for the image dimensions".to_string(),
+        ));
+    }
+    let usable_width = input_shape[x_axis] - total_border_x;
+    let usable_height = input_shape[y_axis] - total_border_y;
+    if usable_width % columns != 0 || usable_height % rows != 0 {
+        return Err(OpsError::InvalidParams(
+            "montage dimensions must divide evenly by columns/rows after borders".to_string(),
+        ));
+    }
+    let tile_width = usable_width / columns;
+    let tile_height = usable_height / rows;
+    if tile_width == 0 || tile_height == 0 {
+        return Err(OpsError::InvalidParams(
+            "montage tiles must have nonzero dimensions".to_string(),
+        ));
+    }
+
+    let mut output_shape = input_shape.clone();
+    output_shape[x_axis] = tile_width;
+    output_shape[y_axis] = tile_height;
+    output_shape.push(columns * rows);
+    let z_axis = output_shape.len() - 1;
+    let mut output = Vec::with_capacity(output_shape.iter().product());
+    iterate_indices(&output_shape, |coord| {
+        let z = coord[z_axis];
+        let tile_column = z % columns;
+        let tile_row = z / columns;
+        let mut src = coord[..z_axis].to_vec();
+        src[x_axis] = tile_column * (tile_width + border) + coord[x_axis];
+        src[y_axis] = tile_row * (tile_height + border) + coord[y_axis];
+        output.push(dataset.data[IxDyn(&src)]);
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build stack from montage".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[x_axis].size = tile_width;
+    metadata.dims[y_axis].size = tile_height;
+    metadata.dims.push(Dim::new(AxisKind::Z, columns * rows));
+    metadata
+        .extras
+        .insert("montage_to_stack_columns".to_string(), json!(columns));
+    metadata
+        .extras
+        .insert("montage_to_stack_rows".to_string(), json!(rows));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn metadata_usize(dataset: &DatasetF32, key: &str) -> Option<usize> {
+    dataset
+        .metadata
+        .extras
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+}
+
 fn apply_coordinate_bounds(
     metadata: &mut Metadata,
     axis: usize,
@@ -1371,6 +2837,93 @@ fn apply_coordinate_units(
             metadata.dims[z_axis].unit = Some(unit);
         }
     }
+}
+
+fn apply_set_scale(metadata: &mut Metadata, dataset: &DatasetF32, params: &Value) -> Result<()> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let measured = get_optional_f32(params, "distance_pixels", 0.0);
+    let known = get_optional_f32(params, "known_distance", 0.0);
+    let aspect_ratio = get_optional_f32(params, "pixel_aspect_ratio", 1.0);
+    if !aspect_ratio.is_finite() {
+        return Err(OpsError::InvalidParams(
+            "`pixel_aspect_ratio` must be finite".to_string(),
+        ));
+    }
+
+    let unit = params
+        .get("unit")
+        .and_then(Value::as_str)
+        .unwrap_or("pixel")
+        .trim();
+    let removes_scale = measured <= 0.0
+        || known <= 0.0
+        || unit.is_empty()
+        || unit.to_lowercase().starts_with("pixel");
+
+    if removes_scale {
+        metadata.dims[x_axis].spacing = Some(1.0);
+        metadata.dims[y_axis].spacing = Some(1.0);
+        metadata.dims[x_axis].unit = Some("pixel".to_string());
+        metadata.dims[y_axis].unit = Some("pixel".to_string());
+        if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
+            metadata.dims[z_axis].spacing = Some(1.0);
+            metadata.dims[z_axis].unit = Some("pixel".to_string());
+        }
+        metadata
+            .extras
+            .insert("global_calibration".to_string(), json!(false));
+        return Ok(());
+    }
+
+    let pixel_width = known / measured;
+    let pixel_height = if aspect_ratio == 0.0 {
+        pixel_width
+    } else {
+        pixel_width * aspect_ratio
+    };
+    metadata.dims[x_axis].spacing = Some(pixel_width);
+    metadata.dims[y_axis].spacing = Some(pixel_height);
+    metadata.dims[x_axis].unit = Some(unit.to_string());
+    metadata.dims[y_axis].unit = Some(unit.to_string());
+    if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
+        if metadata.dims[z_axis].spacing.unwrap_or(1.0) == 1.0 {
+            metadata.dims[z_axis].spacing = Some(pixel_width);
+        }
+        metadata.dims[z_axis].unit = Some(unit.to_string());
+    }
+    let global = params
+        .get("global")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    metadata
+        .extras
+        .insert("global_calibration".to_string(), json!(global));
+    Ok(())
+}
+
+fn shift_origin(metadata: &mut Metadata, axis: usize, label: &str, offset: usize) {
+    if offset == 0 {
+        return;
+    }
+    let Some(origin) = metadata
+        .extras
+        .get(&format!("{label}_origin_coordinate"))
+        .and_then(Value::as_f64)
+    else {
+        return;
+    };
+    let spacing = metadata.dims[axis].spacing.unwrap_or(1.0) as f64;
+    let inverted = metadata
+        .extras
+        .get(&format!("{label}_coordinate_inverted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let direction = if inverted { -1.0 } else { 1.0 };
+    metadata.extras.insert(
+        format!("{label}_origin_coordinate"),
+        json!(origin + direction * spacing * offset as f64),
+    );
 }
 
 fn optional_f32_param(params: &Value, key: &str) -> Result<Option<f32>> {
@@ -2844,6 +4397,81 @@ fn filter_xy(dataset: &DatasetF32, kind: FilterKind) -> Result<DatasetF32> {
     let data = ArrayD::from_shape_vec(IxDyn(&shape), output)
         .map_err(|_| OpsError::UnsupportedLayout("failed to build filtered dataset".to_string()))?;
     Ok(Dataset::new(data, dataset.metadata.clone())?)
+}
+
+fn find_maxima_mask_xy(
+    dataset: &DatasetF32,
+    prominence: f32,
+    strict: bool,
+    exclude_edges: bool,
+    light_background: bool,
+) -> Result<DatasetF32> {
+    let x_axis = axis_index(dataset, AxisKind::X)?;
+    let y_axis = axis_index(dataset, AxisKind::Y)?;
+    let shape = dataset.shape().to_vec();
+    let width = shape[x_axis];
+    let height = shape[y_axis];
+    let mut output = vec![0.0_f32; dataset.data.len()];
+    let mut write_at = 0usize;
+
+    iterate_indices(&shape, |coord| {
+        let x = coord[x_axis];
+        let y = coord[y_axis];
+        let edge = x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+        if exclude_edges && edge {
+            write_at += 1;
+            return;
+        }
+
+        let center = maxima_sample(dataset.data[IxDyn(coord)], light_background);
+        if !center.is_finite() {
+            write_at += 1;
+            return;
+        }
+
+        let mut max_neighbor = f32::NEG_INFINITY;
+        let mut is_maximum = true;
+        for dy in -1_isize..=1 {
+            for dx in -1_isize..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let sx = x as isize + dx;
+                let sy = y as isize + dy;
+                if sx < 0 || sy < 0 || sx >= width as isize || sy >= height as isize {
+                    continue;
+                }
+                let mut sample_coord = coord.to_vec();
+                sample_coord[x_axis] = sx as usize;
+                sample_coord[y_axis] = sy as usize;
+                let neighbor = maxima_sample(dataset.data[IxDyn(&sample_coord)], light_background);
+                if !neighbor.is_finite() {
+                    continue;
+                }
+                max_neighbor = max_neighbor.max(neighbor);
+                if (strict && center <= neighbor) || (!strict && center < neighbor) {
+                    is_maximum = false;
+                }
+            }
+        }
+
+        if is_maximum && (max_neighbor == f32::NEG_INFINITY || center - max_neighbor >= prominence)
+        {
+            output[write_at] = 1.0;
+        }
+        write_at += 1;
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build maxima mask dataset".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.pixel_type = PixelType::U8;
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn maxima_sample(value: f32, light_background: bool) -> f32 {
+    if light_background { -value } else { value }
 }
 
 fn bilinear_sample(

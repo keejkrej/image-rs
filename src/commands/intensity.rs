@@ -1,7 +1,7 @@
 use crate::model::{Dataset, DatasetF32, PixelType};
 use ndarray::{Array, IxDyn};
 use rayon::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     OpOutput, OpSchema, Operation, OpsError, ParamSpec, Result, get_optional_f32, get_required_f32,
@@ -9,6 +9,9 @@ use super::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct IntensityNormalizeOp;
+
+#[derive(Debug, Clone, Copy)]
+pub struct IntensityEnhanceContrastOp;
 
 #[derive(Debug, Clone, Copy)]
 pub struct IntensityInvertOp;
@@ -72,6 +75,78 @@ impl Operation for IntensityNormalizeOp {
             .expect("shape is unchanged and valid");
         let output_dataset = Dataset::new(normalized, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
+    }
+}
+
+impl Operation for IntensityEnhanceContrastOp {
+    fn name(&self) -> &'static str {
+        "intensity.enhance_contrast"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Enhance contrast using ImageJ-style saturated tail clipping.".to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "saturated_percent".to_string(),
+                    description: "Total saturated pixels percentage split across both tails."
+                        .to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
+                ParamSpec {
+                    name: "normalize".to_string(),
+                    description:
+                        "When true, remap pixels into [0, 1]; otherwise record display bounds."
+                            .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let saturated = get_optional_f32(params, "saturated_percent", 0.35).clamp(0.0, 100.0);
+        let normalize = params
+            .get("normalize")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let Some((low, high)) = saturated_min_max(dataset, saturated) else {
+            return Ok(OpOutput::dataset_only(dataset.clone()));
+        };
+        if high <= low {
+            return Ok(OpOutput::dataset_only(dataset.clone()));
+        }
+
+        if !normalize {
+            let mut metadata = dataset.metadata.clone();
+            metadata
+                .extras
+                .insert("display_min".to_string(), json!(low));
+            metadata
+                .extras
+                .insert("display_max".to_string(), json!(high));
+            return Ok(OpOutput::dataset_only(Dataset::new(
+                dataset.data.clone(),
+                metadata,
+            )?));
+        }
+
+        let scale = high - low;
+        let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
+        values.par_iter_mut().for_each(|value| {
+            if value.is_finite() {
+                *value = ((*value - low) / scale).clamp(0.0, 1.0);
+            }
+        });
+        let output =
+            Array::from_shape_vec(IxDyn(dataset.shape()), values).expect("shape is unchanged");
+        Ok(OpOutput::dataset_only(Dataset::new(
+            output,
+            dataset.metadata.clone(),
+        )?))
     }
 }
 
@@ -255,6 +330,24 @@ impl Operation for IntensityNaNBackgroundOp {
             dataset.metadata.clone(),
         )?))
     }
+}
+
+fn saturated_min_max(dataset: &DatasetF32, saturated_percent: f32) -> Option<(f32, f32)> {
+    let mut values = dataset
+        .data
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|left, right| left.total_cmp(right));
+    let tail_count = ((values.len() as f32 * saturated_percent / 200.0).floor() as usize)
+        .min(values.len().saturating_sub(1));
+    let low = values[tail_count];
+    let high = values[values.len() - 1 - tail_count];
+    Some((low, high))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

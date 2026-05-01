@@ -95,15 +95,33 @@
           { "type": "item", "id": "image.adjust.coordinates", "label": "Coordinates..." }
         ]
       },
+      { "type": "item", "id": "image.show_info", "label": "Show Info...", "shortcut": "I" },
+      { "type": "item", "id": "image.properties", "label": "Properties..." },
+      { "type": "item", "id": "image.crop", "label": "Crop", "shortcut": "X" },
+      { "type": "item", "id": "image.duplicate", "label": "Duplicate..." },
+      { "type": "item", "id": "image.rename", "label": "Rename..." },
+      { "type": "item", "id": "image.scale", "label": "Scale..." },
       {
         "type": "submenu",
         "id": "image.stacks",
         "label": "Stacks",
         "items": [
+          { "type": "item", "id": "image.stacks.add_slice", "label": "Add Slice" },
+          { "type": "item", "id": "image.stacks.delete_slice", "label": "Delete Slice" },
+          { "type": "separator" },
           { "type": "item", "id": "image.stacks.next", "label": "Next Slice", "shortcut": ">" },
           { "type": "item", "id": "image.stacks.previous", "label": "Previous Slice", "shortcut": "<" },
           { "type": "item", "id": "image.stacks.set", "label": "Set Slice..." },
+          { "type": "item", "id": "image.stacks.make_substack", "label": "Make Substack..." },
+          { "type": "item", "id": "image.stacks.reslice", "label": "Reslice..." },
           { "type": "separator" },
+          { "type": "item", "id": "image.stacks.make_montage", "label": "Make Montage..." },
+          { "type": "item", "id": "image.stacks.montage_to_stack", "label": "Montage to Stack..." },
+          { "type": "item", "id": "image.stacks.plot_z_profile", "label": "Plot Z-axis Profile" },
+          { "type": "item", "id": "image.stacks.statistics", "label": "Statistics" },
+          { "type": "item", "id": "image.stacks.z_project", "label": "Z Project..." },
+          { "type": "item", "id": "image.stacks.grouped_z_project", "label": "Grouped Z Project..." },
+          { "type": "item", "id": "image.stacks.reduce", "label": "Reduce..." },
           { "type": "item", "id": "image.stacks.reverse", "label": "Reverse" }
         ]
       },
@@ -151,6 +169,8 @@
       { "type": "item", "id": "process.smooth", "label": "Smooth" },
       { "type": "item", "id": "process.sharpen", "label": "Sharpen" },
       { "type": "item", "id": "process.find_edges", "label": "Find Edges" },
+      { "type": "item", "id": "process.find_maxima", "label": "Find Maxima..." },
+      { "type": "item", "id": "process.enhance_contrast", "label": "Enhance Contrast..." },
       {
         "type": "submenu",
         "id": "process.noise",
@@ -164,6 +184,7 @@
           { "type": "item", "id": "process.noise.remove_nans", "label": "Remove NaNs..." }
         ]
       },
+      { "type": "item", "id": "process.subtract_background", "label": "Subtract Background..." },
       {
         "type": "submenu",
         "id": "process.shadows",
@@ -270,8 +291,12 @@
     "label": "Analyze",
     "items": [
       { "type": "item", "id": "analyze.measure", "label": "Measure", "shortcut": "M" },
+      { "type": "item", "id": "analyze.set_scale", "label": "Set Scale..." },
       { "type": "item", "id": "analyze.set_measurements", "label": "Set Measurements..." },
       { "type": "item", "id": "analyze.analyze_particles", "label": "Analyze Particles..." },
+      { "type": "item", "id": "analyze.summarize", "label": "Summarize" },
+      { "type": "item", "id": "analyze.distribution", "label": "Distribution..." },
+      { "type": "item", "id": "analyze.clear_results", "label": "Clear Results" },
       { "type": "item", "id": "analyze.histogram", "label": "Histogram" },
       { "type": "item", "id": "analyze.plot_profile", "label": "Plot Profile" },
       { "type": "separator" },

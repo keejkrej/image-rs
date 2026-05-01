@@ -19,6 +19,7 @@ use super::interaction::tooling::{
     LineMode, OvalMode, PointMode, RectMode, ToolId, ToolOptionsState, ToolState,
 };
 use super::interaction::transform::{ViewerTransformState, zoom_level_down, zoom_level_up};
+use crate::commands::MeasurementTable;
 use crate::formats::{NativeRasterImage, supported_formats};
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
 use crate::runtime::AppContext;
@@ -380,6 +381,12 @@ struct ViewerFrameBuffer {
 }
 
 #[derive(Debug, Clone)]
+struct OpRunOutput {
+    dataset: Arc<DatasetF32>,
+    measurements: Option<MeasurementTable>,
+}
+
+#[derive(Debug, Clone)]
 enum WorkerEvent {
     OpFinished {
         window_label: String,
@@ -388,7 +395,7 @@ enum WorkerEvent {
         mode: OpRunMode,
         op: String,
         preview_key: Option<String>,
-        result: Result<Arc<DatasetF32>, String>,
+        result: Result<OpRunOutput, String>,
     },
 }
 
@@ -481,6 +488,75 @@ impl Default for ResizeDialogState {
             width: 512,
             height: 512,
             fill: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StackPositionDialogState {
+    open: bool,
+    window_label: String,
+    channel: usize,
+    slice: usize,
+    frame: usize,
+}
+
+impl Default for StackPositionDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            channel: 1,
+            slice: 1,
+            frame: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ZoomSetDialogState {
+    open: bool,
+    window_label: String,
+    zoom_percent: f32,
+    x_center: f32,
+    y_center: f32,
+}
+
+impl Default for ZoomSetDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            zoom_percent: 100.0,
+            x_center: 0.0,
+            y_center: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorDialogMode {
+    Colors,
+    Foreground,
+    Background,
+    Picker,
+}
+
+#[derive(Debug, Clone)]
+struct ColorDialogState {
+    open: bool,
+    mode: ColorDialogMode,
+    foreground: egui::Color32,
+    background: egui::Color32,
+}
+
+impl Default for ColorDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            mode: ColorDialogMode::Colors,
+            foreground: egui::Color32::WHITE,
+            background: egui::Color32::BLACK,
         }
     }
 }
@@ -641,7 +717,7 @@ enum UiAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum ZoomCommand {
     In,
     Out,
@@ -649,7 +725,11 @@ enum ZoomCommand {
     View100,
     ToSelection,
     ScaleToFit,
-    Set,
+    Set {
+        magnification: f32,
+        x_center: Option<f32>,
+        y_center: Option<f32>,
+    },
     Maximize,
 }
 
@@ -677,6 +757,9 @@ struct ImageUiApp {
     new_image_dialog: NewImageDialogState,
     resize_dialog: ResizeDialogState,
     canvas_dialog: ResizeDialogState,
+    stack_position_dialog: StackPositionDialogState,
+    zoom_set_dialog: ZoomSetDialogState,
+    color_dialog: ColorDialogState,
     raw_import_dialog: RawImportDialogState,
     url_import_dialog: UrlImportDialogState,
     command_finder: CommandFinderState,
@@ -744,6 +827,9 @@ impl ImageUiApp {
             new_image_dialog: NewImageDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
+            stack_position_dialog: StackPositionDialogState::default(),
+            zoom_set_dialog: ZoomSetDialogState::default(),
+            color_dialog: ColorDialogState::default(),
             raw_import_dialog: RawImportDialogState::default(),
             url_import_dialog: UrlImportDialogState::default(),
             command_finder: CommandFinderState::default(),
@@ -794,6 +880,13 @@ impl ImageUiApp {
         self.refresh_launcher_status();
     }
 
+    fn open_color_dialog(&mut self, mode: ColorDialogMode) {
+        self.color_dialog.open = true;
+        self.color_dialog.mode = mode;
+        self.color_dialog.foreground = self.tool_options.foreground_color;
+        self.color_dialog.background = self.tool_options.background_color;
+    }
+
     fn refresh_launcher_status(&mut self) {
         let active_label = self
             .active_viewer_label
@@ -838,6 +931,7 @@ impl ImageUiApp {
                     result,
                 } => {
                     let mut status = format!("{op} failed");
+                    let mut measurements = None;
                     if let Some(session) = self.state.label_to_session.get_mut(&window_label) {
                         if !session.is_active_job(job_id, generation) {
                             continue;
@@ -845,16 +939,19 @@ impl ImageUiApp {
                         state_changed = true;
 
                         match result {
-                            Ok(dataset) => {
+                            Ok(output) => {
                                 match mode {
                                     OpRunMode::Preview => {
                                         if let Some(key) = preview_key {
-                                            session.preview_cache.insert(key.clone(), dataset);
+                                            session
+                                                .preview_cache
+                                                .insert(key.clone(), output.dataset);
                                             session.set_active_preview(Some(key));
                                         }
                                     }
                                     OpRunMode::Apply => {
-                                        session.commit_dataset(dataset);
+                                        session.commit_dataset(output.dataset);
+                                        measurements = output.measurements;
                                     }
                                 }
                                 session.active_job = None;
@@ -864,6 +961,21 @@ impl ImageUiApp {
                                 session.active_job = None;
                                 status = error;
                             }
+                        }
+                    }
+
+                    if let Some(measurements) = measurements {
+                        if op == "measurements.profile" {
+                            if let Some(samples) = profile_samples_from_table(&measurements) {
+                                self.profile_plot.title = format!("Profile ({window_label})");
+                                self.profile_plot.samples = samples;
+                                self.desktop_state.utility_windows.profile_plot_open = true;
+                            }
+                        } else {
+                            for row in measurement_rows_from_table(&measurements) {
+                                self.results_table.add_row(row);
+                            }
+                            self.desktop_state.utility_windows.results_open = true;
                         }
                     }
 
@@ -1392,6 +1504,33 @@ impl ImageUiApp {
         Ok(format!("created results image in {label}"))
     }
 
+    fn summarize_results(&mut self) -> Result<String, String> {
+        let summary_rows = results_summary_rows(&self.results_table.rows)?;
+        let count = summary_rows.len();
+        for row in summary_rows {
+            self.results_table.add_row(row);
+        }
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(format!("added {count} summary rows"))
+    }
+
+    fn clear_results(&mut self) -> String {
+        self.results_table.clear();
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        "results table cleared".to_string()
+    }
+
+    fn results_distribution_payload(&mut self, params: &Value) -> Result<Value, String> {
+        let bins = params.get("bins").and_then(Value::as_u64).unwrap_or(10) as usize;
+        let column = params.get("column").and_then(Value::as_str);
+        let payload = results_distribution(&self.results_table.rows, column, bins)?;
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(payload)
+    }
+
     fn show_circular_masks(&mut self) -> Result<String, String> {
         let dataset = create_circular_masks_dataset()?;
         let path = normalize_path(&PathBuf::from(format!(
@@ -1400,6 +1539,136 @@ impl ImageUiApp {
         )));
         let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
         Ok(format!("created circular masks stack in {label}"))
+    }
+
+    fn duplicate_viewer(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for duplicate".to_string())?
+            .to_string();
+        let (source, stem) = {
+            let session = self
+                .state
+                .label_to_session
+                .get(&viewer_label)
+                .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+            let source = session
+                .source_for_kind(&session.current_source_kind())
+                .ok_or_else(|| format!("no image source for `{viewer_label}`"))?;
+            let stem = session
+                .path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Image")
+                .to_string();
+            (source, stem)
+        };
+        let dataset = source.to_dataset()?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "{stem}-copy-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(
+            path,
+            ViewerImageSource::Dataset(Arc::new(dataset.as_ref().clone())),
+        );
+        Ok(format!("duplicated image in {label}"))
+    }
+
+    fn rename_viewer(&mut self, window_label: &str, params: &Value) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for rename".to_string())?
+            .to_string();
+        let current_path = self
+            .state
+            .label_to_path
+            .get(&viewer_label)
+            .cloned()
+            .ok_or_else(|| format!("no viewer path for `{viewer_label}`"))?;
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Untitled-{}", self.state.next_window_id + 1));
+        let renamed_path = renamed_image_path(&current_path, &title);
+        if self
+            .state
+            .path_to_label
+            .get(&renamed_path)
+            .is_some_and(|label| label != &viewer_label)
+        {
+            return Err(format!("{} is already open", renamed_path.display()));
+        }
+
+        self.state.path_to_label.remove(&current_path);
+        self.state
+            .path_to_label
+            .insert(renamed_path.clone(), viewer_label.clone());
+        self.state
+            .label_to_path
+            .insert(viewer_label.clone(), renamed_path.clone());
+        if let Some(session) = self.state.label_to_session.get_mut(&viewer_label) {
+            session.path = renamed_path.clone();
+            session.committed_summary = summarize_source(&session.committed_source, &renamed_path);
+        }
+        if let Some(viewer) = self.viewers_ui.get_mut(&viewer_label) {
+            viewer.title = format!(
+                "{} - image-rs",
+                renamed_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Image")
+            );
+            viewer.status_message = "image renamed".to_string();
+        }
+        self.refresh_launcher_status();
+        Ok(format!("renamed image to {}", renamed_path.display()))
+    }
+
+    fn image_info_payload(&self, window_label: &str) -> Result<Value, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for image info".to_string())?;
+        let session = self
+            .state
+            .label_to_session
+            .get(viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+        let source = session
+            .source_for_kind(&session.current_source_kind())
+            .ok_or_else(|| format!("no image source for `{viewer_label}`"))?;
+        let summary = summarize_source(&source, &session.path);
+        let dataset = source.to_dataset()?;
+        let axes = dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| {
+                json!({
+                    "axis": format!("{:?}", dim.axis),
+                    "size": dim.size,
+                    "spacing": dim.spacing,
+                    "unit": dim.unit
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "shape": summary.shape,
+            "axes": summary.axes,
+            "channels": summary.channels,
+            "zSlices": summary.z_slices,
+            "times": summary.times,
+            "min": summary.min,
+            "max": summary.max,
+            "source": summary.source,
+            "pixelType": format!("{:?}", dataset.metadata.pixel_type),
+            "calibration": axes,
+            "channelNames": &dataset.metadata.channel_names,
+            "metadata": &dataset.metadata,
+        }))
     }
 
     fn measure_all_rois(&mut self, window_label: &str) -> Result<String, String> {
@@ -1488,43 +1757,6 @@ impl ImageUiApp {
         self.desktop_state.utility_windows.roi_manager_open = true;
         self.persist_desktop_state();
         Ok("particle analysis added to results".to_string())
-    }
-
-    fn build_profile_plot(&mut self, window_label: &str) -> Result<String, String> {
-        let viewer_label = self
-            .current_viewer_label(window_label)
-            .ok_or_else(|| "a loaded image is required for plot profile".to_string())?
-            .to_string();
-        let (slice, roi_bbox, _, _, _) = self.measurement_context(&viewer_label)?;
-        let samples = if let Some((min_x, min_y, max_x, max_y)) = roi_bbox {
-            if max_y > min_y {
-                mean_profile_rect(&slice.values, slice.width, min_x, min_y, max_x, max_y)
-            } else {
-                sample_line_profile(
-                    &slice.values,
-                    slice.width,
-                    min_x as f32,
-                    min_y as f32,
-                    max_x as f32,
-                    max_y as f32,
-                )
-            }
-        } else {
-            let y = slice.height.saturating_sub(1) / 2;
-            mean_profile_rect(
-                &slice.values,
-                slice.width,
-                0,
-                y,
-                slice.width.saturating_sub(1),
-                y,
-            )
-        };
-        self.profile_plot.title = format!("Profile ({viewer_label})");
-        self.profile_plot.samples = samples;
-        self.desktop_state.utility_windows.profile_plot_open = true;
-        self.persist_desktop_state();
-        Ok("profile plot opened".to_string())
     }
 
     fn copy_selection(&mut self, window_label: &str, cut: bool) -> Result<String, String> {
@@ -2097,31 +2329,27 @@ impl ImageUiApp {
                 ));
             }
             "tool.dropper.palette.foreground" => {
-                std::mem::swap(
-                    &mut self.tool_options.foreground_color,
-                    &mut self.tool_options.background_color,
-                );
+                self.open_color_dialog(ColorDialogMode::Foreground);
                 return Some(command_registry::CommandExecuteResult::ok(
-                    "foreground/background swapped",
+                    "foreground color dialog opened",
                 ));
             }
             "tool.dropper.palette.background" => {
-                std::mem::swap(
-                    &mut self.tool_options.foreground_color,
-                    &mut self.tool_options.background_color,
-                );
+                self.open_color_dialog(ColorDialogMode::Background);
                 return Some(command_registry::CommandExecuteResult::ok(
-                    "foreground/background swapped",
+                    "background color dialog opened",
                 ));
             }
             "tool.dropper.palette.colors" => {
+                self.open_color_dialog(ColorDialogMode::Colors);
                 return Some(command_registry::CommandExecuteResult::ok(
-                    "color dialog is not implemented yet",
+                    "color dialog opened",
                 ));
             }
             "tool.dropper.palette.color_picker" => {
+                self.open_color_dialog(ColorDialogMode::Picker);
                 return Some(command_registry::CommandExecuteResult::ok(
-                    "color picker dialog is not implemented yet",
+                    "color picker opened",
                 ));
             }
             _ => {}
@@ -2147,9 +2375,47 @@ impl ImageUiApp {
                     "moved to previous slice",
                 ))
             }
-            "image.stacks.set" => Some(command_registry::CommandExecuteResult::ok(
-                "set slice dialog is not implemented yet",
-            )),
+            "image.stacks.set" => {
+                let params = command_registry::merge_params(command_id, params.cloned());
+                let Some(session) = self.state.label_to_session.get(window_label) else {
+                    return Some(command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required for set slice",
+                    ));
+                };
+                if !has_stack_position_param(&params) {
+                    self.stack_position_dialog.open = true;
+                    self.stack_position_dialog.window_label = window_label.to_string();
+                    self.stack_position_dialog.channel = viewer.channel + 1;
+                    self.stack_position_dialog.slice = viewer.z + 1;
+                    self.stack_position_dialog.frame = viewer.t + 1;
+                    return Some(command_registry::CommandExecuteResult::ok(
+                        "set slice dialog opened",
+                    ));
+                }
+                match stack_position_from_params(
+                    &params,
+                    viewer.channel,
+                    viewer.z,
+                    viewer.t,
+                    session.committed_summary.channels,
+                    session.committed_summary.z_slices,
+                    session.committed_summary.times,
+                ) {
+                    Ok((channel, z, t)) => {
+                        viewer.channel = channel;
+                        viewer.z = z;
+                        viewer.t = t;
+                        viewer.last_request = None;
+                        Some(command_registry::CommandExecuteResult::ok(format!(
+                            "set position to C{} Z{} T{}",
+                            channel + 1,
+                            z + 1,
+                            t + 1
+                        )))
+                    }
+                    Err(error) => Some(command_registry::CommandExecuteResult::blocked(error)),
+                }
+            }
             "viewer.roi.delete" => {
                 if let Some(selected) = viewer.rois.selected_roi_id {
                     viewer.rois.overlay_rois.retain(|roi| roi.id != selected);
@@ -2190,10 +2456,35 @@ impl ImageUiApp {
                 ))
             }
             "image.zoom.set" => {
-                viewer.pending_zoom = Some(ZoomCommand::Set);
-                Some(command_registry::CommandExecuteResult::ok(
-                    "zoom set dialog is not implemented yet",
-                ))
+                let params = command_registry::merge_params(command_id, params.cloned());
+                if !has_zoom_set_param(&params) {
+                    let center = egui::pos2(
+                        viewer.transform.src_rect.x + viewer.transform.src_rect.width * 0.5,
+                        viewer.transform.src_rect.y + viewer.transform.src_rect.height * 0.5,
+                    );
+                    self.zoom_set_dialog.open = true;
+                    self.zoom_set_dialog.window_label = window_label.to_string();
+                    self.zoom_set_dialog.zoom_percent = viewer.transform.magnification * 100.0;
+                    self.zoom_set_dialog.x_center = center.x;
+                    self.zoom_set_dialog.y_center = center.y;
+                    return Some(command_registry::CommandExecuteResult::ok(
+                        "set zoom dialog opened",
+                    ));
+                }
+                match zoom_set_params(&params) {
+                    Ok((magnification, x_center, y_center)) => {
+                        viewer.pending_zoom = Some(ZoomCommand::Set {
+                            magnification,
+                            x_center,
+                            y_center,
+                        });
+                        Some(command_registry::CommandExecuteResult::ok(format!(
+                            "zoom set to {:.0}%",
+                            magnification * 100.0
+                        )))
+                    }
+                    Err(error) => Some(command_registry::CommandExecuteResult::blocked(error)),
+                }
             }
             "process.fft.make_circular_selection" => {
                 let Some(session) = self.state.label_to_session.get(window_label) else {
@@ -2396,6 +2687,198 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
+            "image.stacks.add_slice" | "image.stacks.delete_slice" => {
+                let viewer_z = self
+                    .viewers_ui
+                    .get(window_label)
+                    .map(|viewer| viewer.z)
+                    .unwrap_or(0);
+                let mut params =
+                    command_registry::merge_params(&request.command_id, request.params);
+                if let Some(map) = params.as_object_mut() {
+                    let needs_index = map.get("index").map_or(true, Value::is_null);
+                    if needs_index {
+                        let index = if request.command_id == "image.stacks.add_slice" {
+                            viewer_z.saturating_add(1)
+                        } else {
+                            viewer_z
+                        };
+                        map.insert("index".to_string(), json!(index));
+                    }
+                }
+                let op = if request.command_id == "image.stacks.add_slice" {
+                    "image.stack.add_slice"
+                } else {
+                    "image.stack.delete_slice"
+                };
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: op.to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "stack edit started",
+                        json!({ "job_id": ticket.job_id, "op": op }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.plot_z_profile" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.z_profile".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "Z-axis profile started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.z_profile" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.statistics" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.statistics".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "stack statistics started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.statistics" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.make_substack" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.substack".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "substack started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.substack" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.reslice" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.reslice".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "reslice started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.reslice" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.z_project" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.z_project".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "Z projection started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.z_project" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.make_montage" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.montage".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "montage started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.montage" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.montage_to_stack" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.montage_to_stack".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "montage-to-stack started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.montage_to_stack" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.grouped_z_project" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.grouped_z_project".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "grouped Z projection started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.grouped_z_project" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.stacks.reduce" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.stack.reduce".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "stack reduction started",
+                        json!({ "job_id": ticket.job_id, "op": "image.stack.reduce" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "image.transform.flip_horizontal"
             | "image.transform.flip_vertical"
             | "image.transform.flip_z"
@@ -2497,12 +2980,85 @@ impl ImageUiApp {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
+            "image.crop" => {
+                let params = match request.params {
+                    Some(Value::Object(map)) if !map.is_empty() => Value::Object(map),
+                    Some(Value::Null) | None => {
+                        let Some(viewer) = self.viewers_ui.get(window_label) else {
+                            return command_registry::CommandExecuteResult::blocked(
+                                "a loaded image is required for crop",
+                            );
+                        };
+                        let Some((min_x, min_y, max_x, max_y)) = selected_roi_bbox(viewer) else {
+                            return command_registry::CommandExecuteResult::blocked(
+                                "a selection is required for crop",
+                            );
+                        };
+                        json!({
+                            "x": min_x,
+                            "y": min_y,
+                            "width": max_x.saturating_sub(min_x) + 1,
+                            "height": max_y.saturating_sub(min_y) + 1
+                        })
+                    }
+                    Some(other) => other,
+                };
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.crop".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "crop started",
+                        json!({ "job_id": ticket.job_id, "op": "image.crop" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.duplicate" => match self.duplicate_viewer(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.rename" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.rename_viewer(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.scale" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.scale".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "scale started",
+                        json!({ "job_id": ticket.job_id, "op": "image.scale" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "image.transform.results_to_image" => match self.results_to_image() {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
             "process.filters.show_circular_masks" => match self.show_circular_masks() {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.show_info" | "image.properties" => match self.image_info_payload(window_label) {
+                Ok(payload) => command_registry::CommandExecuteResult::with_payload(
+                    "image information complete",
+                    payload,
+                ),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
             "process.smooth"
@@ -2572,6 +3128,40 @@ impl ImageUiApp {
                 ),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
+            "process.enhance_contrast" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "intensity.enhance_contrast".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "enhance contrast started",
+                        json!({ "job_id": ticket.job_id, "op": "intensity.enhance_contrast" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.subtract_background" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.subtract_background".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "subtract background started",
+                        json!({ "job_id": ticket.job_id, "op": "image.subtract_background" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "image.adjust.window_level" => {
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
@@ -2589,7 +3179,7 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
-            "image.adjust.threshold" | "process.binary.make" | "process.binary.convert_mask" => {
+            "image.adjust.threshold" => {
                 match self.viewer_start_op(
                     window_label,
                     ViewerOpRequest {
@@ -2601,6 +3191,23 @@ impl ImageUiApp {
                     Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
                         "binary threshold started",
                         json!({ "job_id": ticket.job_id, "op": "threshold.otsu" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.binary.make" | "process.binary.convert_mask" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "threshold.make_binary".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "binary mask conversion started",
+                        json!({ "job_id": ticket.job_id, "op": "threshold.make_binary" }),
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
@@ -2920,6 +3527,23 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
+            "process.find_maxima" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.find_maxima".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "find maxima started",
+                        json!({ "job_id": ticket.job_id, "op": "image.find_maxima" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "process.fft.swap_quadrants" => match self.viewer_start_op(
                 window_label,
                 ViewerOpRequest {
@@ -2969,40 +3593,51 @@ impl ImageUiApp {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
+            "analyze.set_scale" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.set_scale".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "set scale started",
+                        json!({ "job_id": ticket.job_id, "op": "image.set_scale" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "analyze.histogram" => {
                 let Some(viewer) = self.viewers_ui.get(window_label) else {
                     return command_registry::CommandExecuteResult::blocked(
                         "a loaded image is required for histogram",
                     );
                 };
-                let request = ViewerFrameRequest {
-                    z: viewer.z,
-                    t: viewer.t,
-                    channel: viewer.channel,
-                };
-                match self.active_dataset_slice(window_label, &request) {
-                    Ok(slice) => {
-                        let (min, max) = min_max(&slice.values);
-                        let span = (max - min).max(f32::EPSILON);
-                        let mut bins = vec![0u64; 256];
-                        for value in &slice.values {
-                            let normalized = ((*value - min) / span).clamp(0.0, 1.0);
-                            let bin = (normalized * 255.0).round() as usize;
-                            bins[bin] += 1;
-                        }
-                        command_registry::CommandExecuteResult::with_payload(
-                            "histogram complete",
-                            json!({
-                                "min": min,
-                                "max": max,
-                                "bins": bins,
-                                "pixelCount": slice.values.len(),
-                                "z": viewer.z,
-                                "t": viewer.t,
-                                "channel": viewer.channel
-                            }),
-                        )
-                    }
+                let mut params =
+                    command_registry::merge_params(&request.command_id, request.params);
+                if let Some(map) = params.as_object_mut() {
+                    map.entry("z".to_string())
+                        .or_insert_with(|| json!(viewer.z));
+                    map.entry("t".to_string())
+                        .or_insert_with(|| json!(viewer.t));
+                    map.entry("channel".to_string())
+                        .or_insert_with(|| json!(viewer.channel));
+                }
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "measurements.histogram".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "histogram started",
+                        json!({ "job_id": ticket.job_id, "op": "measurements.histogram" }),
+                    ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
@@ -3010,6 +3645,23 @@ impl ImageUiApp {
                 self.desktop_state.utility_windows.measurements_open = true;
                 self.persist_desktop_state();
                 command_registry::CommandExecuteResult::ok("measurement settings opened")
+            }
+            "analyze.summarize" => match self.summarize_results() {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "analyze.distribution" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.results_distribution_payload(&params) {
+                    Ok(payload) => command_registry::CommandExecuteResult::with_payload(
+                        "distribution complete",
+                        payload,
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "analyze.clear_results" => {
+                command_registry::CommandExecuteResult::ok(self.clear_results())
             }
             "analyze.tools.results" => {
                 self.desktop_state.utility_windows.results_open = true;
@@ -3021,10 +3673,31 @@ impl ImageUiApp {
                 self.persist_desktop_state();
                 command_registry::CommandExecuteResult::ok("ROI manager opened")
             }
-            "analyze.plot_profile" => match self.build_profile_plot(window_label) {
-                Ok(message) => command_registry::CommandExecuteResult::ok(message),
-                Err(error) => command_registry::CommandExecuteResult::blocked(error),
-            },
+            "analyze.plot_profile" => {
+                let params = match self
+                    .viewers_ui
+                    .get(window_label)
+                    .ok_or_else(|| "a loaded image is required for plot profile".to_string())
+                    .and_then(|viewer| selected_roi_profile_params(viewer, request.params.as_ref()))
+                {
+                    Ok(params) => params,
+                    Err(error) => return command_registry::CommandExecuteResult::blocked(error),
+                };
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "measurements.profile".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "profile plot started",
+                        json!({ "job_id": ticket.job_id, "op": "measurements.profile" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "analyze.analyze_particles" => match self.analyze_particles(window_label) {
                 Ok(message) => command_registry::CommandExecuteResult::ok(message),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
@@ -3144,7 +3817,10 @@ impl ImageUiApp {
         std::thread::spawn(move || {
             let result = ops_service
                 .execute(&op_name, input_dataset.as_ref(), &params)
-                .map(|output| Arc::new(output.dataset))
+                .map(|output| OpRunOutput {
+                    dataset: Arc::new(output.dataset),
+                    measurements: output.measurements,
+                })
                 .map_err(|error| error.to_string());
 
             let _ = tx.send(WorkerEvent::OpFinished {
@@ -3544,6 +4220,10 @@ impl ImageUiApp {
                         ("Yellow", "tool.dropper.palette.yellow"),
                         ("Cyan", "tool.dropper.palette.cyan"),
                         ("Magenta", "tool.dropper.palette.magenta"),
+                        ("Foreground...", "tool.dropper.palette.foreground"),
+                        ("Background...", "tool.dropper.palette.background"),
+                        ("Colors...", "tool.dropper.palette.colors"),
+                        ("Color Picker...", "tool.dropper.palette.color_picker"),
                     ] {
                         if ui.button(label).clicked() {
                             actions.push(UiAction::Command {
@@ -3802,6 +4482,9 @@ impl ImageUiApp {
         self.draw_new_image_dialog(ctx, actions);
         self.draw_resize_dialog(ctx, actions, false);
         self.draw_resize_dialog(ctx, actions, true);
+        self.draw_stack_position_dialog(ctx, actions);
+        self.draw_zoom_set_dialog(ctx, actions);
+        self.draw_color_dialog(ctx);
         self.draw_raw_import_dialog(ctx);
         self.draw_url_import_dialog(ctx, actions);
         self.draw_results_window(ctx);
@@ -3892,6 +4575,176 @@ impl ImageUiApp {
                 }
             });
         dialog.open = open;
+    }
+
+    fn draw_stack_position_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.stack_position_dialog.open {
+            return;
+        }
+        let target = self.stack_position_dialog.window_label.clone();
+        let summary = self
+            .state
+            .label_to_session
+            .get(&target)
+            .map(|session| session.committed_summary.clone());
+        let mut open = self.stack_position_dialog.open;
+        egui::Window::new("Set Position")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if let Some(summary) = &summary {
+                    ui.add(
+                        egui::DragValue::new(&mut self.stack_position_dialog.channel)
+                            .prefix("Channel ")
+                            .range(1..=summary.channels.max(1)),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.stack_position_dialog.slice)
+                            .prefix("Slice ")
+                            .range(1..=summary.z_slices.max(1)),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.stack_position_dialog.frame)
+                            .prefix("Frame ")
+                            .range(1..=summary.times.max(1)),
+                    );
+                    if ui.button("Apply").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: target.clone(),
+                            command_id: "image.stacks.set".to_string(),
+                            params: Some(json!({
+                                "channel": self.stack_position_dialog.channel,
+                                "slice": self.stack_position_dialog.slice,
+                                "frame": self.stack_position_dialog.frame,
+                            })),
+                        });
+                        self.stack_position_dialog.open = false;
+                    }
+                } else {
+                    ui.label("No active stack.");
+                }
+            });
+        self.stack_position_dialog.open = open && self.stack_position_dialog.open;
+    }
+
+    fn draw_zoom_set_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.zoom_set_dialog.open {
+            return;
+        }
+        let target = self.zoom_set_dialog.window_label.clone();
+        let mut open = self.zoom_set_dialog.open;
+        egui::Window::new("Set Zoom")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.zoom_set_dialog.zoom_percent)
+                        .prefix("Zoom ")
+                        .suffix("%")
+                        .speed(1.0)
+                        .range(1.0..=3200.0),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.zoom_set_dialog.x_center)
+                        .prefix("X center ")
+                        .speed(1.0),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.zoom_set_dialog.y_center)
+                        .prefix("Y center ")
+                        .speed(1.0),
+                );
+                if ui.button("Apply").clicked() {
+                    actions.push(UiAction::Command {
+                        window_label: target.clone(),
+                        command_id: "image.zoom.set".to_string(),
+                        params: Some(json!({
+                            "zoom_percent": self.zoom_set_dialog.zoom_percent,
+                            "x": self.zoom_set_dialog.x_center,
+                            "y": self.zoom_set_dialog.y_center,
+                        })),
+                    });
+                    self.zoom_set_dialog.open = false;
+                }
+            });
+        self.zoom_set_dialog.open = open && self.zoom_set_dialog.open;
+    }
+
+    fn draw_color_dialog(&mut self, ctx: &egui::Context) {
+        if !self.color_dialog.open {
+            return;
+        }
+        let title = match self.color_dialog.mode {
+            ColorDialogMode::Colors => "Colors",
+            ColorDialogMode::Foreground => "Select Foreground Color",
+            ColorDialogMode::Background => "Select Background Color",
+            ColorDialogMode::Picker => "Color Picker",
+        };
+        let mut open = self.color_dialog.open;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new(title).open(&mut open).show(ctx, |ui| {
+            match self.color_dialog.mode {
+                ColorDialogMode::Colors => {
+                    named_color_combo(ui, "Foreground", &mut self.color_dialog.foreground);
+                    named_color_combo(ui, "Background", &mut self.color_dialog.background);
+                }
+                ColorDialogMode::Foreground => {
+                    ui.horizontal(|ui| {
+                        ui.label("Foreground");
+                        egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut self.color_dialog.foreground,
+                            egui::color_picker::Alpha::Opaque,
+                        );
+                    });
+                }
+                ColorDialogMode::Background => {
+                    ui.horizontal(|ui| {
+                        ui.label("Background");
+                        egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut self.color_dialog.background,
+                            egui::color_picker::Alpha::Opaque,
+                        );
+                    });
+                }
+                ColorDialogMode::Picker => {
+                    ui.horizontal(|ui| {
+                        ui.label("Foreground");
+                        egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut self.color_dialog.foreground,
+                            egui::color_picker::Alpha::Opaque,
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Background");
+                        egui::color_picker::color_edit_button_srgba(
+                            ui,
+                            &mut self.color_dialog.background,
+                            egui::color_picker::Alpha::Opaque,
+                        );
+                    });
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if apply {
+            self.tool_options.foreground_color = self.color_dialog.foreground;
+            self.tool_options.background_color = self.color_dialog.background;
+            self.color_dialog.open = false;
+        } else if cancel {
+            self.color_dialog.open = false;
+        } else {
+            self.color_dialog.open = open;
+        }
     }
 
     fn draw_raw_import_dialog(&mut self, ctx: &egui::Context) {
@@ -5211,7 +6064,30 @@ fn apply_zoom_command(
                 }
             }
         }
-        ZoomCommand::Set => {}
+        ZoomCommand::Set {
+            magnification,
+            x_center,
+            y_center,
+        } => {
+            let center = egui::pos2(
+                x_center
+                    .unwrap_or(viewer.transform.src_rect.x + viewer.transform.src_rect.width * 0.5),
+                y_center.unwrap_or(
+                    viewer.transform.src_rect.y + viewer.transform.src_rect.height * 0.5,
+                ),
+            );
+            let pointer = viewer.transform.image_to_screen(image_rect, center);
+            viewer.transform.set_magnification_at_with_viewport(
+                image_rect,
+                viewport_rect,
+                pointer,
+                magnification,
+                frame.width,
+                frame.height,
+            );
+            viewer.zoom = viewer.transform.magnification;
+            viewer.pan = egui::Vec2::ZERO;
+        }
         ZoomCommand::Maximize => {
             let src_rect = interaction::transform::SourceRect {
                 x: viewer.transform.src_rect.x,
@@ -5663,6 +6539,112 @@ fn value_to_display(value: &Value) -> String {
     }
 }
 
+fn measurement_rows_from_table(table: &MeasurementTable) -> Vec<BTreeMap<String, Value>> {
+    if let Some(rows) = table.values.get("rows").and_then(Value::as_array) {
+        let parsed = rows
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|row| {
+                row.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    if table.values.is_empty() {
+        Vec::new()
+    } else {
+        vec![table.values.clone()]
+    }
+}
+
+fn profile_samples_from_table(table: &MeasurementTable) -> Option<Vec<f32>> {
+    let samples = table.values.get("profile")?.as_array()?;
+    Some(
+        samples
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(|value| value as f32)
+            .collect(),
+    )
+}
+
+fn named_color_combo(ui: &mut egui::Ui, label: &str, color: &mut egui::Color32) {
+    egui::ComboBox::from_label(label)
+        .selected_text(imagej_color_to_string(*color))
+        .show_ui(ui, |ui| {
+            for (name, option) in imagej_named_colors() {
+                ui.selectable_value(color, option, name);
+            }
+        });
+}
+
+fn imagej_named_colors() -> [(&'static str, egui::Color32); 13] {
+    [
+        ("Red", egui::Color32::from_rgb(255, 0, 0)),
+        ("Green", egui::Color32::from_rgb(0, 255, 0)),
+        ("Blue", egui::Color32::from_rgb(0, 0, 255)),
+        ("Magenta", egui::Color32::from_rgb(255, 0, 255)),
+        ("Cyan", egui::Color32::from_rgb(0, 255, 255)),
+        ("Yellow", egui::Color32::from_rgb(255, 255, 0)),
+        ("Orange", egui::Color32::from_rgb(255, 200, 0)),
+        ("Black", egui::Color32::from_rgb(0, 0, 0)),
+        ("White", egui::Color32::from_rgb(255, 255, 255)),
+        ("Gray", egui::Color32::from_rgb(128, 128, 128)),
+        ("lightGray", egui::Color32::from_rgb(192, 192, 192)),
+        ("darkGray", egui::Color32::from_rgb(64, 64, 64)),
+        ("Pink", egui::Color32::from_rgb(255, 175, 175)),
+    ]
+}
+
+#[cfg(test)]
+fn imagej_color_from_name(name: &str) -> Option<egui::Color32> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("black") {
+        Some(egui::Color32::from_rgb(0, 0, 0))
+    } else if name.contains("white") {
+        Some(egui::Color32::from_rgb(255, 255, 255))
+    } else if name.contains("red") {
+        Some(egui::Color32::from_rgb(255, 0, 0))
+    } else if name.contains("blue") {
+        Some(egui::Color32::from_rgb(0, 0, 255))
+    } else if name.contains("yellow") {
+        Some(egui::Color32::from_rgb(255, 255, 0))
+    } else if name.contains("green") {
+        Some(egui::Color32::from_rgb(0, 255, 0))
+    } else if name.contains("magenta") {
+        Some(egui::Color32::from_rgb(255, 0, 255))
+    } else if name.contains("cyan") {
+        Some(egui::Color32::from_rgb(0, 255, 255))
+    } else if name.contains("orange") {
+        Some(egui::Color32::from_rgb(255, 200, 0))
+    } else if name.contains("pink") {
+        Some(egui::Color32::from_rgb(255, 175, 175))
+    } else if name.contains("gray") || name.contains("grey") {
+        if name.contains("light") {
+            Some(egui::Color32::from_rgb(192, 192, 192))
+        } else if name.contains("dark") {
+            Some(egui::Color32::from_rgb(64, 64, 64))
+        } else {
+            Some(egui::Color32::from_rgb(128, 128, 128))
+        }
+    } else {
+        None
+    }
+}
+
+fn imagej_color_to_string(color: egui::Color32) -> String {
+    for (name, option) in imagej_named_colors() {
+        if color == option {
+            return name.to_string();
+        }
+    }
+    format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
 fn value_to_csv(value: &Value) -> String {
     let text = value_to_display(value);
     if text.contains(',') || text.contains('"') {
@@ -5713,6 +6695,172 @@ fn selected_roi_bbox(viewer: &ViewerUiState) -> Option<(usize, usize, usize, usi
         .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
         .or(viewer.rois.active_roi.as_ref())?;
     roi_kind_bbox(&roi.kind)
+}
+
+fn selected_roi_profile_params(
+    viewer: &ViewerUiState,
+    base_params: Option<&Value>,
+) -> Result<Value, String> {
+    let mut params = base_params
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    params.insert("z".to_string(), json!(viewer.z));
+    params.insert("time".to_string(), json!(viewer.t));
+    params.insert("channel".to_string(), json!(viewer.channel));
+
+    let explicit_selection = ["left", "top", "width", "height", "x0", "y0", "x1", "y1"]
+        .iter()
+        .any(|key| params.get(*key).is_some_and(|value| !value.is_null()));
+    if explicit_selection {
+        return Ok(Value::Object(params));
+    }
+
+    let roi = viewer
+        .rois
+        .selected_roi_id
+        .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
+        .or(viewer.rois.active_roi.as_ref())
+        .ok_or_else(|| "Plot Profile requires a line or rectangular selection".to_string())?;
+
+    match &roi.kind {
+        RoiKind::Rect { .. } => {
+            let (min_x, min_y, max_x, max_y) = roi_kind_bbox(&roi.kind)
+                .ok_or_else(|| "Plot Profile requires a valid rectangular selection".to_string())?;
+            params.insert("left".to_string(), json!(min_x));
+            params.insert("top".to_string(), json!(min_y));
+            params.insert(
+                "width".to_string(),
+                json!(max_x.saturating_sub(min_x).saturating_add(1)),
+            );
+            params.insert(
+                "height".to_string(),
+                json!(max_y.saturating_sub(min_y).saturating_add(1)),
+            );
+        }
+        RoiKind::Line { start, end, .. } => {
+            params.insert("x0".to_string(), json!(start.x));
+            params.insert("y0".to_string(), json!(start.y));
+            params.insert("x1".to_string(), json!(end.x));
+            params.insert("y1".to_string(), json!(end.y));
+        }
+        _ => {
+            return Err("Plot Profile requires a line or rectangular selection".to_string());
+        }
+    }
+
+    Ok(Value::Object(params))
+}
+
+fn stack_position_from_params(
+    params: &Value,
+    current_channel: usize,
+    current_z: usize,
+    current_t: usize,
+    channels: usize,
+    z_slices: usize,
+    times: usize,
+) -> Result<(usize, usize, usize), String> {
+    if channels == 0 || z_slices == 0 || times == 0 {
+        return Err("set slice requires a non-empty image".to_string());
+    }
+
+    if !has_stack_position_param(params) {
+        return Err("set slice requires `slice`, `channel` or `frame`".to_string());
+    }
+
+    let channel = one_based_index_param(params, &["channel", "c"], channels, "channel")?;
+    let z = one_based_index_param(params, &["slice", "z"], z_slices, "slice")?;
+    let t = one_based_index_param(params, &["frame", "time", "t"], times, "frame")?;
+
+    Ok((
+        channel.unwrap_or_else(|| current_channel.min(channels - 1)),
+        z.unwrap_or_else(|| current_z.min(z_slices - 1)),
+        t.unwrap_or_else(|| current_t.min(times - 1)),
+    ))
+}
+
+fn has_stack_position_param(params: &Value) -> bool {
+    ["channel", "c", "slice", "z", "frame", "time", "t"]
+        .iter()
+        .any(|key| params.get(*key).is_some_and(|value| !value.is_null()))
+}
+
+fn zoom_set_params(params: &Value) -> Result<(f32, Option<f32>, Option<f32>), String> {
+    let Some(percent) = optional_f32_param_any(params, &["zoom_percent", "zoom", "percent"])?
+    else {
+        return Err("set zoom requires `zoom_percent`".to_string());
+    };
+    if percent <= 0.0 {
+        return Err("`zoom_percent` must be positive".to_string());
+    }
+    let magnification = (percent / 100.0).clamp(
+        interaction::transform::MIN_MAGNIFICATION,
+        interaction::transform::MAX_MAGNIFICATION,
+    );
+    let x = optional_f32_param_any(params, &["x", "x_center"])?;
+    let y = optional_f32_param_any(params, &["y", "y_center"])?;
+    if x.is_some() != y.is_some() {
+        return Err("set zoom requires both `x` and `y` center coordinates".to_string());
+    }
+    Ok((magnification, x, y))
+}
+
+fn has_zoom_set_param(params: &Value) -> bool {
+    [
+        "zoom_percent",
+        "zoom",
+        "percent",
+        "x",
+        "x_center",
+        "y",
+        "y_center",
+    ]
+    .iter()
+    .any(|key| params.get(*key).is_some_and(|value| !value.is_null()))
+}
+
+fn optional_f32_param_any(params: &Value, keys: &[&str]) -> Result<Option<f32>, String> {
+    for key in keys {
+        let Some(value) = params.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let Some(value) = value.as_f64() else {
+            return Err(format!("`{key}` must be a number"));
+        };
+        if !value.is_finite() {
+            return Err(format!("`{key}` must be finite"));
+        }
+        return Ok(Some(value as f32));
+    }
+    Ok(None)
+}
+
+fn one_based_index_param(
+    params: &Value,
+    keys: &[&str],
+    max: usize,
+    label: &str,
+) -> Result<Option<usize>, String> {
+    for key in keys {
+        let Some(value) = params.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let Some(index) = value.as_u64() else {
+            return Err(format!("`{label}` must be a positive integer"));
+        };
+        if index == 0 || index as usize > max {
+            return Err(format!("`{label}` must be between 1 and {max}"));
+        }
+        return Ok(Some(index as usize - 1));
+    }
+    Ok(None)
 }
 
 fn roi_kind_bbox(kind: &RoiKind) -> Option<(usize, usize, usize, usize)> {
@@ -5978,6 +7126,117 @@ fn results_rows_to_dataset(rows: &[BTreeMap<String, Value>]) -> Result<DatasetF3
     Dataset::new(data, metadata).map_err(|error| error.to_string())
 }
 
+fn results_summary_rows(
+    rows: &[BTreeMap<String, Value>],
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    if rows.len() < 2 {
+        return Err("at least two results rows are required to summarize".to_string());
+    }
+    if rows
+        .last()
+        .and_then(|row| row.get("Label"))
+        .and_then(Value::as_str)
+        == Some("Max")
+    {
+        return Err("results table is already summarized".to_string());
+    }
+
+    let columns = numeric_results_columns(rows);
+    if columns.is_empty() {
+        return Err("results table has no numeric columns".to_string());
+    }
+
+    let mut summary = ["Mean", "SD", "Min", "Max"]
+        .into_iter()
+        .map(|label| {
+            let mut row = BTreeMap::new();
+            row.insert("Label".to_string(), json!(label));
+            row
+        })
+        .collect::<Vec<_>>();
+
+    for column in columns {
+        let values = rows
+            .iter()
+            .filter_map(|row| row.get(&column).and_then(Value::as_f64))
+            .collect::<Vec<_>>();
+        if values.len() < 2 {
+            continue;
+        }
+        let count = values.len() as f64;
+        let sum = values.iter().sum::<f64>();
+        let sum2 = values.iter().map(|value| value * value).sum::<f64>();
+        let mean = sum / count;
+        let variance = ((sum2 - sum * sum / count) / (count - 1.0)).max(0.0);
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        summary[0].insert(column.clone(), json!(mean));
+        summary[1].insert(column.clone(), json!(variance.sqrt()));
+        summary[2].insert(column.clone(), json!(min));
+        summary[3].insert(column, json!(max));
+    }
+
+    Ok(summary)
+}
+
+fn results_distribution(
+    rows: &[BTreeMap<String, Value>],
+    column: Option<&str>,
+    bins: usize,
+) -> Result<Value, String> {
+    if bins == 0 {
+        return Err("distribution bins must be > 0".to_string());
+    }
+    let columns = numeric_results_columns(rows);
+    let column = match column {
+        Some(column) if columns.iter().any(|candidate| candidate == column) => column.to_string(),
+        Some(column) => return Err(format!("results table has no numeric column `{column}`")),
+        None => columns
+            .first()
+            .cloned()
+            .ok_or_else(|| "results table has no numeric columns".to_string())?,
+    };
+    let values = rows
+        .iter()
+        .filter_map(|row| row.get(&column).and_then(Value::as_f64))
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(format!("results column `{column}` has no finite values"));
+    }
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (max - min).max(f64::EPSILON);
+    let mut counts = vec![0_u64; bins];
+    for value in &values {
+        let mut bin = (((*value - min) / span) * bins as f64).floor() as usize;
+        if bin >= bins {
+            bin = bins - 1;
+        }
+        counts[bin] += 1;
+    }
+    let bin_width = span / bins as f64;
+    let bins_payload = counts
+        .iter()
+        .enumerate()
+        .map(|(index, count)| {
+            json!({
+                "min": min + bin_width * index as f64,
+                "max": if index + 1 == bins { max } else { min + bin_width * (index + 1) as f64 },
+                "count": count
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "column": column,
+        "count": values.len(),
+        "min": min,
+        "max": max,
+        "bins": bins_payload
+    }))
+}
+
 fn create_circular_masks_dataset() -> Result<DatasetF32, String> {
     const WIDTH: usize = 150;
     const HEIGHT: usize = 150;
@@ -6071,50 +7330,6 @@ fn clamped_bbox(
         return None;
     }
     Some((min_x, min_y, max_x, max_y))
-}
-
-fn mean_profile_rect(
-    values: &[f32],
-    width: usize,
-    min_x: usize,
-    min_y: usize,
-    max_x: usize,
-    max_y: usize,
-) -> Vec<f32> {
-    let row_count = max_y.saturating_sub(min_y) + 1;
-    let mut output = Vec::new();
-    for x in min_x..=max_x {
-        let mut sum = 0.0;
-        for y in min_y..=max_y {
-            sum += values[x + y * width];
-        }
-        output.push(sum / row_count as f32);
-    }
-    output
-}
-
-fn sample_line_profile(
-    values: &[f32],
-    width: usize,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-) -> Vec<f32> {
-    let steps = ((x1 - x0).hypot(y1 - y0)).round().max(1.0) as usize;
-    let height = values.len() / width;
-    let mut output = Vec::with_capacity(steps + 1);
-    for step in 0..=steps {
-        let t = step as f32 / steps.max(1) as f32;
-        let x = x0 + (x1 - x0) * t;
-        let y = y0 + (y1 - y0) * t;
-        let x_clamped = x.clamp(0.0, width.saturating_sub(1) as f32);
-        let y_clamped = y.clamp(0.0, height.saturating_sub(1) as f32);
-        let x_floor = x_clamped.floor() as usize;
-        let y_floor = y_clamped.floor() as usize;
-        output.push(values[x_floor + y_floor * width]);
-    }
-    output
 }
 
 fn canonical_json(value: &Value) -> Value {
@@ -6497,6 +7712,41 @@ fn normalize_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(&absolute).unwrap_or(absolute)
 }
 
+fn renamed_image_path(current_path: &Path, title: &str) -> PathBuf {
+    let sanitized = sanitize_image_title(title);
+    let extension = current_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or("tif");
+    let file_name = if Path::new(&sanitized).extension().is_some() {
+        sanitized
+    } else {
+        format!("{sanitized}.{extension}")
+    };
+    current_path
+        .parent()
+        .map(|parent| parent.join(&file_name))
+        .unwrap_or_else(|| PathBuf::from(file_name))
+}
+
+fn sanitize_image_title(title: &str) -> String {
+    let sanitized = title
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '\0' => '_',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        "Untitled".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn viewport_id_for_label(label: &str) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(format!("viewport-{label}"))
 }
@@ -6534,14 +7784,14 @@ pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     use crate::model::{AxisKind, DatasetF32, PixelType};
     use crate::ui::interaction::transform::ViewerTransformState;
     use eframe::egui;
     use ndarray::{Array, IxDyn};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         HoverInfo, ImageSummary, LauncherStatusModel, NativeRasterImage, ProgressState,
@@ -6550,10 +7800,12 @@ mod tests {
         ZoomCommand, apply_zoom_command, build_frame, canonical_json, centered_circular_roi,
         compute_initial_viewport_size, compute_viewer_frame, create_circular_masks_dataset,
         dominant_scroll_component, effective_scroll_delta, format_launcher_status, image_draw_rect,
-        image_slice_to_results_rows, initialize_view_to_open_state, line_width_from_params,
-        preview_cache_key, results_rows_to_dataset, roi_stroke_width,
-        should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
-        tool_from_command_id, tool_shortcut_command, viewer_sort_key,
+        image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
+        initialize_view_to_open_state, line_width_from_params, preview_cache_key,
+        renamed_image_path, results_distribution, results_rows_to_dataset, results_summary_rows,
+        roi_stroke_width, sanitize_image_title, should_request_periodic_repaint,
+        should_request_repaint_now, source_ptr_eq, stack_position_from_params,
+        tool_from_command_id, tool_shortcut_command, viewer_sort_key, zoom_set_params,
     };
 
     fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
@@ -6617,6 +7869,68 @@ mod tests {
     }
 
     #[test]
+    fn stack_position_from_params_uses_imagej_one_based_indices() {
+        let position = stack_position_from_params(
+            &json!({"channel": 2, "slice": 3, "frame": 4}),
+            0,
+            0,
+            0,
+            3,
+            5,
+            6,
+        )
+        .expect("position");
+
+        assert_eq!(position, (1, 2, 3));
+    }
+
+    #[test]
+    fn stack_position_from_params_keeps_unspecified_axes_and_validates_bounds() {
+        let position =
+            stack_position_from_params(&json!({"slice": 2}), 1, 3, 4, 3, 5, 6).expect("position");
+
+        assert_eq!(position, (1, 1, 4));
+        assert!(stack_position_from_params(&json!({}), 0, 0, 0, 1, 1, 1).is_err());
+        assert!(stack_position_from_params(&json!({"slice": 0}), 0, 0, 0, 1, 3, 1).is_err());
+        assert!(stack_position_from_params(&json!({"slice": 4}), 0, 0, 0, 1, 3, 1).is_err());
+    }
+
+    #[test]
+    fn zoom_set_params_accepts_percent_and_optional_center() {
+        let params = zoom_set_params(&json!({"zoom_percent": 250.0, "x": 10.0, "y": 20.0}))
+            .expect("zoom params");
+
+        assert_eq!(params, (2.5, Some(10.0), Some(20.0)));
+    }
+
+    #[test]
+    fn zoom_set_params_validates_percent_and_paired_center() {
+        assert!(zoom_set_params(&json!({})).is_err());
+        assert!(zoom_set_params(&json!({"zoom_percent": 0.0})).is_err());
+        assert!(zoom_set_params(&json!({"zoom_percent": 100.0, "x": 10.0})).is_err());
+    }
+
+    #[test]
+    fn imagej_color_helpers_match_named_colors_and_hex_fallback() {
+        assert_eq!(
+            imagej_color_from_name("lightGray"),
+            Some(egui::Color32::from_rgb(192, 192, 192))
+        );
+        assert_eq!(
+            imagej_color_from_name("grey"),
+            Some(egui::Color32::from_rgb(128, 128, 128))
+        );
+        assert_eq!(
+            imagej_color_to_string(egui::Color32::from_rgb(255, 255, 0)),
+            "Yellow"
+        );
+        assert_eq!(
+            imagej_color_to_string(egui::Color32::from_rgb(1, 2, 3)),
+            "#010203"
+        );
+    }
+
+    #[test]
     fn roi_stroke_width_uses_line_width_and_selection_emphasis() {
         assert_eq!(roi_stroke_width(3.0, false), 3.0);
         assert_eq!(roi_stroke_width(3.0, true), 3.5);
@@ -6676,6 +7990,89 @@ mod tests {
         row.insert("Name".to_string(), json!("cell"));
         let error = results_rows_to_dataset(&[row]).expect_err("non-numeric results");
         assert!(error.contains("no numeric columns"));
+    }
+
+    #[test]
+    fn results_summary_rows_adds_imagej_mean_sd_min_max_rows() {
+        let mut row0 = BTreeMap::new();
+        row0.insert("Label".to_string(), json!("cell-1"));
+        row0.insert("Area".to_string(), json!(2.0));
+        row0.insert("Mean".to_string(), json!(4.0));
+        let mut row1 = BTreeMap::new();
+        row1.insert("Label".to_string(), json!("cell-2"));
+        row1.insert("Area".to_string(), json!(4.0));
+        row1.insert("Mean".to_string(), json!(8.0));
+
+        let summary = results_summary_rows(&[row0, row1]).expect("summary rows");
+
+        assert_eq!(summary.len(), 4);
+        assert_eq!(summary[0].get("Label"), Some(&json!("Mean")));
+        assert_eq!(summary[0].get("Area"), Some(&json!(3.0)));
+        assert_eq!(summary[0].get("Mean"), Some(&json!(6.0)));
+        assert_eq!(summary[2].get("Area"), Some(&json!(2.0)));
+        assert_eq!(summary[3].get("Mean"), Some(&json!(8.0)));
+        let sd = summary[1].get("Area").and_then(Value::as_f64).unwrap();
+        assert!((sd - 2.0_f64.sqrt()).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn results_summary_rows_rejects_small_or_already_summarized_tables() {
+        let mut row = BTreeMap::new();
+        row.insert("Area".to_string(), json!(2.0));
+        assert!(results_summary_rows(&[row.clone()]).is_err());
+
+        row.insert("Label".to_string(), json!("Max"));
+        let mut row0 = BTreeMap::new();
+        row0.insert("Area".to_string(), json!(1.0));
+        let error = results_summary_rows(&[row0, row]).expect_err("already summarized");
+        assert!(error.contains("already summarized"));
+    }
+
+    #[test]
+    fn results_distribution_bins_numeric_results_column() {
+        let rows = [1.0, 2.0, 3.0, 4.0]
+            .into_iter()
+            .map(|value| {
+                let mut row = BTreeMap::new();
+                row.insert("Area".to_string(), json!(value));
+                row
+            })
+            .collect::<Vec<_>>();
+
+        let distribution = results_distribution(&rows, Some("Area"), 2).expect("distribution");
+
+        assert_eq!(distribution.get("column"), Some(&json!("Area")));
+        assert_eq!(distribution.get("count"), Some(&json!(4)));
+        let bins = distribution
+            .get("bins")
+            .and_then(Value::as_array)
+            .expect("bins");
+        assert_eq!(bins[0].get("count"), Some(&json!(2)));
+        assert_eq!(bins[1].get("count"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn results_distribution_rejects_missing_column_or_zero_bins() {
+        let mut row = BTreeMap::new();
+        row.insert("Area".to_string(), json!(2.0));
+
+        assert!(results_distribution(&[row.clone()], Some("Mean"), 10).is_err());
+        assert!(results_distribution(&[row], None, 0).is_err());
+    }
+
+    #[test]
+    fn renamed_image_path_preserves_parent_and_extension() {
+        let path = renamed_image_path(Path::new("/tmp/source.tif"), "Renamed Image");
+        assert_eq!(path, PathBuf::from("/tmp/Renamed Image.tif"));
+
+        let explicit = renamed_image_path(Path::new("/tmp/source.tif"), "renamed.png");
+        assert_eq!(explicit, PathBuf::from("/tmp/renamed.png"));
+    }
+
+    #[test]
+    fn sanitize_image_title_replaces_path_separators() {
+        assert_eq!(sanitize_image_title("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_image_title("   "), "Untitled");
     }
 
     #[test]
@@ -7037,6 +8434,40 @@ mod tests {
             &frame,
         );
         assert!((viewer.transform.magnification - initial).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn set_zoom_applies_exact_magnification_around_image_center() {
+        let canvas = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let frame = ViewerFrameBuffer {
+            width: 1200,
+            height: 300,
+            values: vec![0.0; 1200 * 300],
+            pixels_u8: vec![0; 1200 * 300],
+            min: 0.0,
+            max: 0.0,
+        };
+        let mut viewer = ViewerUiState::new("viewer-1", "Test".to_string());
+        initialize_view_to_open_state(&mut viewer, canvas, frame.width, frame.height);
+        let image_rect = image_draw_rect(canvas, &viewer.transform, frame.width, frame.height);
+
+        apply_zoom_command(
+            &mut viewer,
+            ZoomCommand::Set {
+                magnification: 2.0,
+                x_center: Some(600.0),
+                y_center: Some(150.0),
+            },
+            canvas,
+            image_rect,
+            &frame,
+        );
+
+        assert!((viewer.transform.magnification - 2.0).abs() < f32::EPSILON);
+        assert!((viewer.transform.src_rect.x - 500.0).abs() < f32::EPSILON);
+        assert!((viewer.transform.src_rect.y - 75.0).abs() < f32::EPSILON);
+        assert!((viewer.transform.src_rect.width - 200.0).abs() < f32::EPSILON);
+        assert!((viewer.transform.src_rect.height - 150.0).abs() < f32::EPSILON);
     }
 
     #[test]

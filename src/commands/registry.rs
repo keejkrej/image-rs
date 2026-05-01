@@ -6,17 +6,21 @@ use serde_json::Value;
 
 use super::{
     ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCanvasResizeOp, ImageConvertOp,
-    ImageConvolveOp, ImageCoordinatesOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp,
-    ImageFindEdgesOp, ImageFlipOp, ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp,
-    ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp,
-    ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp, ImageSwapQuadrantsOp, ImageTranslateOp,
-    ImageUnsharpMaskOp, IntensityInvertOp, IntensityMathOp, IntensityNaNBackgroundOp,
-    IntensityNormalizeOp, IntensityWindowOp, MeasurementsSummaryOp, MorphologyBinaryMedianOp,
-    MorphologyCloseOp, MorphologyDilateOp, MorphologyDistanceMapOp, MorphologyErodeOp,
-    MorphologyFillHolesOp, MorphologyOpenOp, MorphologyOutlineOp, MorphologySkeletonizeOp,
-    MorphologyUltimatePointsOp, MorphologyVoronoiOp, MorphologyWatershedOp, NoiseGaussianOp,
-    NoiseSaltAndPepperOp, OpOutput, OpSchema, Operation, OpsError, Result, ThresholdFixedOp,
-    ThresholdOtsuOp,
+    ImageConvolveOp, ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp,
+    ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp, ImageMedianFilterOp, ImageRankFilter3dOp,
+    ImageRankFilterOp, ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op,
+    ImageRotateOp, ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp,
+    ImageStackAddSliceOp, ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp,
+    ImageStackMontageOp, ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp,
+    ImageStackStatisticsOp, ImageStackSubstackOp, ImageStackZProfileOp, ImageStackZProjectOp,
+    ImageSubtractBackgroundOp, ImageSwapQuadrantsOp, ImageTranslateOp, ImageUnsharpMaskOp,
+    IntensityEnhanceContrastOp, IntensityInvertOp, IntensityMathOp, IntensityNaNBackgroundOp,
+    IntensityNormalizeOp, IntensityWindowOp, MeasurementsHistogramOp, MeasurementsProfileOp,
+    MeasurementsSummaryOp, MorphologyBinaryMedianOp, MorphologyCloseOp, MorphologyDilateOp,
+    MorphologyDistanceMapOp, MorphologyErodeOp, MorphologyFillHolesOp, MorphologyOpenOp,
+    MorphologyOutlineOp, MorphologySkeletonizeOp, MorphologyUltimatePointsOp, MorphologyVoronoiOp,
+    MorphologyWatershedOp, NoiseGaussianOp, NoiseSaltAndPepperOp, OpOutput, OpSchema, Operation,
+    OpsError, Result, ThresholdFixedOp, ThresholdMakeBinaryOp, ThresholdOtsuOp,
 };
 #[cfg(feature = "morpholib")]
 use super::{
@@ -40,6 +44,7 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| {
         let mut map: Registry = HashMap::new();
         register(&mut map, IntensityNormalizeOp);
+        register(&mut map, IntensityEnhanceContrastOp);
         register(&mut map, IntensityInvertOp);
         register(&mut map, IntensityMathOp);
         register(&mut map, IntensityNaNBackgroundOp);
@@ -47,8 +52,22 @@ fn registry() -> &'static Registry {
         register(&mut map, GaussianBlurOp);
         register(&mut map, ImageConvertOp);
         register(&mut map, ImageResizeOp);
+        register(&mut map, ImageScaleOp);
         register(&mut map, ImageCanvasResizeOp);
+        register(&mut map, ImageCropOp);
         register(&mut map, ImageCoordinatesOp);
+        register(&mut map, ImageSetScaleOp);
+        register(&mut map, ImageStackAddSliceOp);
+        register(&mut map, ImageStackDeleteSliceOp);
+        register(&mut map, ImageStackZProjectOp);
+        register(&mut map, ImageStackMontageOp);
+        register(&mut map, ImageStackMontageToStackOp);
+        register(&mut map, ImageStackGroupedZProjectOp);
+        register(&mut map, ImageStackReduceOp);
+        register(&mut map, ImageStackResliceOp);
+        register(&mut map, ImageStackSubstackOp);
+        register(&mut map, ImageStackZProfileOp);
+        register(&mut map, ImageStackStatisticsOp);
         register(&mut map, ImageBinOp);
         register(&mut map, ImageFlipOp);
         register(&mut map, ImageRotate90Op);
@@ -61,15 +80,20 @@ fn registry() -> &'static Registry {
         register(&mut map, ImageRemoveOutliersOp);
         register(&mut map, ImageSharpenOp);
         register(&mut map, ImageFindEdgesOp);
+        register(&mut map, ImageFindMaximaOp);
         register(&mut map, ImageShadowOp);
         register(&mut map, ImageShadowDemoOp);
+        register(&mut map, ImageSubtractBackgroundOp);
         register(&mut map, ImageUnsharpMaskOp);
         register(&mut map, ImageConvolveOp);
         register(&mut map, ImageSwapQuadrantsOp);
         register(&mut map, ImageFftPowerSpectrumOp);
         register(&mut map, ImageFftBandpassOp);
         register(&mut map, ThresholdFixedOp);
+        register(&mut map, ThresholdMakeBinaryOp);
         register(&mut map, ThresholdOtsuOp);
+        register(&mut map, MeasurementsHistogramOp);
+        register(&mut map, MeasurementsProfileOp);
         register(&mut map, MorphologyErodeOp);
         register(&mut map, MorphologyDilateOp);
         register(&mut map, MorphologyOpenOp);

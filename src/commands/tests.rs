@@ -27,18 +27,33 @@ fn contains_required_operations() {
         .map(|schema| schema.name)
         .collect::<Vec<_>>();
     assert!(names.contains(&"gaussian.blur".to_string()));
+    assert!(names.contains(&"intensity.enhance_contrast".to_string()));
     assert!(names.contains(&"intensity.invert".to_string()));
     assert!(names.contains(&"intensity.math".to_string()));
     assert!(names.contains(&"intensity.nan_background".to_string()));
     assert!(names.contains(&"image.convert".to_string()));
     assert!(names.contains(&"image.resize".to_string()));
     assert!(names.contains(&"image.canvas_resize".to_string()));
+    assert!(names.contains(&"image.crop".to_string()));
     assert!(names.contains(&"image.coordinates".to_string()));
+    assert!(names.contains(&"image.set_scale".to_string()));
     assert!(names.contains(&"image.bin".to_string()));
     assert!(names.contains(&"image.flip".to_string()));
     assert!(names.contains(&"image.median_filter".to_string()));
     assert!(names.contains(&"image.remove_nans".to_string()));
     assert!(names.contains(&"image.remove_outliers".to_string()));
+    assert!(names.contains(&"image.scale".to_string()));
+    assert!(names.contains(&"image.stack.add_slice".to_string()));
+    assert!(names.contains(&"image.stack.delete_slice".to_string()));
+    assert!(names.contains(&"image.stack.grouped_z_project".to_string()));
+    assert!(names.contains(&"image.stack.montage".to_string()));
+    assert!(names.contains(&"image.stack.montage_to_stack".to_string()));
+    assert!(names.contains(&"image.stack.reduce".to_string()));
+    assert!(names.contains(&"image.stack.reslice".to_string()));
+    assert!(names.contains(&"image.stack.statistics".to_string()));
+    assert!(names.contains(&"image.stack.substack".to_string()));
+    assert!(names.contains(&"image.stack.z_profile".to_string()));
+    assert!(names.contains(&"image.stack.z_project".to_string()));
     assert!(names.contains(&"image.rotate_90".to_string()));
     assert!(names.contains(&"image.rotate".to_string()));
     assert!(names.contains(&"image.translate".to_string()));
@@ -51,8 +66,14 @@ fn contains_required_operations() {
     assert!(names.contains(&"image.convolve".to_string()));
     assert!(names.contains(&"image.unsharp_mask".to_string()));
     assert!(names.contains(&"image.find_edges".to_string()));
+    assert!(names.contains(&"image.find_maxima".to_string()));
     assert!(names.contains(&"image.shadow".to_string()));
     assert!(names.contains(&"image.shadow_demo".to_string()));
+    assert!(names.contains(&"image.subtract_background".to_string()));
+    assert!(names.contains(&"threshold.make_binary".to_string()));
+    assert!(names.contains(&"threshold.otsu".to_string()));
+    assert!(names.contains(&"measurements.histogram".to_string()));
+    assert!(names.contains(&"measurements.profile".to_string()));
     assert!(names.contains(&"components.label".to_string()));
     assert!(names.contains(&"noise.gaussian".to_string()));
     assert!(names.contains(&"noise.salt_and_pepper".to_string()));
@@ -98,6 +119,62 @@ fn intensity_invert_uses_float_display_range() {
 
     let values = output.dataset.data.iter().copied().collect::<Vec<_>>();
     assert_eq!(values, vec![8.0, 6.0, 4.0, 2.0]);
+}
+
+#[test]
+fn intensity_enhance_contrast_clips_saturated_tails_and_normalizes() {
+    let dataset = test_dataset(
+        vec![
+            -10.0, 0.0, 1.0, 2.0, //
+            3.0, 4.0, 5.0, 100.0,
+        ],
+        (2, 4),
+    );
+
+    let output = execute_operation(
+        "intensity.enhance_contrast",
+        &dataset,
+        &json!({
+            "saturated_percent": 25.0,
+            "normalize": true
+        }),
+    )
+    .expect("enhance contrast");
+
+    let values = output.dataset.data.iter().copied().collect::<Vec<_>>();
+    assert_eq!(values[0], 0.0);
+    assert_eq!(values[7], 1.0);
+    assert!((values[1] - 0.0).abs() < 1.0e-6);
+    assert!((values[6] - 1.0).abs() < 1.0e-6);
+    assert!((values[3] - 0.4).abs() < 1.0e-6);
+}
+
+#[test]
+fn intensity_enhance_contrast_can_record_display_range_without_changing_pixels() {
+    let dataset = test_dataset(vec![0.0, 1.0, 2.0, 3.0], (2, 2));
+
+    let output = execute_operation(
+        "intensity.enhance_contrast",
+        &dataset,
+        &json!({
+            "saturated_percent": 0.0,
+            "normalize": false
+        }),
+    )
+    .expect("enhance contrast display range");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("display_min"),
+        Some(&json!(0.0))
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("display_max"),
+        Some(&json!(3.0))
+    );
 }
 
 #[test]
@@ -292,6 +369,126 @@ fn image_resize_changes_xy_shape() {
 }
 
 #[test]
+fn image_crop_extracts_xy_bounds_and_preserves_other_axes() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 3, 2]),
+        (0..12).map(|v| v as f32).collect::<Vec<_>>(),
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 3),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.crop",
+        &dataset,
+        &json!({"x": 1, "y": 0, "width": 2, "height": 2}),
+    )
+    .expect("crop");
+
+    assert_eq!(output.dataset.shape(), &[2, 2, 2]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![2.0, 3.0, 4.0, 5.0, 8.0, 9.0, 10.0, 11.0]
+    );
+    assert_eq!(output.dataset.metadata.dims[2].axis, AxisKind::Z);
+    assert_eq!(output.dataset.metadata.dims[2].size, 2);
+}
+
+#[test]
+fn image_crop_updates_calibrated_origin_and_rejects_out_of_bounds() {
+    let mut dataset = test_dataset(
+        vec![
+            1.0, 2.0, 3.0, 4.0, //
+            5.0, 6.0, 7.0, 8.0,
+        ],
+        (2, 4),
+    );
+    dataset.metadata.dims[1].spacing = Some(2.0);
+    dataset.metadata.dims[0].spacing = Some(5.0);
+    dataset
+        .metadata
+        .extras
+        .insert("x_origin_coordinate".to_string(), json!(10.0));
+    dataset
+        .metadata
+        .extras
+        .insert("y_origin_coordinate".to_string(), json!(20.0));
+
+    let output = execute_operation(
+        "image.crop",
+        &dataset,
+        &json!({"x": 1, "y": 1, "width": 2, "height": 1}),
+    )
+    .expect("crop");
+
+    assert_eq!(output.dataset.shape(), &[1, 2]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![6.0, 7.0]
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("x_origin_coordinate"),
+        Some(&json!(12.0))
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("y_origin_coordinate"),
+        Some(&json!(25.0))
+    );
+
+    let error = execute_operation(
+        "image.crop",
+        &dataset,
+        &json!({"x": 3, "y": 0, "width": 2, "height": 1}),
+    )
+    .expect_err("out of bounds");
+    assert!(error.to_string().contains("crop bounds"));
+}
+
+#[test]
+fn image_scale_resizes_by_factor_and_updates_spacing() {
+    let mut dataset = test_dataset(
+        vec![
+            0.0, 1.0, 2.0, //
+            3.0, 4.0, 5.0,
+        ],
+        (2, 3),
+    );
+    dataset.metadata.dims[1].spacing = Some(2.0);
+    dataset.metadata.dims[0].spacing = Some(4.0);
+
+    let output = execute_operation(
+        "image.scale",
+        &dataset,
+        &json!({"x_scale": 2.0, "y_scale": 0.5}),
+    )
+    .expect("scale");
+
+    assert_eq!(output.dataset.shape(), &[1, 6]);
+    assert_eq!(output.dataset.metadata.dims[1].spacing, Some(1.0));
+    assert_eq!(output.dataset.metadata.dims[0].spacing, Some(8.0));
+    let values = output.dataset.data.iter().copied().collect::<Vec<_>>();
+    assert_eq!(values.first().copied(), Some(0.0));
+    assert_eq!(values.last().copied(), Some(2.0));
+}
+
+#[test]
+fn image_scale_rejects_non_positive_factors() {
+    let dataset = test_dataset(vec![0.0, 1.0, 2.0, 3.0], (2, 2));
+
+    let error = execute_operation("image.scale", &dataset, &json!({"x_scale": 0.0}))
+        .expect_err("invalid scale");
+    assert!(error.to_string().contains("x_scale"));
+}
+
+#[test]
 fn image_coordinates_updates_spacing_units_and_origin_metadata() {
     let dataset = test_dataset(
         vec![
@@ -349,6 +546,98 @@ fn image_coordinates_rejects_incomplete_or_degenerate_bounds() {
     )
     .expect_err("degenerate bounds");
     assert!(degenerate.to_string().contains("right"));
+}
+
+#[test]
+fn image_set_scale_updates_xy_calibration_metadata() {
+    let dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+
+    let output = execute_operation(
+        "image.set_scale",
+        &dataset,
+        &json!({
+            "distance_pixels": 25.0,
+            "known_distance": 10.0,
+            "pixel_aspect_ratio": 1.5,
+            "unit": "um",
+            "global": true
+        }),
+    )
+    .expect("set scale");
+
+    assert_eq!(output.dataset.shape(), dataset.shape());
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        dataset.data.iter().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(output.dataset.metadata.dims[1].spacing, Some(0.4));
+    assert_eq!(output.dataset.metadata.dims[0].spacing, Some(0.6));
+    assert_eq!(output.dataset.metadata.dims[1].unit.as_deref(), Some("um"));
+    assert_eq!(output.dataset.metadata.dims[0].unit.as_deref(), Some("um"));
+    assert_eq!(
+        output.dataset.metadata.extras.get("global_calibration"),
+        Some(&json!(true))
+    );
+}
+
+#[test]
+fn image_set_scale_resets_pixel_units_and_updates_default_z_spacing() {
+    let data = Array::from_shape_vec(IxDyn(&[2, 2, 2]), vec![0.0; 8]).expect("shape");
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[2].spacing = Some(1.0);
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let calibrated = execute_operation(
+        "image.set_scale",
+        &dataset,
+        &json!({
+            "distance_pixels": 4.0,
+            "known_distance": 2.0,
+            "unit": "mm"
+        }),
+    )
+    .expect("calibrated set scale");
+    assert_eq!(calibrated.dataset.metadata.dims[1].spacing, Some(0.5));
+    assert_eq!(calibrated.dataset.metadata.dims[0].spacing, Some(0.5));
+    assert_eq!(calibrated.dataset.metadata.dims[2].spacing, Some(0.5));
+    assert_eq!(
+        calibrated.dataset.metadata.dims[2].unit.as_deref(),
+        Some("mm")
+    );
+
+    let reset = execute_operation(
+        "image.set_scale",
+        &calibrated.dataset,
+        &json!({
+            "distance_pixels": 4.0,
+            "known_distance": 2.0,
+            "unit": "pixel"
+        }),
+    )
+    .expect("reset set scale");
+    assert_eq!(reset.dataset.metadata.dims[1].spacing, Some(1.0));
+    assert_eq!(reset.dataset.metadata.dims[0].spacing, Some(1.0));
+    assert_eq!(reset.dataset.metadata.dims[2].spacing, Some(1.0));
+    assert_eq!(
+        reset.dataset.metadata.dims[1].unit.as_deref(),
+        Some("pixel")
+    );
+    assert_eq!(
+        reset.dataset.metadata.dims[0].unit.as_deref(),
+        Some("pixel")
+    );
+    assert_eq!(
+        reset.dataset.metadata.dims[2].unit.as_deref(),
+        Some("pixel")
+    );
 }
 
 #[test]
@@ -513,6 +802,923 @@ fn image_flip_reverses_z_stack() {
             12.0, 11.0, 10.0,
         ]
     );
+}
+
+#[test]
+fn image_stack_add_slice_promotes_2d_and_inserts_into_stack() {
+    let dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let promoted = execute_operation(
+        "image.stack.add_slice",
+        &dataset,
+        &json!({
+            "index": 1,
+            "fill": 9.0
+        }),
+    )
+    .expect("add slice to 2D");
+    assert_eq!(promoted.dataset.shape(), &[2, 2, 2]);
+    assert_eq!(promoted.dataset.metadata.dims[2].axis, AxisKind::Z);
+    assert_eq!(
+        promoted.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 4.0, 9.0]
+    );
+
+    let inserted = execute_operation(
+        "image.stack.add_slice",
+        &promoted.dataset,
+        &json!({
+            "index": 1,
+            "fill": 5.0
+        }),
+    )
+    .expect("insert slice");
+    assert_eq!(inserted.dataset.shape(), &[2, 2, 3]);
+    assert_eq!(inserted.dataset.data[IxDyn(&[0, 0, 1])], 5.0);
+    assert_eq!(inserted.dataset.data[IxDyn(&[0, 0, 2])], 9.0);
+}
+
+#[test]
+fn image_stack_delete_slice_removes_z_plane_and_validates_bounds() {
+    let data = Array::from_shape_vec((1, 2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        .expect("shape")
+        .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.delete_slice",
+        &dataset,
+        &json!({
+            "index": 1
+        }),
+    )
+    .expect("delete slice");
+    assert_eq!(output.dataset.shape(), &[1, 2, 2]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 3.0, 4.0, 6.0]
+    );
+
+    let error = execute_operation(
+        "image.stack.delete_slice",
+        &dataset,
+        &json!({
+            "index": 3
+        }),
+    )
+    .expect_err("invalid delete index");
+    assert!(error.to_string().contains("index"));
+}
+
+#[test]
+fn image_stack_z_profile_measures_slice_means_and_rows() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+            10.0, 11.0, 12.0,
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[2].spacing = Some(0.5);
+    metadata.dims[2].unit = Some("um".to_string());
+    metadata
+        .extras
+        .insert("z_origin_coordinate".to_string(), json!(10.0));
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output =
+        execute_operation("image.stack.z_profile", &dataset, &json!({})).expect("z profile");
+    assert_eq!(output.dataset.shape(), dataset.shape());
+    let measurements = output.measurements.expect("measurements");
+    assert_eq!(measurements.values.get("profile_axis"), Some(&json!("z")));
+    assert_eq!(
+        measurements.values.get("z_profile"),
+        Some(&json!([5.5, 6.5, 7.5]))
+    );
+    assert_eq!(
+        measurements.values.get("z_positions"),
+        Some(&json!([10.0, 10.5, 11.0]))
+    );
+    assert_eq!(measurements.values.get("z_unit"), Some(&json!("um")));
+    assert_eq!(
+        measurements
+            .values
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("Mean")),
+        Some(&json!(5.5))
+    );
+}
+
+#[test]
+fn image_stack_z_profile_supports_roi_threshold_and_rejects_non_stacks() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+            10.0, 11.0, 12.0,
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.z_profile",
+        &dataset,
+        &json!({
+            "left": 1,
+            "top": 0,
+            "width": 1,
+            "height": 2,
+            "min_threshold": 6.0
+        }),
+    )
+    .expect("z profile");
+    let measurements = output.measurements.expect("measurements");
+    assert_eq!(
+        measurements.values.get("z_profile"),
+        Some(&json!([10.0, 11.0, 9.0]))
+    );
+    assert_eq!(measurements.values.get("counts"), Some(&json!([1, 1, 2])));
+
+    let single = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let error = execute_operation("image.stack.z_profile", &single, &json!({}))
+        .expect_err("single image rejected");
+    assert!(error.to_string().contains("Z"));
+}
+
+#[test]
+fn image_stack_statistics_reports_imagej_style_results_row() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+            10.0, 11.0, 12.0,
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[0].spacing = Some(2.0);
+    metadata.dims[1].spacing = Some(3.0);
+    metadata.dims[2].spacing = Some(4.0);
+    metadata.dims[0].unit = Some("um".to_string());
+    metadata.dims[1].unit = Some("um".to_string());
+    metadata.dims[2].unit = Some("um".to_string());
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation("image.stack.statistics", &dataset, &json!({}))
+        .expect("stack statistics");
+    assert_eq!(output.dataset.shape(), dataset.shape());
+    let measurements = output.measurements.expect("measurements");
+    assert_eq!(measurements.values.get("voxels"), Some(&json!(12)));
+    assert_eq!(measurements.values.get("volume"), Some(&json!(288.0)));
+    assert_eq!(
+        measurements.values.get("percent_volume"),
+        Some(&json!(100.0))
+    );
+    assert_eq!(measurements.values.get("mean"), Some(&json!(6.5)));
+    let std_dev = measurements
+        .values
+        .get("std_dev")
+        .and_then(serde_json::Value::as_f64)
+        .expect("std dev");
+    assert!((std_dev - 13.0_f64.sqrt()).abs() < 1e-6);
+    assert_eq!(measurements.values.get("min"), Some(&json!(1.0)));
+    assert_eq!(measurements.values.get("max"), Some(&json!(12.0)));
+    assert_eq!(measurements.values.get("mode"), Some(&json!(1.0)));
+    assert_eq!(measurements.values.get("median"), Some(&json!(6.5)));
+    assert_eq!(measurements.values.get("volume_unit"), Some(&json!("um^3")));
+    assert_eq!(
+        measurements
+            .values
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("Voxels")),
+        Some(&json!(12))
+    );
+}
+
+#[test]
+fn image_stack_statistics_supports_roi_threshold_and_rejects_non_stacks() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+            10.0, 11.0, 12.0,
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.statistics",
+        &dataset,
+        &json!({
+            "left": 1,
+            "top": 0,
+            "width": 1,
+            "height": 2,
+            "min_threshold": 6.0,
+            "max_threshold": 11.0
+        }),
+    )
+    .expect("stack statistics");
+    let measurements = output.measurements.expect("measurements");
+    assert_eq!(measurements.values.get("voxels"), Some(&json!(3)));
+    assert_eq!(
+        measurements.values.get("percent_volume"),
+        Some(&json!(50.0))
+    );
+    assert_eq!(measurements.values.get("mean"), Some(&json!(9.0)));
+    assert_eq!(measurements.values.get("min"), Some(&json!(6.0)));
+    assert_eq!(measurements.values.get("max"), Some(&json!(11.0)));
+    assert_eq!(measurements.values.get("median"), Some(&json!(10.0)));
+
+    let single = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let error = execute_operation("image.stack.statistics", &single, &json!({}))
+        .expect_err("single image rejected");
+    assert!(error.to_string().contains("Z"));
+}
+
+#[test]
+fn image_stack_substack_extracts_imagej_style_range_and_list() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 4]),
+        vec![
+            1.0, 2.0, 3.0, 4.0, //
+            5.0, 6.0, 7.0, 8.0, //
+            9.0, 10.0, 11.0, 12.0, //
+            13.0, 14.0, 15.0, 16.0,
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 4),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[2].spacing = Some(0.25);
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let range = execute_operation(
+        "image.stack.substack",
+        &dataset,
+        &json!({"slices": "2-4-2"}),
+    )
+    .expect("range substack");
+    assert_eq!(range.dataset.shape(), &[2, 2, 2]);
+    assert_eq!(range.dataset.metadata.dims[2].spacing, Some(0.25));
+    assert_eq!(
+        range.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]
+    );
+    assert_eq!(
+        range.dataset.metadata.extras.get("substack_slices"),
+        Some(&json!([2, 4]))
+    );
+
+    let list = execute_operation(
+        "image.stack.substack",
+        &dataset,
+        &json!({"slices": "4,1,2"}),
+    )
+    .expect("list substack");
+    assert_eq!(list.dataset.shape(), &[2, 2, 3]);
+    assert_eq!(
+        list.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            4.0, 1.0, 2.0, //
+            8.0, 5.0, 6.0, //
+            12.0, 9.0, 10.0, //
+            16.0, 13.0, 14.0,
+        ]
+    );
+}
+
+#[test]
+fn image_stack_substack_supports_indices_and_validates_selection() {
+    let data = Array::from_shape_vec(IxDyn(&[1, 2, 3]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        .expect("shape")
+        .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.substack",
+        &dataset,
+        &json!({"indices": [2, 0, 2]}),
+    )
+    .expect("index substack");
+    assert_eq!(output.dataset.shape(), &[1, 2, 3]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![3.0, 1.0, 3.0, 6.0, 4.0, 6.0]
+    );
+
+    let invalid = execute_operation("image.stack.substack", &dataset, &json!({"slices": "3-1"}))
+        .expect_err("reverse range rejected");
+    assert!(invalid.to_string().contains("start"));
+
+    let single = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let error = execute_operation("image.stack.substack", &single, &json!({"slices": "1"}))
+        .expect_err("single image rejected");
+    assert!(error.to_string().contains("Z"));
+}
+
+#[test]
+fn image_stack_reslice_creates_top_and_left_orthogonal_stacks() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 3, 2]),
+        vec![
+            0.0, 1.0, 10.0, 11.0, 20.0, 21.0, //
+            100.0, 101.0, 110.0, 111.0, 120.0, 121.0,
+        ],
+    )
+    .expect("shape")
+    .into_dyn();
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 3),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[0].spacing = Some(2.0);
+    metadata.dims[1].spacing = Some(3.0);
+    metadata.dims[2].spacing = Some(4.0);
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let top = execute_operation("image.stack.reslice", &dataset, &json!({"start": "top"}))
+        .expect("top reslice");
+    assert_eq!(top.dataset.shape(), &[2, 3, 2]);
+    assert_eq!(
+        top.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            0.0, 100.0, 10.0, 110.0, 20.0, 120.0, //
+            1.0, 101.0, 11.0, 111.0, 21.0, 121.0,
+        ]
+    );
+    assert_eq!(top.dataset.metadata.dims[0].axis, AxisKind::Y);
+    assert_eq!(top.dataset.metadata.dims[0].spacing, Some(4.0));
+    assert_eq!(top.dataset.metadata.dims[1].axis, AxisKind::X);
+    assert_eq!(top.dataset.metadata.dims[1].spacing, Some(3.0));
+    assert_eq!(top.dataset.metadata.dims[2].axis, AxisKind::Z);
+    assert_eq!(top.dataset.metadata.dims[2].spacing, Some(2.0));
+
+    let left = execute_operation("image.stack.reslice", &dataset, &json!({"start": "left"}))
+        .expect("left reslice");
+    assert_eq!(left.dataset.shape(), &[2, 2, 3]);
+    assert_eq!(
+        left.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            0.0, 10.0, 20.0, 100.0, 110.0, 120.0, //
+            1.0, 11.0, 21.0, 101.0, 111.0, 121.0,
+        ]
+    );
+    assert_eq!(left.dataset.metadata.dims[0].spacing, Some(4.0));
+    assert_eq!(left.dataset.metadata.dims[1].spacing, Some(2.0));
+    assert_eq!(left.dataset.metadata.dims[2].spacing, Some(3.0));
+}
+
+#[test]
+fn image_stack_reslice_supports_reverse_starts_and_validates_layout() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 2]),
+        vec![0.0, 1.0, 10.0, 11.0, 100.0, 101.0, 110.0, 111.0],
+    )
+    .expect("shape")
+    .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let bottom = execute_operation("image.stack.reslice", &dataset, &json!({"start": "bottom"}))
+        .expect("bottom reslice");
+    assert_eq!(
+        bottom.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![100.0, 0.0, 110.0, 10.0, 101.0, 1.0, 111.0, 11.0]
+    );
+
+    let right = execute_operation("image.stack.reslice", &dataset, &json!({"start": "right"}))
+        .expect("right reslice");
+    assert_eq!(
+        right.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![10.0, 0.0, 110.0, 100.0, 11.0, 1.0, 111.0, 101.0]
+    );
+
+    let single = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let error = execute_operation("image.stack.reslice", &single, &json!({}))
+        .expect_err("single image rejected");
+    assert!(error.to_string().contains("Z"));
+}
+
+#[test]
+fn image_stack_z_project_averages_and_removes_z_axis() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            1.0, 3.0, 5.0, //
+            2.0, 4.0, 6.0, //
+            10.0, 12.0, 14.0, //
+            20.0, 22.0, 24.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.z_project",
+        &dataset,
+        &json!({"method": "average"}),
+    )
+    .expect("z project");
+
+    assert_eq!(output.dataset.shape(), &[2, 2]);
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>(),
+        vec![AxisKind::Y, AxisKind::X]
+    );
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![3.0, 4.0, 12.0, 22.0]
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("z_projection_method"),
+        Some(&json!("average"))
+    );
+}
+
+#[test]
+fn image_stack_z_project_supports_range_median_sd_and_rejects_invalid_bounds() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 4]),
+        vec![1.0, 5.0, 9.0, 13.0, 2.0, 4.0, 8.0, 16.0],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 4),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let median = execute_operation(
+        "image.stack.z_project",
+        &dataset,
+        &json!({"method": "median", "start": 1, "stop": 3}),
+    )
+    .expect("median projection");
+    assert_eq!(
+        median.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![9.0, 8.0]
+    );
+
+    let sd = execute_operation(
+        "image.stack.z_project",
+        &dataset,
+        &json!({"method": "sd", "start": 0, "stop": 1}),
+    )
+    .expect("sd projection");
+    let values = sd.dataset.data.iter().copied().collect::<Vec<_>>();
+    assert!((values[0] - 2.828427).abs() < 1.0e-5);
+    assert!((values[1] - 1.4142135).abs() < 1.0e-5);
+
+    let error = execute_operation(
+        "image.stack.z_project",
+        &dataset,
+        &json!({"method": "average", "start": 3, "stop": 1}),
+    )
+    .expect_err("invalid z projection range");
+    assert!(error.to_string().contains("start/stop"));
+}
+
+#[test]
+fn image_stack_montage_tiles_z_slices_with_borders_and_fill() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 2, 3]),
+        vec![
+            0.0, 10.0, 20.0, //
+            1.0, 11.0, 21.0, //
+            2.0, 12.0, 22.0, //
+            3.0, 13.0, 23.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.montage",
+        &dataset,
+        &json!({
+            "columns": 2,
+            "rows": 2,
+            "border_width": 1,
+            "fill": -1.0
+        }),
+    )
+    .expect("montage");
+
+    assert_eq!(output.dataset.shape(), &[5, 5]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            0.0, 1.0, -1.0, 10.0, 11.0, //
+            2.0, 3.0, -1.0, 12.0, 13.0, //
+            -1.0, -1.0, -1.0, -1.0, -1.0, //
+            20.0, 21.0, -1.0, -1.0, -1.0, //
+            22.0, 23.0, -1.0, -1.0, -1.0,
+        ]
+    );
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .dims
+            .iter()
+            .map(|dim| dim.axis)
+            .collect::<Vec<_>>(),
+        vec![AxisKind::Y, AxisKind::X]
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("montage_columns"),
+        Some(&json!(2))
+    );
+}
+
+#[test]
+fn image_stack_montage_supports_range_scale_and_rejects_invalid_grid() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[2, 4, 4]),
+        (0..32).map(|value| value as f32).collect::<Vec<_>>(),
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 2),
+            Dim::new(AxisKind::X, 4),
+            Dim::new(AxisKind::Z, 4),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.montage",
+        &dataset,
+        &json!({
+            "columns": 2,
+            "rows": 1,
+            "first": 1,
+            "last": 3,
+            "increment": 2,
+            "scale": 0.5
+        }),
+    )
+    .expect("scaled montage");
+
+    assert_eq!(output.dataset.shape(), &[1, 4]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 9.0, 3.0, 11.0]
+    );
+
+    let error = execute_operation(
+        "image.stack.montage",
+        &dataset,
+        &json!({"columns": 0, "rows": 1}),
+    )
+    .expect_err("invalid montage grid");
+    assert!(error.to_string().contains("columns"));
+}
+
+#[test]
+fn image_stack_montage_to_stack_splits_montage_grid() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[5, 5]),
+        vec![
+            0.0, 1.0, -1.0, 10.0, 11.0, //
+            2.0, 3.0, -1.0, 12.0, 13.0, //
+            -1.0, -1.0, -1.0, -1.0, -1.0, //
+            20.0, 21.0, -1.0, 30.0, 31.0, //
+            22.0, 23.0, -1.0, 32.0, 33.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![Dim::new(AxisKind::Y, 5), Dim::new(AxisKind::X, 5)],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.montage_to_stack",
+        &dataset,
+        &json!({"columns": 2, "rows": 2, "border_width": 1}),
+    )
+    .expect("montage to stack");
+
+    assert_eq!(output.dataset.shape(), &[2, 2, 4]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            0.0, 10.0, 20.0, 30.0, //
+            1.0, 11.0, 21.0, 31.0, //
+            2.0, 12.0, 22.0, 32.0, //
+            3.0, 13.0, 23.0, 33.0,
+        ]
+    );
+    assert_eq!(output.dataset.metadata.dims[2].axis, AxisKind::Z);
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("montage_to_stack_columns"),
+        Some(&json!(2))
+    );
+}
+
+#[test]
+fn image_stack_montage_to_stack_uses_montage_metadata_and_rejects_stacks() {
+    let data = Array::from_shape_vec(IxDyn(&[1, 4]), vec![1.0, 2.0, 3.0, 4.0]).expect("shape");
+    let mut metadata = Metadata {
+        dims: vec![Dim::new(AxisKind::Y, 1), Dim::new(AxisKind::X, 4)],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata
+        .extras
+        .insert("montage_columns".to_string(), json!(2));
+    metadata.extras.insert("montage_rows".to_string(), json!(1));
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation("image.stack.montage_to_stack", &dataset, &json!({}))
+        .expect("metadata-driven montage to stack");
+    assert_eq!(output.dataset.shape(), &[1, 2, 2]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 3.0, 2.0, 4.0]
+    );
+
+    let stack_data = Array::from_shape_vec(IxDyn(&[1, 1, 2]), vec![1.0, 2.0]).expect("shape");
+    let stack_metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let stack = Dataset::new(stack_data, stack_metadata).expect("stack");
+    let error = execute_operation("image.stack.montage_to_stack", &stack, &json!({}))
+        .expect_err("stack input rejected");
+    assert!(error.to_string().contains("montage"));
+}
+
+#[test]
+fn image_stack_grouped_z_project_projects_adjacent_groups() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 4]),
+        vec![1.0, 3.0, 10.0, 30.0, 2.0, 4.0, 20.0, 40.0],
+    )
+    .expect("shape");
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 4),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[2].spacing = Some(0.5);
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.grouped_z_project",
+        &dataset,
+        &json!({"method": "average", "group_size": 2}),
+    )
+    .expect("grouped projection");
+
+    assert_eq!(output.dataset.shape(), &[1, 2, 2]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![2.0, 20.0, 3.0, 30.0]
+    );
+    assert_eq!(output.dataset.metadata.dims[2].spacing, Some(1.0));
+    assert_eq!(
+        output
+            .dataset
+            .metadata
+            .extras
+            .get("grouped_z_projection_group_size"),
+        Some(&json!(2))
+    );
+}
+
+#[test]
+fn image_stack_grouped_z_project_supports_max_and_rejects_non_factor_group_size() {
+    let data = Array::from_shape_vec(IxDyn(&[1, 1, 6]), vec![1.0, 4.0, 2.0, 8.0, 3.0, 6.0])
+        .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 6),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.stack.grouped_z_project",
+        &dataset,
+        &json!({"method": "max", "group_size": 3}),
+    )
+    .expect("grouped max");
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![4.0, 8.0]
+    );
+
+    let error = execute_operation(
+        "image.stack.grouped_z_project",
+        &dataset,
+        &json!({"method": "average", "group_size": 4}),
+    )
+    .expect_err("invalid group size");
+    assert!(error.to_string().contains("group_size"));
+}
+
+#[test]
+fn image_stack_reduce_keeps_every_nth_slice_and_updates_spacing() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 5]),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+    )
+    .expect("shape");
+    let mut metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 5),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    metadata.dims[2].spacing = Some(0.25);
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation("image.stack.reduce", &dataset, &json!({"factor": 2}))
+        .expect("reduce stack");
+
+    assert_eq!(output.dataset.shape(), &[1, 2, 3]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 3.0, 5.0, 10.0, 30.0, 50.0]
+    );
+    assert_eq!(output.dataset.metadata.dims[2].spacing, Some(0.5));
+    assert_eq!(
+        output.dataset.metadata.extras.get("stack_reduce_factor"),
+        Some(&json!(2))
+    );
+}
+
+#[test]
+fn image_stack_reduce_rejects_zero_factor_and_single_slice_images() {
+    let data = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![1.0, 2.0, 3.0]).expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let zero = execute_operation("image.stack.reduce", &dataset, &json!({"factor": 0}))
+        .expect_err("zero factor");
+    assert!(zero.to_string().contains("factor"));
+
+    let single = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let error = execute_operation("image.stack.reduce", &single, &json!({"factor": 2}))
+        .expect_err("single slice");
+    assert!(error.to_string().contains("Z"));
 }
 
 #[test]
@@ -1028,6 +2234,95 @@ fn find_edges_highlights_gradient() {
 }
 
 #[test]
+fn image_find_maxima_marks_prominent_local_peaks() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 0.0, 0.0, //
+            0.0, 5.0, 1.0, //
+            0.0, 1.0, 0.0, //
+        ],
+        (3, 3),
+    );
+
+    let output = execute_operation(
+        "image.find_maxima",
+        &dataset,
+        &json!({
+            "prominence": 3.0
+        }),
+    )
+    .expect("find maxima");
+
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+    assert_eq!(output.dataset.data[IxDyn(&[1, 1])], 1.0);
+    assert_eq!(
+        output
+            .dataset
+            .data
+            .iter()
+            .filter(|value| **value > 0.0)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn image_find_maxima_supports_edges_and_light_background_minima() {
+    let edge_peak = test_dataset(
+        vec![
+            9.0, 1.0, 0.0, //
+            1.0, 2.0, 0.0, //
+            0.0, 0.0, 0.0, //
+        ],
+        (3, 3),
+    );
+    let included =
+        execute_operation("image.find_maxima", &edge_peak, &json!({})).expect("include edges");
+    assert_eq!(included.dataset.data[IxDyn(&[0, 0])], 1.0);
+    let excluded = execute_operation(
+        "image.find_maxima",
+        &edge_peak,
+        &json!({"exclude_edges": true}),
+    )
+    .expect("exclude edges");
+    assert_eq!(excluded.dataset.data[IxDyn(&[0, 0])], 0.0);
+
+    let valley = test_dataset(
+        vec![
+            5.0, 5.0, 5.0, //
+            5.0, 0.0, 5.0, //
+            5.0, 5.0, 5.0, //
+        ],
+        (3, 3),
+    );
+    let minima = execute_operation(
+        "image.find_maxima",
+        &valley,
+        &json!({
+            "prominence": 1.0,
+            "light_background": true
+        }),
+    )
+    .expect("find minima");
+    assert_eq!(minima.dataset.data[IxDyn(&[1, 1])], 1.0);
+}
+
+#[test]
+fn image_find_maxima_rejects_invalid_prominence() {
+    let dataset = test_dataset(vec![0.0; 9], (3, 3));
+
+    let error = execute_operation(
+        "image.find_maxima",
+        &dataset,
+        &json!({
+            "prominence": -1.0
+        }),
+    )
+    .expect_err("invalid prominence");
+    assert!(error.to_string().contains("prominence"));
+}
+
+#[test]
 fn image_shadow_applies_imagej_directional_kernel() {
     let dataset = test_dataset(
         vec![
@@ -1303,6 +2598,65 @@ fn image_rank_filter_top_hat_can_return_grayscale_close() {
     .expect("top hat");
 
     assert_eq!(output.dataset.data[IxDyn(&[1, 1])], 10.0);
+}
+
+#[test]
+fn image_subtract_background_subtracts_dark_background_estimate() {
+    let dataset = test_dataset(
+        vec![
+            1.0, 1.0, 1.0, //
+            1.0, 10.0, 1.0, //
+            1.0, 1.0, 1.0, //
+        ],
+        (3, 3),
+    );
+
+    let output = execute_operation(
+        "image.subtract_background",
+        &dataset,
+        &json!({
+            "radius": 1.0,
+            "light_background": false
+        }),
+    )
+    .expect("subtract background");
+
+    assert_eq!(output.dataset.data[IxDyn(&[1, 1])], 9.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0])], 0.0);
+}
+
+#[test]
+fn image_subtract_background_can_create_background_and_rejects_invalid_radius() {
+    let dataset = test_dataset(
+        vec![
+            1.0, 1.0, 1.0, //
+            1.0, 10.0, 1.0, //
+            1.0, 1.0, 1.0, //
+        ],
+        (3, 3),
+    );
+
+    let background = execute_operation(
+        "image.subtract_background",
+        &dataset,
+        &json!({
+            "radius": 1.0,
+            "light_background": false,
+            "create_background": true
+        }),
+    )
+    .expect("create background");
+    assert_eq!(background.dataset.data[IxDyn(&[1, 1])], 1.0);
+
+    let error = execute_operation(
+        "image.subtract_background",
+        &dataset,
+        &json!({
+            "radius": -1.0
+        }),
+    )
+    .expect_err("invalid radius");
+    assert!(error.to_string().contains("radius"));
 }
 
 #[test]
@@ -2330,6 +3684,79 @@ fn otsu_threshold_returns_measurement() {
 }
 
 #[test]
+fn make_binary_threshold_creates_imagej_style_u8_mask() {
+    let dataset = test_dataset(vec![0.0, 0.1, 0.2, 0.8, 0.9, 1.0], (2, 3));
+
+    let output = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "fixed", "threshold": 0.5, "background": "dark"}),
+    )
+    .expect("make binary");
+
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("threshold_min"),
+        Some(&json!(0.5))
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("threshold_max"),
+        Some(&json!(1.0))
+    );
+}
+
+#[test]
+fn make_binary_threshold_supports_light_background_and_explicit_range() {
+    let dataset = test_dataset(vec![0.0, 0.25, 0.5, 0.75, 1.0, f32::NAN], (2, 3));
+
+    let light = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "fixed", "threshold": 0.5, "background": "light"}),
+    )
+    .expect("make binary light background");
+    assert_eq!(
+        light.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+    );
+
+    let ranged = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"min": 0.25, "max": 0.75}),
+    )
+    .expect("make binary explicit range");
+    assert_eq!(
+        ranged.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn make_binary_threshold_defaults_to_imagej_isodata_polarity() {
+    let dataset = test_dataset(vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], (2, 3));
+
+    let output =
+        execute_operation("threshold.make_binary", &dataset, &json!({})).expect("make binary");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    );
+    let threshold = output
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(|value| value.as_f64())
+        .expect("threshold");
+    assert!((threshold - 0.501960813999176).abs() < 1.0e-12);
+}
+
+#[test]
 fn measurements_include_bbox() {
     let dataset = test_dataset(
         vec![
@@ -2351,4 +3778,167 @@ fn measurements_include_bbox() {
     );
     assert!(table.values.contains_key("bbox_min"));
     assert!(table.values.contains_key("bbox_max"));
+}
+
+#[test]
+fn measurements_histogram_reports_bins_and_rows() {
+    let dataset = test_dataset(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (2, 3));
+
+    let output = execute_operation(
+        "measurements.histogram",
+        &dataset,
+        &json!({"bins": 3, "min": 0.0, "max": 6.0}),
+    )
+    .expect("histogram");
+    let measurements = output.measurements.expect("measurements");
+
+    assert_eq!(measurements.values.get("bins"), Some(&json!(3)));
+    assert_eq!(
+        measurements.values.get("histogram"),
+        Some(&json!([2, 2, 2]))
+    );
+    assert_eq!(measurements.values.get("pixel_count"), Some(&json!(6)));
+    assert_eq!(measurements.values.get("min"), Some(&json!(0.0)));
+    assert_eq!(measurements.values.get("max"), Some(&json!(6.0)));
+    assert_eq!(
+        measurements
+            .values
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.get(1))
+            .and_then(|row| row.get("Count")),
+        Some(&json!(2))
+    );
+}
+
+#[test]
+fn measurements_histogram_supports_slice_and_stack_modes() {
+    let data = Array::from_shape_vec(IxDyn(&[1, 2, 3]), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+        .expect("shape")
+        .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 3),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let slice = execute_operation(
+        "measurements.histogram",
+        &dataset,
+        &json!({"bins": 2, "z": 1, "min": 0.0, "max": 6.0}),
+    )
+    .expect("slice histogram");
+    assert_eq!(
+        slice
+            .measurements
+            .expect("measurements")
+            .values
+            .get("histogram"),
+        Some(&json!([1, 1]))
+    );
+
+    let stack = execute_operation(
+        "measurements.histogram",
+        &dataset,
+        &json!({"bins": 2, "stack": true, "min": 0.0, "max": 6.0}),
+    )
+    .expect("stack histogram");
+    let measurements = stack.measurements.expect("measurements");
+    assert_eq!(measurements.values.get("histogram"), Some(&json!([3, 3])));
+    assert_eq!(
+        measurements.values.get("stack_histogram"),
+        Some(&json!(true))
+    );
+
+    let error = execute_operation("measurements.histogram", &dataset, &json!({"bins": 0}))
+        .expect_err("zero bins rejected");
+    assert!(error.to_string().contains("bins"));
+}
+
+#[test]
+fn measurements_profile_reports_rectangular_column_means() {
+    let dataset = test_dataset(
+        vec![
+            1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+        ],
+        (3, 3),
+    );
+
+    let output = execute_operation(
+        "measurements.profile",
+        &dataset,
+        &json!({"left": 0, "top": 0, "width": 3, "height": 2}),
+    )
+    .expect("profile");
+    let measurements = output.measurements.expect("measurements");
+
+    assert_eq!(measurements.values.get("profile_axis"), Some(&json!("x")));
+    assert_eq!(
+        measurements.values.get("profile"),
+        Some(&json!([2.5, 3.5, 4.5]))
+    );
+    assert_eq!(measurements.values.get("sample_count"), Some(&json!(3)));
+    assert_eq!(
+        measurements
+            .values
+            .get("rows")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("Value")),
+        Some(&json!(2.5))
+    );
+}
+
+#[test]
+fn measurements_profile_supports_vertical_rectangles_lines_and_selection_errors() {
+    let dataset = test_dataset(
+        vec![
+            1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0, //
+        ],
+        (3, 3),
+    );
+
+    let vertical = execute_operation(
+        "measurements.profile",
+        &dataset,
+        &json!({"left": 0, "top": 0, "width": 3, "height": 2, "vertical": true}),
+    )
+    .expect("vertical profile");
+    assert_eq!(
+        vertical
+            .measurements
+            .expect("measurements")
+            .values
+            .get("profile"),
+        Some(&json!([2.0, 5.0]))
+    );
+
+    let line = execute_operation(
+        "measurements.profile",
+        &dataset,
+        &json!({"x0": 0.0, "y0": 0.0, "x1": 2.0, "y1": 0.0}),
+    )
+    .expect("line profile");
+    let measurements = line.measurements.expect("measurements");
+    assert_eq!(
+        measurements.values.get("profile_axis"),
+        Some(&json!("line"))
+    );
+    assert_eq!(
+        measurements.values.get("profile"),
+        Some(&json!([1.0, 2.0, 3.0]))
+    );
+
+    let error = execute_operation("measurements.profile", &dataset, &json!({}))
+        .expect_err("selection required");
+    assert!(error.to_string().contains("line or rectangular selection"));
 }
