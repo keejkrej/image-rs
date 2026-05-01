@@ -5,10 +5,18 @@ use crate::model::DatasetF32;
 use serde_json::Value;
 
 use super::{
-    ComponentsLabelOp, GaussianBlurOp, ImageCanvasResizeOp, ImageConvertOp, ImageFindEdgesOp,
-    ImageResizeOp, ImageSharpenOp, IntensityNormalizeOp, IntensityWindowOp, MeasurementsSummaryOp,
-    MorphologyCloseOp, MorphologyDilateOp, MorphologyErodeOp, MorphologyOpenOp, OpOutput, OpSchema,
-    Operation, OpsError, Result, ThresholdFixedOp, ThresholdOtsuOp,
+    ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCanvasResizeOp, ImageConvertOp,
+    ImageConvolveOp, ImageCoordinatesOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp,
+    ImageFindEdgesOp, ImageFlipOp, ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp,
+    ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp,
+    ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp, ImageSwapQuadrantsOp, ImageTranslateOp,
+    ImageUnsharpMaskOp, IntensityInvertOp, IntensityMathOp, IntensityNaNBackgroundOp,
+    IntensityNormalizeOp, IntensityWindowOp, MeasurementsSummaryOp, MorphologyBinaryMedianOp,
+    MorphologyCloseOp, MorphologyDilateOp, MorphologyDistanceMapOp, MorphologyErodeOp,
+    MorphologyFillHolesOp, MorphologyOpenOp, MorphologyOutlineOp, MorphologySkeletonizeOp,
+    MorphologyUltimatePointsOp, MorphologyVoronoiOp, MorphologyWatershedOp, NoiseGaussianOp,
+    NoiseSaltAndPepperOp, OpOutput, OpSchema, Operation, OpsError, Result, ThresholdFixedOp,
+    ThresholdOtsuOp,
 };
 #[cfg(feature = "morpholib")]
 use super::{
@@ -32,19 +40,50 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(|| {
         let mut map: Registry = HashMap::new();
         register(&mut map, IntensityNormalizeOp);
+        register(&mut map, IntensityInvertOp);
+        register(&mut map, IntensityMathOp);
+        register(&mut map, IntensityNaNBackgroundOp);
         register(&mut map, IntensityWindowOp);
         register(&mut map, GaussianBlurOp);
         register(&mut map, ImageConvertOp);
         register(&mut map, ImageResizeOp);
         register(&mut map, ImageCanvasResizeOp);
+        register(&mut map, ImageCoordinatesOp);
+        register(&mut map, ImageBinOp);
+        register(&mut map, ImageFlipOp);
+        register(&mut map, ImageRotate90Op);
+        register(&mut map, ImageRotateOp);
+        register(&mut map, ImageTranslateOp);
+        register(&mut map, ImageRankFilterOp);
+        register(&mut map, ImageRankFilter3dOp);
+        register(&mut map, ImageMedianFilterOp);
+        register(&mut map, ImageRemoveNaNsOp);
+        register(&mut map, ImageRemoveOutliersOp);
         register(&mut map, ImageSharpenOp);
         register(&mut map, ImageFindEdgesOp);
+        register(&mut map, ImageShadowOp);
+        register(&mut map, ImageShadowDemoOp);
+        register(&mut map, ImageUnsharpMaskOp);
+        register(&mut map, ImageConvolveOp);
+        register(&mut map, ImageSwapQuadrantsOp);
+        register(&mut map, ImageFftPowerSpectrumOp);
+        register(&mut map, ImageFftBandpassOp);
         register(&mut map, ThresholdFixedOp);
         register(&mut map, ThresholdOtsuOp);
         register(&mut map, MorphologyErodeOp);
         register(&mut map, MorphologyDilateOp);
         register(&mut map, MorphologyOpenOp);
         register(&mut map, MorphologyCloseOp);
+        register(&mut map, MorphologyBinaryMedianOp);
+        register(&mut map, MorphologyDistanceMapOp);
+        register(&mut map, MorphologyUltimatePointsOp);
+        register(&mut map, MorphologyWatershedOp);
+        register(&mut map, MorphologyVoronoiOp);
+        register(&mut map, MorphologyFillHolesOp);
+        register(&mut map, MorphologyOutlineOp);
+        register(&mut map, MorphologySkeletonizeOp);
+        register(&mut map, NoiseGaussianOp);
+        register(&mut map, NoiseSaltAndPepperOp);
         register(&mut map, ComponentsLabelOp);
         #[cfg(feature = "morpholib")]
         register(&mut map, MorpholibjChamferDistanceOp);

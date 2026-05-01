@@ -286,6 +286,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Use the internal image clipboard for ROI or frame data."),
         ),
+        "edit.invert" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Invert active image intensities using ImageJ-style ranges."),
+        ),
         "edit.options.appearance" | "edit.options.memory" => CommandMetadata::with(
             CommandScope::Both,
             true,
@@ -293,6 +301,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             false,
             None,
             Some("Open informational utility dialogs for appearance and memory."),
+        ),
+        "edit.options.line_width" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"width": 1.0})),
+            Some("Set the default ImageJ-style line selection width."),
         ),
         "image.zoom.in"
         | "image.zoom.out"
@@ -376,13 +392,23 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("ImageJ-style interaction command routed to the viewer shell."),
         ),
-        "process.smooth" | "process.gaussian" => CommandMetadata::with(
+        "process.smooth" | "process.gaussian" | "process.filters.gaussian" => {
+            CommandMetadata::with(
+                CommandScope::Viewer,
+                true,
+                false,
+                true,
+                Some(json!({"sigma": 1.0})),
+                Some("Processes the active image using gaussian blur/ smooth path."),
+            )
+        }
+        "process.filters.gaussian_3d" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             false,
             true,
-            Some(json!({"sigma": 1.0})),
-            Some("Processes the active image using gaussian blur/ smooth path."),
+            Some(json!({"sigma": 2.0})),
+            Some("Run ImageJ Process/Filters 3D Gaussian blur on the active image."),
         ),
         "image.type.8bit" | "image.type.16bit" | "image.type.32bit" | "image.type.rgb" => {
             CommandMetadata::with(
@@ -402,6 +428,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Applies automatic normalization or thresholding to the active image."),
         ),
+        "image.adjust.window_level" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"low": 0.0, "high": 1.0})),
+            Some("Apply an ImageJ-style window/level clamp to the active image."),
+        ),
         "image.adjust.size" | "image.adjust.canvas" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -409,6 +443,22 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             None,
             Some("Open utility dialogs for X/Y resize and canvas size changes."),
+        ),
+        "image.adjust.line_width" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"width": 1.0})),
+            Some("Set the default ImageJ-style line selection width."),
+        ),
+        "image.adjust.coordinates" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"x_unit": "pixel", "y_unit": "<same as x unit>"})),
+            Some("Update ImageJ-style coordinate calibration metadata."),
         ),
         "image.stacks.next" | "image.stacks.previous" | "image.stacks.set" => {
             CommandMetadata::with(
@@ -420,16 +470,337 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                 Some("Image stack navigation is implemented in the viewer shell."),
             )
         }
-        "process.binary.make" | "process.binary.erode" | "process.binary.dilate" => {
-            CommandMetadata::with(
-                CommandScope::Viewer,
-                true,
-                false,
-                true,
-                None,
-                Some("Runs binary threshold or binary morphology on the active image."),
-            )
-        }
+        "image.stacks.reverse" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"axis": "z"})),
+            Some("Reverse the active image stack along Z."),
+        ),
+        "image.transform.flip_horizontal"
+        | "image.transform.flip_vertical"
+        | "image.transform.flip_z"
+        | "image.transform.rotate_right"
+        | "image.transform.rotate_left" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Transform the active image with ImageJ-style flip or 90-degree rotation."),
+        ),
+        "image.transform.rotate" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(
+                json!({"angle": 15.0, "fill": 0.0, "interpolation": "bilinear", "enlarge": false}),
+            ),
+            Some("Rotate the active image by an arbitrary angle."),
+        ),
+        "image.transform.translate" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"x": 15.0, "y": 15.0, "fill": 0.0, "interpolation": "nearest"})),
+            Some("Translate the active image by X/Y pixel offsets."),
+        ),
+        "image.transform.bin" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"x": 2, "y": 2, "z": 1, "method": "average"})),
+            Some("Reduce the active image dimensions using ImageJ-style binning."),
+        ),
+        "image.transform.image_to_results" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Convert the active image slice or selection to an ImageJ-style results table."),
+        ),
+        "image.transform.results_to_image" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            false,
+            None,
+            Some("Convert numeric results table columns to a float image."),
+        ),
+        "process.binary.make"
+        | "process.binary.convert_mask"
+        | "process.binary.erode"
+        | "process.binary.dilate"
+        | "process.binary.open"
+        | "process.binary.close"
+        | "process.binary.median"
+        | "process.binary.outline"
+        | "process.binary.fill_holes"
+        | "process.binary.skeletonize"
+        | "process.binary.distance_map"
+        | "process.binary.ultimate_points"
+        | "process.binary.watershed"
+        | "process.binary.voronoi" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Runs binary threshold or binary morphology on the active image."),
+        ),
+        "process.noise.add" | "process.noise.specified" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"sigma": 25.0, "seed": 0})),
+            Some("Add ImageJ-style Gaussian noise to the active image."),
+        ),
+        "process.noise.salt_pepper" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"percent": 0.05, "seed": 0})),
+            Some("Apply ImageJ-style salt-and-pepper noise to an integer-backed active image."),
+        ),
+        "process.noise.despeckle" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"radius": 1.0})),
+            Some("Apply ImageJ-style despeckle median filtering to the active image."),
+        ),
+        "process.noise.remove_nans" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"radius": 2.0})),
+            Some("Replace NaN pixels using ImageJ-style neighborhood medians."),
+        ),
+        "process.noise.remove_outliers" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"radius": 2.0, "threshold": 50.0, "which": "bright"})),
+            Some("Replace bright or dark outliers using ImageJ-style neighborhood medians."),
+        ),
+        "process.math.add" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "add", "value": 25.0 / 255.0})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.subtract" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "subtract", "value": 25.0 / 255.0})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.multiply" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "multiply", "value": 1.25})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.divide" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "divide", "value": 1.25})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.and" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "and", "value": "11110000"})),
+            Some("Run ImageJ-style bitwise math on integer-backed active images."),
+        ),
+        "process.math.or" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "or", "value": "11110000"})),
+            Some("Run ImageJ-style bitwise math on integer-backed active images."),
+        ),
+        "process.math.xor" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "xor", "value": "11110000"})),
+            Some("Run ImageJ-style bitwise math on integer-backed active images."),
+        ),
+        "process.math.min" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "min", "value": 0.0})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.max" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "max", "value": 1.0})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.gamma" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "gamma", "value": 0.5})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.set" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": "set", "value": 25.0 / 255.0})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.math.nan_background" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"lower": 0.0, "upper": 1.0})),
+            Some("Set pixels outside the threshold range to NaN for 32-bit float images."),
+        ),
+        "process.math.log"
+        | "process.math.exp"
+        | "process.math.square"
+        | "process.math.sqrt"
+        | "process.math.reciprocal"
+        | "process.math.abs" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"operation": command_id.strip_prefix("process.math.").unwrap_or("")})),
+            Some("Run ImageJ-style per-pixel math on the active image."),
+        ),
+        "process.shadows.north"
+        | "process.shadows.northeast"
+        | "process.shadows.east"
+        | "process.shadows.southeast"
+        | "process.shadows.south"
+        | "process.shadows.southwest"
+        | "process.shadows.west"
+        | "process.shadows.northwest" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"direction": command_id.strip_prefix("process.shadows.").unwrap_or("")})),
+            Some("Run ImageJ Process/Shadows directional 3x3 convolution."),
+        ),
+        "process.shadows.demo" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"iterations": 20})),
+            Some("Create an ImageJ Process/Shadows eight-direction demo stack."),
+        ),
+        "process.filters.mean"
+        | "process.filters.minimum"
+        | "process.filters.maximum"
+        | "process.filters.variance" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(
+                json!({"filter": command_id.strip_prefix("process.filters.").unwrap_or(""), "radius": 2.0}),
+            ),
+            Some("Run ImageJ Process/Filters rank filters on the active image."),
+        ),
+        "process.filters.top_hat" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(
+                json!({"filter": "top_hat", "radius": 2.0, "light_background": false, "dont_subtract": false}),
+            ),
+            Some("Run ImageJ Process/Filters top-hat background subtraction on the active image."),
+        ),
+        "process.filters.median_3d"
+        | "process.filters.mean_3d"
+        | "process.filters.minimum_3d"
+        | "process.filters.maximum_3d"
+        | "process.filters.variance_3d" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "x_radius": 2.0,
+                "y_radius": 2.0,
+                "z_radius": 2.0
+            })),
+            Some("Run ImageJ Process/Filters 3D rank filters on the active image."),
+        ),
+        "process.filters.median" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"radius": 2.0})),
+            Some("Run ImageJ Process/Filters median filter on the active image."),
+        ),
+        "process.filters.convolve" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "width": 3,
+                "height": 3,
+                "kernel": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                "normalize": false
+            })),
+            Some("Run ImageJ Process/Filters custom convolution on the active image."),
+        ),
+        "process.filters.unsharp_mask" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({"sigma": 1.0, "weight": 0.6})),
+            Some("Run ImageJ Process/Filters unsharp mask on the active image."),
+        ),
+        "process.filters.show_circular_masks" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Create the ImageJ rank-filter circular mask demonstration stack."),
+        ),
         "process.sharpen" | "process.find_edges" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -437,6 +808,44 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             None,
             Some("Run sharpen or edge-detection filters on the active image."),
+        ),
+        "process.fft.swap_quadrants" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Run ImageJ Process/FFT quadrant swapping on the active image."),
+        ),
+        "process.fft.fft" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Run ImageJ Process/FFT power spectrum on the active image."),
+        ),
+        "process.fft.bandpass" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "filter_large": 40.0,
+                "filter_small": 3.0,
+                "suppress_stripes": "none",
+                "tolerance": 5.0,
+                "autoscale": true
+            })),
+            Some("Run ImageJ Process/FFT bandpass filtering on the active image."),
+        ),
+        "process.fft.make_circular_selection" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"radius": null})),
+            Some("Create an ImageJ Process/FFT centered circular selection on the active image."),
         ),
         "analyze.measure"
         | "analyze.histogram"
@@ -615,6 +1024,7 @@ mod tests {
             "file.revert",
             "edit.undo",
             "edit.redo",
+            "edit.invert",
         ] {
             let metadata = metadata(command);
             assert!(metadata.implemented, "{command} should be implemented");
@@ -630,8 +1040,59 @@ mod tests {
             "file.new",
             "file.import.image",
             "file.export.results",
+            "edit.options.line_width",
             "image.type.rgb",
+            "image.adjust.window_level",
             "image.adjust.size",
+            "image.adjust.line_width",
+            "image.adjust.coordinates",
+            "image.stacks.reverse",
+            "image.transform.flip_horizontal",
+            "image.transform.flip_z",
+            "image.transform.rotate",
+            "image.transform.translate",
+            "image.transform.bin",
+            "image.transform.image_to_results",
+            "image.transform.results_to_image",
+            "process.noise.add",
+            "process.noise.specified",
+            "process.noise.salt_pepper",
+            "process.noise.despeckle",
+            "process.noise.remove_outliers",
+            "process.noise.remove_nans",
+            "process.binary.convert_mask",
+            "process.binary.open",
+            "process.binary.close",
+            "process.binary.median",
+            "process.binary.outline",
+            "process.binary.fill_holes",
+            "process.binary.skeletonize",
+            "process.binary.distance_map",
+            "process.binary.ultimate_points",
+            "process.binary.watershed",
+            "process.binary.voronoi",
+            "process.shadows.north",
+            "process.shadows.southwest",
+            "process.shadows.demo",
+            "process.filters.convolve",
+            "process.filters.gaussian",
+            "process.filters.mean",
+            "process.filters.unsharp_mask",
+            "process.filters.variance",
+            "process.filters.top_hat",
+            "process.filters.gaussian_3d",
+            "process.filters.median_3d",
+            "process.filters.mean_3d",
+            "process.filters.minimum_3d",
+            "process.filters.maximum_3d",
+            "process.filters.variance_3d",
+            "process.filters.show_circular_masks",
+            "process.math.sqrt",
+            "process.math.nan_background",
+            "process.fft.fft",
+            "process.fft.bandpass",
+            "process.fft.swap_quadrants",
+            "process.fft.make_circular_selection",
             "process.sharpen",
             "analyze.analyze_particles",
             "analyze.tools.results",
@@ -641,6 +1102,28 @@ mod tests {
             assert!(
                 metadata(command).implemented,
                 "{command} should be implemented or explicitly handled"
+            );
+        }
+    }
+
+    #[test]
+    fn process_math_commands_are_operation_backed() {
+        for command in [
+            "process.math.add",
+            "process.math.and",
+            "process.math.gamma",
+            "process.math.sqrt",
+            "process.math.nan_background",
+            "process.math.abs",
+            "image.stacks.reverse",
+        ] {
+            let metadata = metadata(command);
+            assert!(metadata.implemented, "{command} should be implemented");
+            assert!(metadata.requires_image, "{command} should require an image");
+            assert!(!metadata.frontend_only, "{command} should run an operation");
+            assert!(
+                metadata.default_params.is_some(),
+                "{command} should provide default operation params"
             );
         }
     }

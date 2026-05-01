@@ -1365,6 +1365,43 @@ impl ImageUiApp {
         Ok("measurement added to results".to_string())
     }
 
+    fn image_to_results(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for image to results".to_string())?
+            .to_string();
+        let (slice, roi_bbox, _, _, _) = self.measurement_context(&viewer_label)?;
+        let rows = image_slice_to_results_rows(&slice, roi_bbox)?;
+        let row_count = rows.len();
+        self.results_table.clear();
+        for row in rows {
+            self.results_table.add_row(row);
+        }
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok(format!("image slice copied to results ({row_count} rows)"))
+    }
+
+    fn results_to_image(&mut self) -> Result<String, String> {
+        let dataset = results_rows_to_dataset(&self.results_table.rows)?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "Results Table-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
+        Ok(format!("created results image in {label}"))
+    }
+
+    fn show_circular_masks(&mut self) -> Result<String, String> {
+        let dataset = create_circular_masks_dataset()?;
+        let path = normalize_path(&PathBuf::from(format!(
+            "Circular Masks-{}.tif",
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
+        Ok(format!("created circular masks stack in {label}"))
+    }
+
     fn measure_all_rois(&mut self, window_label: &str) -> Result<String, String> {
         let viewer_label = self
             .current_viewer_label(window_label)
@@ -1873,6 +1910,20 @@ impl ImageUiApp {
             ));
         }
 
+        if command_id == "edit.options.line_width" || command_id == "image.adjust.line_width" {
+            let params = command_registry::merge_params(command_id, params.cloned());
+            return Some(match line_width_from_params(&params) {
+                Ok(width) => {
+                    self.tool_options.line_width_px = width;
+                    command_registry::CommandExecuteResult::with_payload(
+                        "line width updated",
+                        json!({ "width": width }),
+                    )
+                }
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            });
+        }
+
         if command_id == "__dialog.resize" || command_id == "__dialog.canvas_resize" {
             let Some(viewer_label) = self.current_viewer_label(window_label).map(str::to_string)
             else {
@@ -2144,6 +2195,33 @@ impl ImageUiApp {
                     "zoom set dialog is not implemented yet",
                 ))
             }
+            "process.fft.make_circular_selection" => {
+                let Some(session) = self.state.label_to_session.get(window_label) else {
+                    return Some(command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required for circular selection",
+                    ));
+                };
+                let radius = params
+                    .and_then(|params| params.get("radius"))
+                    .and_then(Value::as_f64)
+                    .map(|value| value as f32);
+                let roi = match centered_circular_roi(&session.committed_summary.shape, radius) {
+                    Ok(roi) => roi,
+                    Err(error) => {
+                        return Some(command_registry::CommandExecuteResult::blocked(error));
+                    }
+                };
+                let position = interaction::roi::RoiPosition {
+                    channel: viewer.channel,
+                    z: viewer.z,
+                    t: viewer.t,
+                };
+                viewer.rois.begin_active(roi, position);
+                viewer.rois.commit_active(false);
+                Some(command_registry::CommandExecuteResult::ok(
+                    "circular selection created",
+                ))
+            }
             "image.zoom.maximize" => {
                 viewer.pending_zoom = Some(ZoomCommand::Maximize);
                 Some(command_registry::CommandExecuteResult::ok("zoom maximized"))
@@ -2281,6 +2359,20 @@ impl ImageUiApp {
                     json!({ "target": target }),
                 )
             }
+            "edit.invert" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "intensity.invert".to_string(),
+                    params: json!({}),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "invert started",
+                    json!({ "job_id": ticket.job_id, "op": "intensity.invert" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
             "image.type.8bit" | "image.type.16bit" | "image.type.32bit" | "image.type.rgb" => {
                 let target = match request.command_id.as_str() {
                     "image.type.8bit" => "u8",
@@ -2304,7 +2396,119 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
-            "process.smooth" | "process.gaussian" => {
+            "image.transform.flip_horizontal"
+            | "image.transform.flip_vertical"
+            | "image.transform.flip_z"
+            | "image.stacks.reverse" => {
+                let axis = match request.command_id.as_str() {
+                    "image.transform.flip_horizontal" => "horizontal",
+                    "image.transform.flip_vertical" => "vertical",
+                    "image.transform.flip_z" | "image.stacks.reverse" => "z",
+                    _ => unreachable!(),
+                };
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.flip".to_string(),
+                        params: json!({ "axis": axis }),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "flip started",
+                        json!({ "job_id": ticket.job_id, "axis": axis }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.transform.rotate_right" | "image.transform.rotate_left" => {
+                let direction = if request.command_id.ends_with("right") {
+                    "right"
+                } else {
+                    "left"
+                };
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.rotate_90".to_string(),
+                        params: json!({ "direction": direction }),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "rotation started",
+                        json!({ "job_id": ticket.job_id, "direction": direction }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.transform.rotate" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.rotate".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "rotation started",
+                        json!({ "job_id": ticket.job_id, "op": "image.rotate" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.transform.translate" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.translate".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "translation started",
+                        json!({ "job_id": ticket.job_id, "op": "image.translate" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.transform.bin" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.bin".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "binning started",
+                        json!({ "job_id": ticket.job_id, "op": "image.bin" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.transform.image_to_results" => match self.image_to_results(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "image.transform.results_to_image" => match self.results_to_image() {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.filters.show_circular_masks" => match self.show_circular_masks() {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.smooth"
+            | "process.gaussian"
+            | "process.filters.gaussian"
+            | "process.filters.gaussian_3d" => {
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
                     window_label,
@@ -2337,6 +2541,23 @@ impl ImageUiApp {
                 self.canvas_dialog.open = true;
                 command_registry::CommandExecuteResult::ok("canvas size dialog opened")
             }
+            "image.adjust.coordinates" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.coordinates".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "coordinate calibration started",
+                        json!({ "job_id": ticket.job_id, "op": "image.coordinates" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "image.adjust.brightness" => match self.viewer_start_op(
                 window_label,
                 ViewerOpRequest {
@@ -2351,25 +2572,65 @@ impl ImageUiApp {
                 ),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
-            "image.adjust.threshold" | "process.binary.make" => match self.viewer_start_op(
-                window_label,
-                ViewerOpRequest {
-                    op: "threshold.otsu".to_string(),
-                    params: json!({}),
-                    mode: OpRunMode::Apply,
-                },
-            ) {
-                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
-                    "binary threshold started",
-                    json!({ "job_id": ticket.job_id }),
-                ),
-                Err(error) => command_registry::CommandExecuteResult::blocked(error),
-            },
-            "process.binary.erode" | "process.binary.dilate" => {
-                let op = if request.command_id.ends_with("erode") {
-                    "morphology.erode"
-                } else {
-                    "morphology.dilate"
+            "image.adjust.window_level" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "intensity.window".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "window/level started",
+                        json!({ "job_id": ticket.job_id, "op": "intensity.window" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.adjust.threshold" | "process.binary.make" | "process.binary.convert_mask" => {
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "threshold.otsu".to_string(),
+                        params: json!({}),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "binary threshold started",
+                        json!({ "job_id": ticket.job_id, "op": "threshold.otsu" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.binary.erode"
+            | "process.binary.dilate"
+            | "process.binary.open"
+            | "process.binary.close"
+            | "process.binary.median"
+            | "process.binary.outline"
+            | "process.binary.fill_holes"
+            | "process.binary.skeletonize"
+            | "process.binary.distance_map"
+            | "process.binary.ultimate_points"
+            | "process.binary.watershed"
+            | "process.binary.voronoi" => {
+                let op = match request.command_id.as_str() {
+                    "process.binary.erode" => "morphology.erode",
+                    "process.binary.dilate" => "morphology.dilate",
+                    "process.binary.open" => "morphology.open",
+                    "process.binary.close" => "morphology.close",
+                    "process.binary.median" => "morphology.binary_median",
+                    "process.binary.outline" => "morphology.outline",
+                    "process.binary.fill_holes" => "morphology.fill_holes",
+                    "process.binary.skeletonize" => "morphology.skeletonize",
+                    "process.binary.distance_map" => "morphology.distance_map",
+                    "process.binary.ultimate_points" => "morphology.ultimate_points",
+                    "process.binary.watershed" => "morphology.watershed",
+                    "process.binary.voronoi" => "morphology.voronoi",
+                    _ => unreachable!(),
                 };
                 match self.viewer_start_op(
                     window_label,
@@ -2382,6 +2643,258 @@ impl ImageUiApp {
                     Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
                         "binary morphology started",
                         json!({ "job_id": ticket.job_id, "op": op }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            command_id if command_id.starts_with("process.math.") => {
+                if command_id == "process.math.nan_background" {
+                    let params =
+                        command_registry::merge_params(&request.command_id, request.params);
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "intensity.nan_background".to_string(),
+                            params,
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "nan background started",
+                            json!({ "job_id": ticket.job_id, "op": "intensity.nan_background" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "intensity.math".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "math operation started",
+                        json!({ "job_id": ticket.job_id, "op": "intensity.math" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.noise.add" | "process.noise.specified" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "noise.gaussian".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "noise operation started",
+                        json!({ "job_id": ticket.job_id, "op": "noise.gaussian" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.noise.salt_pepper" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "noise.salt_and_pepper".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "salt and pepper noise started",
+                        json!({ "job_id": ticket.job_id, "op": "noise.salt_and_pepper" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.noise.despeckle" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.median_filter".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "despeckle started",
+                        json!({ "job_id": ticket.job_id, "op": "image.median_filter" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.noise.remove_nans" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.remove_nans".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "remove NaNs started",
+                        json!({ "job_id": ticket.job_id, "op": "image.remove_nans" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.noise.remove_outliers" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.remove_outliers".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "remove outliers started",
+                        json!({ "job_id": ticket.job_id, "op": "image.remove_outliers" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.shadows.demo" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.shadow_demo".to_string(),
+                    params: command_registry::merge_params(&request.command_id, request.params),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "shadows demo started",
+                    json!({ "job_id": ticket.job_id, "op": "image.shadow_demo" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            command_id if command_id.starts_with("process.shadows.") => {
+                let direction = command_id
+                    .strip_prefix("process.shadows.")
+                    .unwrap_or_default()
+                    .to_string();
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.shadow".to_string(),
+                        params: json!({ "direction": direction }),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "shadow filter started",
+                        json!({ "job_id": ticket.job_id, "op": "image.shadow" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.filters.median" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.median_filter".to_string(),
+                    params: json!({ "radius": 2.0 }),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "rank filter started",
+                    json!({ "job_id": ticket.job_id, "op": "image.median_filter" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.filters.convolve" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.convolve".to_string(),
+                    params: json!({
+                        "width": 3,
+                        "height": 3,
+                        "kernel": [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                        "normalize": false
+                    }),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "convolve filter started",
+                    json!({ "job_id": ticket.job_id, "op": "image.convolve" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.filters.median_3d"
+            | "process.filters.mean_3d"
+            | "process.filters.minimum_3d"
+            | "process.filters.maximum_3d"
+            | "process.filters.variance_3d" => {
+                let filter = request
+                    .command_id
+                    .strip_prefix("process.filters.")
+                    .and_then(|value| value.strip_suffix("_3d"))
+                    .unwrap_or_default()
+                    .to_string();
+                let mut params =
+                    command_registry::merge_params(&request.command_id, request.params);
+                if let Some(params) = params.as_object_mut() {
+                    params.insert("filter".to_string(), json!(filter));
+                }
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.rank_filter_3d".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "3D rank filter started",
+                        json!({ "job_id": ticket.job_id, "op": "image.rank_filter_3d" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.filters.unsharp_mask" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.unsharp_mask".to_string(),
+                    params: json!({ "sigma": 1.0, "weight": 0.6 }),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "unsharp mask started",
+                    json!({ "job_id": ticket.job_id, "op": "image.unsharp_mask" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            command_id if command_id.starts_with("process.filters.") => {
+                let filter = command_id
+                    .strip_prefix("process.filters.")
+                    .unwrap_or_default()
+                    .to_string();
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.rank_filter".to_string(),
+                        params: json!({ "filter": filter, "radius": 2.0 }),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "rank filter started",
+                        json!({ "job_id": ticket.job_id, "op": "image.rank_filter" }),
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
@@ -2403,6 +2916,51 @@ impl ImageUiApp {
                     Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
                         "filter started",
                         json!({ "job_id": ticket.job_id, "op": op }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "process.fft.swap_quadrants" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.swap_quadrants".to_string(),
+                    params: json!({}),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "swap quadrants started",
+                    json!({ "job_id": ticket.job_id, "op": "image.swap_quadrants" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.fft.fft" => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.fft_power_spectrum".to_string(),
+                    params: json!({}),
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "FFT power spectrum started",
+                    json!({ "job_id": ticket.job_id, "op": "image.fft_power_spectrum" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "process.fft.bandpass" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.fft_bandpass".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "FFT bandpass started",
+                        json!({ "job_id": ticket.job_id, "op": "image.fft_bandpass" }),
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
@@ -4074,6 +4632,7 @@ impl ImageUiApp {
                         ui.painter(),
                         viewer,
                         image_rect,
+                        self.tool_options.line_width_px,
                         interaction::roi::RoiPosition {
                             channel: viewer.channel,
                             z: viewer.z,
@@ -4796,6 +5355,29 @@ fn roi_bounds(kind: &RoiKind) -> Option<egui::Rect> {
     }
 }
 
+fn centered_circular_roi(shape: &[usize], radius: Option<f32>) -> Result<RoiKind, String> {
+    if shape.len() < 2 {
+        return Err("circular selection requires X/Y dimensions".to_string());
+    }
+    let height = shape[0] as f32;
+    let width = shape[1] as f32;
+    if width <= 0.0 || height <= 0.0 {
+        return Err("circular selection requires non-empty X/Y dimensions".to_string());
+    }
+    let mut radius = radius.unwrap_or(width / 4.0);
+    if !radius.is_finite() || radius < 0.0 {
+        return Err("circular selection radius must be a finite non-negative value".to_string());
+    }
+    radius = radius.min(width / 2.0).min(height / 2.0);
+    let center = egui::pos2(width / 2.0, height / 2.0);
+    Ok(RoiKind::Oval {
+        start: egui::pos2(center.x - radius, center.y - radius),
+        end: egui::pos2(center.x + radius, center.y + radius),
+        ellipse: false,
+        brush: false,
+    })
+}
+
 fn drag_roi_for_tool(
     tool: ToolId,
     options: &ToolOptionsState,
@@ -4855,14 +5437,16 @@ fn draw_rois(
     painter: &egui::Painter,
     viewer: &ViewerUiState,
     canvas_rect: egui::Rect,
+    line_width_px: f32,
     position: interaction::roi::RoiPosition,
 ) {
     for roi in viewer.rois.visible_rois(position) {
         let selected = viewer.rois.selected_roi_id == Some(roi.id);
+        let width = roi_stroke_width(line_width_px, selected);
         let stroke = if selected {
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 212, 26))
+            egui::Stroke::new(width, egui::Color32::from_rgb(255, 212, 26))
         } else {
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(52, 212, 255))
+            egui::Stroke::new(width, egui::Color32::from_rgb(52, 212, 255))
         };
 
         match &roi.kind {
@@ -5052,6 +5636,24 @@ fn preview_cache_key(op: &str, params: &Value) -> Result<String, String> {
     let encoded = serde_json::to_string(&normalized)
         .map_err(|error| format!("invalid preview params: {error}"))?;
     Ok(format!("{op}:{encoded}"))
+}
+
+fn line_width_from_params(params: &Value) -> Result<f32, String> {
+    let width = params.get("width").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    if !width.is_finite() || width <= 0.0 {
+        return Err("line width must be a finite positive number".to_string());
+    }
+    Ok(width)
+}
+
+fn roi_stroke_width(line_width_px: f32, selected: bool) -> f32 {
+    let width = if line_width_px.is_finite() {
+        line_width_px
+    } else {
+        1.0
+    }
+    .max(1.0);
+    if selected { width + 0.5 } else { width }
 }
 
 fn value_to_display(value: &Value) -> String {
@@ -5330,6 +5932,145 @@ fn measurement_row_from_slice(
         row.insert("channel".into(), json!(channel));
     }
     row
+}
+
+fn image_slice_to_results_rows(
+    slice: &SliceImage,
+    bbox: Option<(usize, usize, usize, usize)>,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    let (min_x, min_y, max_x, max_y) = clamped_bbox(slice.width, slice.height, bbox)
+        .ok_or_else(|| "image slice is empty".to_string())?;
+    let mut rows = Vec::with_capacity(max_y - min_y + 1);
+    for y in min_y..=max_y {
+        let mut row = BTreeMap::new();
+        row.insert("Label".to_string(), json!(format!("Y{y}")));
+        for x in min_x..=max_x {
+            row.insert(format!("X{x}"), json!(slice.values[x + y * slice.width]));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn results_rows_to_dataset(rows: &[BTreeMap<String, Value>]) -> Result<DatasetF32, String> {
+    if rows.is_empty() {
+        return Err("results table is empty".to_string());
+    }
+    let columns = numeric_results_columns(rows);
+    if columns.is_empty() {
+        return Err("results table has no numeric columns".to_string());
+    }
+    let width = columns.len();
+    let height = rows.len();
+    let mut values = Vec::with_capacity(width * height);
+    for row in rows {
+        for column in &columns {
+            values.push(row.get(column).and_then(Value::as_f64).unwrap_or(f64::NAN) as f32);
+        }
+    }
+    let data = ArrayD::from_shape_vec(IxDyn(&[height, width]), values)
+        .map_err(|error| format!("results image shape error: {error}"))?;
+    let metadata = Metadata {
+        dims: vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
+fn create_circular_masks_dataset() -> Result<DatasetF32, String> {
+    const WIDTH: usize = 150;
+    const HEIGHT: usize = 150;
+    const SLICES: usize = 99;
+
+    let mut values = vec![0.0_f32; WIDTH * HEIGHT * SLICES];
+    for slice in 0..SLICES {
+        let radius = 0.5 + slice as f32 * 0.5;
+        let line_radii = circular_mask_line_radii(radius);
+        let kernel_height = line_radii.len();
+        let y0 = HEIGHT / 2 - kernel_height / 2;
+        for (line, (left, right)) in line_radii.iter().enumerate() {
+            let y = y0 + line;
+            for x in (WIDTH as isize / 2 + left)..=(WIDTH as isize / 2 + right) {
+                let x = x as usize;
+                values[(y * WIDTH + x) * SLICES + slice] = 1.0;
+            }
+        }
+    }
+
+    let data = ArrayD::from_shape_vec(IxDyn(&[HEIGHT, WIDTH, SLICES]), values)
+        .map_err(|error| format!("circular masks shape error: {error}"))?;
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, HEIGHT),
+            Dim::new(AxisKind::X, WIDTH),
+            Dim::new(AxisKind::Z, SLICES),
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
+fn circular_mask_line_radii(radius: f32) -> Vec<(isize, isize)> {
+    let radius = if (1.5..1.75).contains(&radius) {
+        1.75
+    } else if (2.5..2.85).contains(&radius) {
+        2.85
+    } else {
+        radius
+    };
+    let r2 = (radius * radius) as isize + 1;
+    let kernel_radius = ((r2 as f32 + 1.0e-10).sqrt()) as isize;
+    let mut line_radii = Vec::with_capacity(2 * kernel_radius as usize + 1);
+    for y in -kernel_radius..=kernel_radius {
+        let dx = ((r2 - y * y) as f32 + 1.0e-10).sqrt() as isize;
+        line_radii.push((-dx, dx));
+    }
+    line_radii
+}
+
+fn numeric_results_columns(rows: &[BTreeMap<String, Value>]) -> Vec<String> {
+    let mut columns = Vec::new();
+    for row in rows {
+        for (key, value) in row {
+            if key == "Label" || !value.is_number() || columns.contains(key) {
+                continue;
+            }
+            columns.push(key.clone());
+        }
+    }
+    columns.sort_by(
+        |left, right| match (x_column_index(left), x_column_index(right)) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        },
+    );
+    columns
+}
+
+fn x_column_index(column: &str) -> Option<usize> {
+    column.strip_prefix('X')?.parse().ok()
+}
+
+fn clamped_bbox(
+    width: usize,
+    height: usize,
+    bbox: Option<(usize, usize, usize, usize)>,
+) -> Option<(usize, usize, usize, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (min_x, min_y, max_x, max_y) =
+        bbox.unwrap_or((0, 0, width.saturating_sub(1), height.saturating_sub(1)));
+    let min_x = min_x.min(width - 1);
+    let min_y = min_y.min(height - 1);
+    let max_x = max_x.min(width - 1);
+    let max_y = max_y.min(height - 1);
+    if max_x < min_x || max_y < min_y {
+        return None;
+    }
+    Some((min_x, min_y, max_x, max_y))
 }
 
 fn mean_profile_rect(
@@ -5792,23 +6533,25 @@ pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::model::{DatasetF32, PixelType};
+    use crate::model::{AxisKind, DatasetF32, PixelType};
     use crate::ui::interaction::transform::ViewerTransformState;
     use eframe::egui;
-    use ndarray::Array;
+    use ndarray::{Array, IxDyn};
     use serde_json::json;
 
     use super::{
         HoverInfo, ImageSummary, LauncherStatusModel, NativeRasterImage, ProgressState,
-        RepaintDecisionInputs, ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest,
-        ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState, ZoomCommand,
-        apply_zoom_command, build_frame, canonical_json, compute_initial_viewport_size,
-        compute_viewer_frame, dominant_scroll_component, effective_scroll_delta,
-        format_launcher_status, image_draw_rect, initialize_view_to_open_state, preview_cache_key,
+        RepaintDecisionInputs, RoiKind, SliceImage, ToolId, UiState, ViewerFrameBuffer,
+        ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState,
+        ZoomCommand, apply_zoom_command, build_frame, canonical_json, centered_circular_roi,
+        compute_initial_viewport_size, compute_viewer_frame, create_circular_masks_dataset,
+        dominant_scroll_component, effective_scroll_delta, format_launcher_status, image_draw_rect,
+        image_slice_to_results_rows, initialize_view_to_open_state, line_width_from_params,
+        preview_cache_key, results_rows_to_dataset, roi_stroke_width,
         should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
         tool_from_command_id, tool_shortcut_command, viewer_sort_key,
     };
@@ -5863,6 +6606,92 @@ mod tests {
     }
 
     #[test]
+    fn line_width_from_params_accepts_positive_width() {
+        assert_eq!(line_width_from_params(&json!({})).expect("default"), 1.0);
+        assert_eq!(
+            line_width_from_params(&json!({"width": 5.5})).expect("custom"),
+            5.5
+        );
+        assert!(line_width_from_params(&json!({"width": 0.0})).is_err());
+        assert!(line_width_from_params(&json!({"width": -1.0})).is_err());
+    }
+
+    #[test]
+    fn roi_stroke_width_uses_line_width_and_selection_emphasis() {
+        assert_eq!(roi_stroke_width(3.0, false), 3.0);
+        assert_eq!(roi_stroke_width(3.0, true), 3.5);
+        assert_eq!(roi_stroke_width(0.0, false), 1.0);
+    }
+
+    #[test]
+    fn image_slice_to_results_rows_uses_imagej_y_labels_and_x_columns() {
+        let slice = SliceImage {
+            width: 3,
+            height: 2,
+            values: vec![
+                1.0, 2.0, 3.0, //
+                4.0, 5.0, 6.0,
+            ],
+        };
+
+        let rows =
+            image_slice_to_results_rows(&slice, Some((1, 0, 2, 1))).expect("image to results");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("Label"), Some(&json!("Y0")));
+        assert_eq!(rows[0].get("X1"), Some(&json!(2.0)));
+        assert_eq!(rows[0].get("X2"), Some(&json!(3.0)));
+        assert_eq!(rows[1].get("Label"), Some(&json!("Y1")));
+        assert_eq!(rows[1].get("X1"), Some(&json!(5.0)));
+        assert_eq!(rows[1].get("X2"), Some(&json!(6.0)));
+    }
+
+    #[test]
+    fn results_rows_to_dataset_sorts_imagej_x_columns_numerically() {
+        let mut row0 = BTreeMap::new();
+        row0.insert("Label".to_string(), json!("Y0"));
+        row0.insert("X10".to_string(), json!(10.0));
+        row0.insert("X2".to_string(), json!(2.0));
+        row0.insert("X1".to_string(), json!(1.0));
+        let mut row1 = BTreeMap::new();
+        row1.insert("Label".to_string(), json!("Y1"));
+        row1.insert("X10".to_string(), json!(20.0));
+        row1.insert("X2".to_string(), json!(4.0));
+        row1.insert("X1".to_string(), json!(3.0));
+
+        let dataset = results_rows_to_dataset(&[row0, row1]).expect("results to image");
+
+        assert_eq!(dataset.shape(), &[2, 3]);
+        assert_eq!(
+            dataset.data.iter().copied().collect::<Vec<_>>(),
+            vec![1.0, 2.0, 10.0, 3.0, 4.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn results_rows_to_dataset_rejects_empty_or_non_numeric_results() {
+        assert!(results_rows_to_dataset(&[]).is_err());
+        let mut row = BTreeMap::new();
+        row.insert("Label".to_string(), json!("Y0"));
+        row.insert("Name".to_string(), json!("cell"));
+        let error = results_rows_to_dataset(&[row]).expect_err("non-numeric results");
+        assert!(error.contains("no numeric columns"));
+    }
+
+    #[test]
+    fn create_circular_masks_dataset_matches_imagej_stack_shape() {
+        let dataset = create_circular_masks_dataset().expect("circular masks");
+
+        assert_eq!(dataset.shape(), &[150, 150, 99]);
+        assert_eq!(dataset.metadata.dims[0].axis, AxisKind::Y);
+        assert_eq!(dataset.metadata.dims[1].axis, AxisKind::X);
+        assert_eq!(dataset.metadata.dims[2].axis, AxisKind::Z);
+        assert_eq!(dataset.data[IxDyn(&[75, 75, 0])], 1.0);
+        assert_eq!(dataset.data[IxDyn(&[75, 76, 0])], 1.0);
+        assert_eq!(dataset.data[IxDyn(&[75, 77, 0])], 0.0);
+    }
+
+    #[test]
     fn viewer_sort_key_uses_numeric_suffix() {
         assert_eq!(viewer_sort_key("viewer-42"), 42);
         assert_eq!(viewer_sort_key("viewer-abc"), u64::MAX);
@@ -5901,6 +6730,37 @@ mod tests {
         assert_eq!(tool_shortcut_command("a"), Some("launcher.tool.angle"));
         assert_eq!(tool_shortcut_command("."), Some("launcher.tool.point"));
         assert_eq!(tool_shortcut_command("?"), None);
+    }
+
+    #[test]
+    fn centered_circular_roi_uses_imagej_default_radius() {
+        let roi = centered_circular_roi(&[80, 120], None).expect("roi");
+        let RoiKind::Oval {
+            start,
+            end,
+            ellipse,
+            brush,
+        } = roi
+        else {
+            panic!("expected oval ROI");
+        };
+
+        assert_eq!(start, egui::pos2(30.0, 10.0));
+        assert_eq!(end, egui::pos2(90.0, 70.0));
+        assert!(!ellipse);
+        assert!(!brush);
+    }
+
+    #[test]
+    fn centered_circular_roi_caps_radius_to_image_bounds() {
+        let roi = centered_circular_roi(&[40, 120], Some(100.0)).expect("roi");
+        let RoiKind::Oval { start, end, .. } = roi else {
+            panic!("expected oval ROI");
+        };
+
+        assert_eq!(start, egui::pos2(40.0, 0.0));
+        assert_eq!(end, egui::pos2(80.0, 40.0));
+        assert!(centered_circular_roi(&[40, 120], Some(-1.0)).is_err());
     }
 
     #[test]

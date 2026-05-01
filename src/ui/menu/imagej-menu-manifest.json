@@ -52,12 +52,14 @@
       { "type": "item", "id": "edit.cut", "label": "Cut", "shortcut": "Ctrl+X" },
       { "type": "item", "id": "edit.copy", "label": "Copy", "shortcut": "Ctrl+C" },
       { "type": "item", "id": "edit.paste", "label": "Paste", "shortcut": "Ctrl+V" },
+      { "type": "item", "id": "edit.invert", "label": "Invert", "shortcut": "Shift+I" },
       { "type": "separator" },
       {
         "type": "submenu",
         "id": "edit.options",
         "label": "Options",
         "items": [
+          { "type": "item", "id": "edit.options.line_width", "label": "Line Width..." },
           { "type": "item", "id": "edit.options.appearance", "label": "Appearance..." },
           { "type": "item", "id": "edit.options.memory", "label": "Memory & Threads..." }
         ]
@@ -85,9 +87,12 @@
         "label": "Adjust",
         "items": [
           { "type": "item", "id": "image.adjust.brightness", "label": "Brightness/Contrast..." },
+          { "type": "item", "id": "image.adjust.window_level", "label": "Window/Level..." },
           { "type": "item", "id": "image.adjust.threshold", "label": "Threshold..." },
           { "type": "item", "id": "image.adjust.size", "label": "Size..." },
-          { "type": "item", "id": "image.adjust.canvas", "label": "Canvas Size..." }
+          { "type": "item", "id": "image.adjust.canvas", "label": "Canvas Size..." },
+          { "type": "item", "id": "image.adjust.line_width", "label": "Line Width..." },
+          { "type": "item", "id": "image.adjust.coordinates", "label": "Coordinates..." }
         ]
       },
       {
@@ -97,7 +102,28 @@
         "items": [
           { "type": "item", "id": "image.stacks.next", "label": "Next Slice", "shortcut": ">" },
           { "type": "item", "id": "image.stacks.previous", "label": "Previous Slice", "shortcut": "<" },
-          { "type": "item", "id": "image.stacks.set", "label": "Set Slice..." }
+          { "type": "item", "id": "image.stacks.set", "label": "Set Slice..." },
+          { "type": "separator" },
+          { "type": "item", "id": "image.stacks.reverse", "label": "Reverse" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "image.transform",
+        "label": "Transform",
+        "items": [
+          { "type": "item", "id": "image.transform.flip_horizontal", "label": "Flip Horizontally" },
+          { "type": "item", "id": "image.transform.flip_vertical", "label": "Flip Vertically" },
+          { "type": "item", "id": "image.transform.flip_z", "label": "Flip Z" },
+          { "type": "separator" },
+          { "type": "item", "id": "image.transform.rotate_right", "label": "Rotate 90 Degrees Right" },
+          { "type": "item", "id": "image.transform.rotate_left", "label": "Rotate 90 Degrees Left" },
+          { "type": "item", "id": "image.transform.rotate", "label": "Rotate..." },
+          { "type": "item", "id": "image.transform.translate", "label": "Translate..." },
+          { "type": "item", "id": "image.transform.bin", "label": "Bin..." },
+          { "type": "separator" },
+          { "type": "item", "id": "image.transform.image_to_results", "label": "Image to Results" },
+          { "type": "item", "id": "image.transform.results_to_image", "label": "Results to Image" }
         ]
       },
       {
@@ -127,12 +153,114 @@
       { "type": "item", "id": "process.find_edges", "label": "Find Edges" },
       {
         "type": "submenu",
+        "id": "process.noise",
+        "label": "Noise",
+        "items": [
+          { "type": "item", "id": "process.noise.add", "label": "Add Noise" },
+          { "type": "item", "id": "process.noise.specified", "label": "Add Specified Noise..." },
+          { "type": "item", "id": "process.noise.salt_pepper", "label": "Salt and Pepper" },
+          { "type": "item", "id": "process.noise.despeckle", "label": "Despeckle" },
+          { "type": "item", "id": "process.noise.remove_outliers", "label": "Remove Outliers..." },
+          { "type": "item", "id": "process.noise.remove_nans", "label": "Remove NaNs..." }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "process.shadows",
+        "label": "Shadows",
+        "items": [
+          { "type": "item", "id": "process.shadows.north", "label": "North" },
+          { "type": "item", "id": "process.shadows.northeast", "label": "Northeast" },
+          { "type": "item", "id": "process.shadows.east", "label": "East" },
+          { "type": "item", "id": "process.shadows.southeast", "label": "Southeast" },
+          { "type": "item", "id": "process.shadows.south", "label": "South" },
+          { "type": "item", "id": "process.shadows.southwest", "label": "Southwest" },
+          { "type": "item", "id": "process.shadows.west", "label": "West" },
+          { "type": "item", "id": "process.shadows.northwest", "label": "Northwest" },
+          { "type": "separator" },
+          { "type": "item", "id": "process.shadows.demo", "label": "Shadows Demo" }
+        ]
+      },
+      {
+        "type": "submenu",
+      "id": "process.filters",
+      "label": "Filters",
+        "items": [
+          { "type": "item", "id": "process.filters.convolve", "label": "Convolve..." },
+          { "type": "item", "id": "process.filters.gaussian", "label": "Gaussian Blur..." },
+          { "type": "item", "id": "process.filters.median", "label": "Median..." },
+        { "type": "item", "id": "process.filters.mean", "label": "Mean..." },
+          { "type": "item", "id": "process.filters.minimum", "label": "Minimum..." },
+          { "type": "item", "id": "process.filters.maximum", "label": "Maximum..." },
+          { "type": "item", "id": "process.filters.unsharp_mask", "label": "Unsharp Mask..." },
+          { "type": "item", "id": "process.filters.variance", "label": "Variance..." },
+          { "type": "item", "id": "process.filters.top_hat", "label": "Top Hat..." },
+          { "type": "item", "id": "process.filters.gaussian_3d", "label": "Gaussian Blur 3D..." },
+          { "type": "item", "id": "process.filters.median_3d", "label": "Median 3D..." },
+          { "type": "item", "id": "process.filters.mean_3d", "label": "Mean 3D..." },
+          { "type": "item", "id": "process.filters.minimum_3d", "label": "Minimum 3D..." },
+          { "type": "item", "id": "process.filters.maximum_3d", "label": "Maximum 3D..." },
+          { "type": "item", "id": "process.filters.variance_3d", "label": "Variance 3D..." },
+          { "type": "separator" },
+          { "type": "item", "id": "process.filters.show_circular_masks", "label": "Show Circular Masks..." }
+        ]
+      },
+      {
+        "type": "submenu",
         "id": "process.binary",
         "label": "Binary",
         "items": [
           { "type": "item", "id": "process.binary.make", "label": "Make Binary" },
+          { "type": "item", "id": "process.binary.convert_mask", "label": "Convert to Mask" },
           { "type": "item", "id": "process.binary.erode", "label": "Erode" },
-          { "type": "item", "id": "process.binary.dilate", "label": "Dilate" }
+          { "type": "item", "id": "process.binary.dilate", "label": "Dilate" },
+          { "type": "item", "id": "process.binary.open", "label": "Open" },
+          { "type": "item", "id": "process.binary.close", "label": "Close-" },
+          { "type": "item", "id": "process.binary.median", "label": "Median" },
+          { "type": "item", "id": "process.binary.outline", "label": "Outline" },
+          { "type": "item", "id": "process.binary.fill_holes", "label": "Fill Holes" },
+          { "type": "item", "id": "process.binary.skeletonize", "label": "Skeletonize" },
+          { "type": "item", "id": "process.binary.distance_map", "label": "Distance Map" },
+          { "type": "item", "id": "process.binary.ultimate_points", "label": "Ultimate Points" },
+          { "type": "item", "id": "process.binary.watershed", "label": "Watershed" },
+          { "type": "item", "id": "process.binary.voronoi", "label": "Voronoi" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "process.math",
+        "label": "Math",
+        "items": [
+          { "type": "item", "id": "process.math.add", "label": "Add..." },
+          { "type": "item", "id": "process.math.subtract", "label": "Subtract..." },
+          { "type": "item", "id": "process.math.multiply", "label": "Multiply..." },
+          { "type": "item", "id": "process.math.divide", "label": "Divide..." },
+          { "type": "item", "id": "process.math.and", "label": "AND..." },
+          { "type": "item", "id": "process.math.or", "label": "OR..." },
+          { "type": "item", "id": "process.math.xor", "label": "XOR..." },
+          { "type": "item", "id": "process.math.min", "label": "Min..." },
+          { "type": "item", "id": "process.math.max", "label": "Max..." },
+          { "type": "item", "id": "process.math.gamma", "label": "Gamma..." },
+          { "type": "item", "id": "process.math.set", "label": "Set..." },
+          { "type": "separator" },
+          { "type": "item", "id": "process.math.log", "label": "Log" },
+          { "type": "item", "id": "process.math.exp", "label": "Exp" },
+          { "type": "item", "id": "process.math.square", "label": "Square" },
+          { "type": "item", "id": "process.math.sqrt", "label": "Square Root" },
+          { "type": "item", "id": "process.math.reciprocal", "label": "Reciprocal" },
+          { "type": "item", "id": "process.math.nan_background", "label": "NaN Background" },
+          { "type": "item", "id": "process.math.abs", "label": "Abs" }
+        ]
+      },
+      {
+        "type": "submenu",
+        "id": "process.fft",
+        "label": "FFT",
+        "items": [
+          { "type": "item", "id": "process.fft.fft", "label": "FFT" },
+          { "type": "item", "id": "process.fft.bandpass", "label": "Bandpass Filter..." },
+          { "type": "item", "id": "process.fft.swap_quadrants", "label": "Swap Quadrants" },
+          { "type": "item", "id": "process.fft.make_circular_selection", "label": "Make Circular Selection..." }
         ]
       }
     ]
