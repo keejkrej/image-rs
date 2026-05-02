@@ -108,10 +108,10 @@
         "id": "image.adjust",
         "label": "Adjust",
         "items": [
-          { "type": "item", "id": "image.adjust.brightness", "label": "Brightness/Contrast..." },
+          { "type": "item", "id": "image.adjust.brightness", "label": "Brightness/Contrast...", "shortcut": "C" },
           { "type": "item", "id": "image.adjust.window_level", "label": "Window/Level..." },
           { "type": "item", "id": "image.adjust.color_balance", "label": "Color Balance..." },
-          { "type": "item", "id": "image.adjust.threshold", "label": "Threshold..." },
+          { "type": "item", "id": "image.adjust.threshold", "label": "Threshold...", "shortcut": "T" },
           { "type": "item", "id": "image.adjust.color_threshold", "label": "Color Threshold..." },
           { "type": "item", "id": "image.adjust.size", "label": "Size..." },
           { "type": "item", "id": "image.adjust.canvas", "label": "Canvas Size..." },
@@ -120,7 +120,7 @@
         ]
       },
       { "type": "item", "id": "image.show_info", "label": "Show Info...", "shortcut": "I" },
-      { "type": "item", "id": "image.properties", "label": "Properties..." },
+      { "type": "item", "id": "image.properties", "label": "Properties...", "shortcut": "P" },
       {
         "type": "submenu",
         "id": "image.color",
@@ -130,14 +130,14 @@
           { "type": "item", "id": "image.color.merge_channels", "label": "Merge Channels..." },
           { "type": "item", "id": "image.color.arrange_channels", "label": "Arrange Channels..." },
           { "type": "item", "id": "image.color.invert_luts", "label": "Invert LUTs" },
-          { "type": "item", "id": "image.color.channels_tool", "label": "Channels Tool..." },
+          { "type": "item", "id": "image.color.channels_tool", "label": "Channels Tool...", "shortcut": "Z" },
           { "type": "separator" },
           { "type": "item", "id": "image.color.stack_to_rgb", "label": "Stack to RGB" },
           { "type": "item", "id": "image.color.make_composite", "command": "image.type.make_composite", "label": "Make Composite" },
           { "type": "item", "id": "image.color.show_lut", "label": "Show LUT" },
           { "type": "item", "id": "image.color.display_luts", "label": "Display LUTs" },
           { "type": "item", "id": "image.color.edit_lut", "label": "Edit LUT..." },
-          { "type": "item", "id": "image.color.color_picker", "label": "Color Picker..." }
+          { "type": "item", "id": "image.color.color_picker", "label": "Color Picker...", "shortcut": "K" }
         ]
       },
       {
@@ -154,8 +154,8 @@
           { "type": "item", "id": "image.stacks.images_to_stack", "label": "Images to Stack" },
           { "type": "item", "id": "image.stacks.stack_to_images", "label": "Stack to Images" },
           { "type": "item", "id": "image.stacks.make_montage", "label": "Make Montage..." },
-          { "type": "item", "id": "image.stacks.reslice", "label": "Reslice..." },
-          { "type": "item", "id": "image.stacks.orthogonal_views", "label": "Orthogonal Views" },
+          { "type": "item", "id": "image.stacks.reslice", "label": "Reslice...", "shortcut": "/" },
+          { "type": "item", "id": "image.stacks.orthogonal_views", "label": "Orthogonal Views", "shortcut": "H" },
           { "type": "item", "id": "image.stacks.z_project", "label": "Z Project..." },
           { "type": "item", "id": "image.stacks.project_3d", "label": "3D Project..." },
           { "type": "item", "id": "image.stacks.plot_z_profile", "label": "Plot Z-axis Profile" },
@@ -207,9 +207,9 @@
       },
       { "type": "separator" },
       { "type": "item", "id": "image.crop", "label": "Crop", "shortcut": "X" },
-      { "type": "item", "id": "image.duplicate", "label": "Duplicate..." },
+      { "type": "item", "id": "image.duplicate", "label": "Duplicate...", "shortcut": "D" },
       { "type": "item", "id": "image.rename", "label": "Rename..." },
-      { "type": "item", "id": "image.scale", "label": "Scale..." },
+      { "type": "item", "id": "image.scale", "label": "Scale...", "shortcut": "E" },
       {
         "type": "submenu",
         "id": "image.transform",
@@ -218,7 +218,6 @@
           { "type": "item", "id": "image.transform.flip_horizontal", "label": "Flip Horizontally" },
           { "type": "item", "id": "image.transform.flip_vertical", "label": "Flip Vertically" },
           { "type": "item", "id": "image.transform.flip_z", "label": "Flip Z" },
-          { "type": "separator" },
           { "type": "item", "id": "image.transform.rotate_right", "label": "Rotate 90 Degrees Right" },
           { "type": "item", "id": "image.transform.rotate_left", "label": "Rotate 90 Degrees Left" },
           { "type": "item", "id": "image.transform.rotate", "label": "Rotate..." },
@@ -236,7 +235,7 @@
         "items": [
           { "type": "item", "id": "image.zoom.in", "label": "In", "shortcut": "+" },
           { "type": "item", "id": "image.zoom.out", "label": "Out", "shortcut": "-" },
-          { "type": "item", "id": "image.zoom.original", "label": "Original Scale", "shortcut": "0" },
+          { "type": "item", "id": "image.zoom.original", "label": "Original Scale", "shortcut": "4" },
           { "type": "item", "id": "image.zoom.view100", "label": "View 100%", "shortcut": "5" },
           { "type": "item", "id": "image.zoom.to_selection", "label": "To Selection" },
           { "type": "item", "id": "image.zoom.scale_to_fit", "label": "Scale to Fit" },

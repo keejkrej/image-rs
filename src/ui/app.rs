@@ -507,6 +507,82 @@ impl Default for ResizeDialogState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdjustDialogKind {
+    BrightnessContrast,
+    WindowLevel,
+    ColorBalance,
+    Threshold,
+    ColorThreshold,
+    LineWidth,
+    Coordinates,
+}
+
+impl AdjustDialogKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::BrightnessContrast => "Brightness/Contrast",
+            Self::WindowLevel => "Window/Level",
+            Self::ColorBalance => "Color Balance",
+            Self::Threshold => "Threshold",
+            Self::ColorThreshold => "Color Threshold",
+            Self::LineWidth => "Line Width",
+            Self::Coordinates => "Coordinates",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AdjustDialogState {
+    open: bool,
+    window_label: String,
+    kind: AdjustDialogKind,
+    min: f32,
+    max: f32,
+    threshold: f32,
+    dark_background: bool,
+    red: f32,
+    green: f32,
+    blue: f32,
+    line_width: f32,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    front: f32,
+    back: f32,
+    x_unit: String,
+    y_unit: String,
+    z_unit: String,
+}
+
+impl Default for AdjustDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            kind: AdjustDialogKind::BrightnessContrast,
+            min: 0.0,
+            max: 1.0,
+            threshold: 0.5,
+            dark_background: true,
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            line_width: 1.0,
+            left: 0.0,
+            right: 512.0,
+            top: 0.0,
+            bottom: 512.0,
+            front: 0.0,
+            back: 1.0,
+            x_unit: "pixel".to_string(),
+            y_unit: "pixel".to_string(),
+            z_unit: "pixel".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StackPositionDialogState {
     open: bool,
@@ -2443,6 +2519,7 @@ struct ImageUiApp {
     clipboard: ClipboardState,
     profile_plot: PlotProfileState,
     new_image_dialog: NewImageDialogState,
+    adjust_dialog: AdjustDialogState,
     resize_dialog: ResizeDialogState,
     canvas_dialog: ResizeDialogState,
     stack_position_dialog: StackPositionDialogState,
@@ -2523,6 +2600,7 @@ impl ImageUiApp {
             clipboard: ClipboardState::default(),
             profile_plot: PlotProfileState::default(),
             new_image_dialog: NewImageDialogState::default(),
+            adjust_dialog: AdjustDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
@@ -4995,6 +5073,36 @@ impl ImageUiApp {
         self.execute_command(window_label, request)
     }
 
+    fn open_adjust_dialog(
+        &mut self,
+        window_label: &str,
+        kind: AdjustDialogKind,
+    ) -> command_registry::CommandExecuteResult {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        self.adjust_dialog.kind = kind;
+        self.adjust_dialog.window_label = target.clone();
+        self.adjust_dialog.open = true;
+        self.adjust_dialog.line_width = self.tool_options.line_width_px;
+
+        if let Some(session) = self.state.label_to_session.get(&target) {
+            let width = session.committed_summary.shape.get(1).copied().unwrap_or(1) as f32;
+            let height = session
+                .committed_summary
+                .shape
+                .first()
+                .copied()
+                .unwrap_or(1) as f32;
+            self.adjust_dialog.right = width;
+            self.adjust_dialog.bottom = height;
+            self.adjust_dialog.back = session.committed_summary.z_slices.max(1) as f32;
+        }
+
+        command_registry::CommandExecuteResult::ok(format!("{} dialog opened", kind.title()))
+    }
+
     fn remember_repeatable_command(
         &mut self,
         command_id: &str,
@@ -5241,6 +5349,9 @@ impl ImageUiApp {
         }
 
         if command_id == "edit.options.line_width" || command_id == "image.adjust.line_width" {
+            if params.is_none() {
+                return Some(self.open_adjust_dialog(window_label, AdjustDialogKind::LineWidth));
+            }
             let params = command_registry::merge_params(command_id, params.cloned());
             return Some(match line_width_from_params(&params) {
                 Ok(width) => {
@@ -6036,8 +6147,6 @@ impl ImageUiApp {
             | "image.color.show_lut"
             | "image.color.display_luts"
             | "image.color.edit_lut"
-            | "image.adjust.color_balance"
-            | "image.adjust.color_threshold"
             | "image.overlay.add_image"
             | "image.stacks.orthogonal_views"
             | "image.stacks.project_3d"
@@ -6054,6 +6163,33 @@ impl ImageUiApp {
                     "{} compatibility command acknowledged",
                     request.command_id
                 ))
+            }
+            "image.adjust.color_balance" => {
+                if request.params.is_none() {
+                    return self.open_adjust_dialog(window_label, AdjustDialogKind::ColorBalance);
+                }
+                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
+                    viewer.status_message =
+                        "image.adjust.color_balance compatibility command acknowledged".to_string();
+                    viewer.tool_message = Some(viewer.status_message.clone());
+                }
+                command_registry::CommandExecuteResult::ok(
+                    "image.adjust.color_balance compatibility command acknowledged",
+                )
+            }
+            "image.adjust.color_threshold" => {
+                if request.params.is_none() {
+                    return self.open_adjust_dialog(window_label, AdjustDialogKind::ColorThreshold);
+                }
+                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
+                    viewer.status_message =
+                        "image.adjust.color_threshold compatibility command acknowledged"
+                            .to_string();
+                    viewer.tool_message = Some(viewer.status_message.clone());
+                }
+                command_registry::CommandExecuteResult::ok(
+                    "image.adjust.color_threshold compatibility command acknowledged",
+                )
             }
             "image.stacks.add_slice" | "image.stacks.delete_slice" => {
                 let viewer_z = self
@@ -6732,6 +6868,9 @@ impl ImageUiApp {
                 command_registry::CommandExecuteResult::ok("canvas size dialog opened")
             }
             "image.adjust.coordinates" => {
+                if request.params.is_none() {
+                    return self.open_adjust_dialog(window_label, AdjustDialogKind::Coordinates);
+                }
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
                     window_label,
@@ -6748,20 +6887,27 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
-            "image.adjust.brightness" => match self.viewer_start_op(
-                window_label,
-                ViewerOpRequest {
-                    op: "intensity.normalize".to_string(),
-                    params: json!({}),
-                    mode: OpRunMode::Apply,
-                },
-            ) {
-                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
-                    "auto contrast applied",
-                    json!({ "job_id": ticket.job_id }),
-                ),
-                Err(error) => command_registry::CommandExecuteResult::blocked(error),
-            },
+            "image.adjust.brightness" => {
+                if request.params.is_none() {
+                    return self
+                        .open_adjust_dialog(window_label, AdjustDialogKind::BrightnessContrast);
+                }
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "intensity.normalize".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "brightness/contrast started",
+                        json!({ "job_id": ticket.job_id, "op": "intensity.normalize" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "process.enhance_contrast" => {
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
@@ -6797,6 +6943,9 @@ impl ImageUiApp {
                 }
             }
             "image.adjust.window_level" => {
+                if request.params.is_none() {
+                    return self.open_adjust_dialog(window_label, AdjustDialogKind::WindowLevel);
+                }
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.viewer_start_op(
                     window_label,
@@ -6814,17 +6963,30 @@ impl ImageUiApp {
                 }
             }
             "image.adjust.threshold" => {
+                if request.params.is_none() {
+                    return self.open_adjust_dialog(window_label, AdjustDialogKind::Threshold);
+                }
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                let op = if params
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(|method| method.eq_ignore_ascii_case("otsu"))
+                {
+                    "threshold.otsu"
+                } else {
+                    "threshold.make_binary"
+                };
                 match self.viewer_start_op(
                     window_label,
                     ViewerOpRequest {
-                        op: "threshold.otsu".to_string(),
-                        params: json!({}),
+                        op: op.to_string(),
+                        params,
                         mode: OpRunMode::Apply,
                     },
                 ) {
                     Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
                         "binary threshold started",
-                        json!({ "job_id": ticket.job_id, "op": "threshold.otsu" }),
+                        json!({ "job_id": ticket.job_id, "op": op }),
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
@@ -8367,6 +8529,7 @@ impl ImageUiApp {
 
     fn draw_utility_windows(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
         self.draw_new_image_dialog(ctx, actions);
+        self.draw_adjust_dialog(ctx, actions);
         self.draw_resize_dialog(ctx, actions, false);
         self.draw_resize_dialog(ctx, actions, true);
         self.draw_stack_position_dialog(ctx, actions);
@@ -8929,6 +9092,196 @@ impl ImageUiApp {
                 }
             });
         self.new_image_dialog.open = open;
+    }
+
+    fn draw_adjust_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.adjust_dialog.open {
+            return;
+        }
+
+        let kind = self.adjust_dialog.kind;
+        let mut open = self.adjust_dialog.open;
+        let mut close = false;
+        egui::Window::new(kind.title())
+            .open(&mut open)
+            .show(ctx, |ui| match kind {
+                AdjustDialogKind::BrightnessContrast => {
+                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Minimum "));
+                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("Maximum "));
+                    ui.horizontal(|ui| {
+                        if ui.button("Auto").clicked() {
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.brightness".to_string(),
+                                params: Some(json!({})),
+                            });
+                            close = true;
+                        }
+                        if ui.button("Apply").clicked() {
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.brightness".to_string(),
+                                params: Some(json!({
+                                    "min": self.adjust_dialog.min,
+                                    "max": self.adjust_dialog.max,
+                                })),
+                            });
+                            close = true;
+                        }
+                    });
+                }
+                AdjustDialogKind::WindowLevel => {
+                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Low "));
+                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("High "));
+                    if ui.button("Apply").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.window_level".to_string(),
+                            params: Some(json!({
+                                "low": self.adjust_dialog.min,
+                                "high": self.adjust_dialog.max,
+                            })),
+                        });
+                        close = true;
+                    }
+                }
+                AdjustDialogKind::ColorBalance => {
+                    ui.add(egui::Slider::new(&mut self.adjust_dialog.red, 0.0..=2.0).text("Red"));
+                    ui.add(
+                        egui::Slider::new(&mut self.adjust_dialog.green, 0.0..=2.0).text("Green"),
+                    );
+                    ui.add(egui::Slider::new(&mut self.adjust_dialog.blue, 0.0..=2.0).text("Blue"));
+                    if ui.button("Apply").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.color_balance".to_string(),
+                            params: Some(json!({
+                                "red": self.adjust_dialog.red,
+                                "green": self.adjust_dialog.green,
+                                "blue": self.adjust_dialog.blue,
+                            })),
+                        });
+                        close = true;
+                    }
+                }
+                AdjustDialogKind::Threshold => {
+                    ui.add(
+                        egui::DragValue::new(&mut self.adjust_dialog.threshold)
+                            .prefix("Threshold "),
+                    );
+                    ui.checkbox(&mut self.adjust_dialog.dark_background, "Dark background");
+                    ui.horizontal(|ui| {
+                        if ui.button("Auto").clicked() {
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.threshold".to_string(),
+                                params: Some(json!({ "method": "otsu" })),
+                            });
+                            close = true;
+                        }
+                        if ui.button("Apply").clicked() {
+                            let background = if self.adjust_dialog.dark_background {
+                                "dark"
+                            } else {
+                                "light"
+                            };
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.threshold".to_string(),
+                                params: Some(json!({
+                                    "method": "fixed",
+                                    "threshold": self.adjust_dialog.threshold,
+                                    "background": background,
+                                })),
+                            });
+                            close = true;
+                        }
+                    });
+                }
+                AdjustDialogKind::ColorThreshold => {
+                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Minimum "));
+                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("Maximum "));
+                    if ui.button("Apply").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.color_threshold".to_string(),
+                            params: Some(json!({
+                                "min": self.adjust_dialog.min,
+                                "max": self.adjust_dialog.max,
+                            })),
+                        });
+                        close = true;
+                    }
+                }
+                AdjustDialogKind::LineWidth => {
+                    ui.add(
+                        egui::DragValue::new(&mut self.adjust_dialog.line_width)
+                            .range(0.1..=999.0)
+                            .prefix("Width "),
+                    );
+                    if ui.button("Apply").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.line_width".to_string(),
+                            params: Some(json!({ "width": self.adjust_dialog.line_width })),
+                        });
+                        close = true;
+                    }
+                }
+                AdjustDialogKind::Coordinates => {
+                    egui::Grid::new("adjust_coordinates_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Left");
+                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.left));
+                            ui.end_row();
+                            ui.label("Right");
+                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.right));
+                            ui.end_row();
+                            ui.label("Top");
+                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.top));
+                            ui.end_row();
+                            ui.label("Bottom");
+                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.bottom));
+                            ui.end_row();
+                            ui.label("Front");
+                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.front));
+                            ui.end_row();
+                            ui.label("Back");
+                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.back));
+                            ui.end_row();
+                            ui.label("X Unit");
+                            ui.text_edit_singleline(&mut self.adjust_dialog.x_unit);
+                            ui.end_row();
+                            ui.label("Y Unit");
+                            ui.text_edit_singleline(&mut self.adjust_dialog.y_unit);
+                            ui.end_row();
+                            ui.label("Z Unit");
+                            ui.text_edit_singleline(&mut self.adjust_dialog.z_unit);
+                            ui.end_row();
+                        });
+                    if ui.button("Apply").clicked() {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.coordinates".to_string(),
+                            params: Some(json!({
+                                "left": self.adjust_dialog.left,
+                                "right": self.adjust_dialog.right,
+                                "top": self.adjust_dialog.top,
+                                "bottom": self.adjust_dialog.bottom,
+                                "front": self.adjust_dialog.front,
+                                "back": self.adjust_dialog.back,
+                                "x_unit": self.adjust_dialog.x_unit.clone(),
+                                "y_unit": self.adjust_dialog.y_unit.clone(),
+                                "z_unit": self.adjust_dialog.z_unit.clone(),
+                            })),
+                        });
+                        close = true;
+                    }
+                }
+            });
+
+        self.adjust_dialog.open = open && !close;
     }
 
     fn draw_resize_dialog(

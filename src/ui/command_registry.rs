@@ -1849,6 +1849,11 @@ mod tests {
                 "Lookup Tables",
             ]
         );
+        assert_eq!(shortcut_for(image_items, "Show Info..."), Some("I"));
+        assert_eq!(shortcut_for(image_items, "Properties..."), Some("P"));
+        assert_eq!(shortcut_for(image_items, "Crop"), Some("X"));
+        assert_eq!(shortcut_for(image_items, "Duplicate..."), Some("D"));
+        assert_eq!(shortcut_for(image_items, "Scale..."), Some("E"));
 
         let type_items = submenu_items(image_items, "Type");
         assert_eq!(
@@ -1865,6 +1870,27 @@ mod tests {
                 "Lab Stack",
             ]
         );
+
+        let adjust_items = submenu_items(image_items, "Adjust");
+        assert_eq!(
+            item_labels(adjust_items),
+            vec![
+                "Brightness/Contrast...",
+                "Window/Level...",
+                "Color Balance...",
+                "Threshold...",
+                "Color Threshold...",
+                "Size...",
+                "Canvas Size...",
+                "Line Width...",
+                "Coordinates...",
+            ]
+        );
+        assert_eq!(
+            shortcut_for(adjust_items, "Brightness/Contrast..."),
+            Some("C")
+        );
+        assert_eq!(shortcut_for(adjust_items, "Threshold..."), Some("T"));
 
         let color_items = submenu_items(image_items, "Color");
         assert_eq!(
@@ -1883,6 +1909,8 @@ mod tests {
                 "Color Picker...",
             ]
         );
+        assert_eq!(shortcut_for(color_items, "Channels Tool..."), Some("Z"));
+        assert_eq!(shortcut_for(color_items, "Color Picker..."), Some("K"));
 
         let stacks_items = submenu_items(image_items, "Stacks");
         assert_eq!(
@@ -1908,6 +1936,17 @@ mod tests {
                 "Tools",
             ]
         );
+        assert_eq!(shortcut_for(stacks_items, "Next Slice"), Some(">"));
+        assert_eq!(shortcut_for(stacks_items, "Previous Slice"), Some("<"));
+        assert_eq!(shortcut_for(stacks_items, "Reslice..."), Some("/"));
+        assert_eq!(shortcut_for(stacks_items, "Orthogonal Views"), Some("H"));
+
+        let animation_items = submenu_items(stacks_items, "Animation");
+        assert_eq!(
+            item_labels(animation_items),
+            vec!["Start Animation", "Stop Animation", "Animation Options..."]
+        );
+        assert_eq!(shortcut_for(animation_items, "Start Animation"), Some("\\"));
 
         let stack_tools_items = submenu_items(stacks_items, "Tools");
         assert_eq!(
@@ -1925,6 +1964,100 @@ mod tests {
                 "Remove Slice Labels",
                 "Reverse",
                 "Set Label...",
+            ]
+        );
+
+        let hyperstacks_items = submenu_items(image_items, "Hyperstacks");
+        assert_eq!(
+            item_labels(hyperstacks_items),
+            vec![
+                "New Hyperstack...",
+                "Stack to Hyperstack...",
+                "Hyperstack to Stack",
+                "Reduce Dimensionality...",
+                "Make Subset...",
+            ]
+        );
+
+        let transform_items = submenu_items(image_items, "Transform");
+        assert_eq!(
+            item_labels_with_separators(transform_items),
+            vec![
+                "Flip Horizontally",
+                "Flip Vertically",
+                "Flip Z",
+                "Rotate 90 Degrees Right",
+                "Rotate 90 Degrees Left",
+                "Rotate...",
+                "Translate...",
+                "Bin...",
+                "-",
+                "Image to Results",
+                "Results to Image",
+            ]
+        );
+
+        let zoom_items = submenu_items(image_items, "Zoom");
+        assert_eq!(
+            item_labels(zoom_items),
+            vec![
+                "In",
+                "Out",
+                "Original Scale",
+                "View 100%",
+                "To Selection",
+                "Scale to Fit",
+                "Set...",
+                "Maximize",
+            ]
+        );
+        assert_eq!(shortcut_for(zoom_items, "In"), Some("+"));
+        assert_eq!(shortcut_for(zoom_items, "Out"), Some("-"));
+        assert_eq!(shortcut_for(zoom_items, "Original Scale"), Some("4"));
+        assert_eq!(shortcut_for(zoom_items, "View 100%"), Some("5"));
+
+        let overlay_items = submenu_items(image_items, "Overlay");
+        assert_eq!(
+            item_labels(overlay_items),
+            vec![
+                "Add Selection...",
+                "Add Image...",
+                "Hide Overlay",
+                "Show Overlay",
+                "From ROI Manager",
+                "To ROI Manager",
+                "Remove Overlay",
+                "Toggle Overlay",
+                "List Elements",
+                "Flatten",
+                "Labels...",
+                "Measure Overlay",
+                "Overlay Options...",
+            ]
+        );
+        assert_eq!(shortcut_for(overlay_items, "Add Selection..."), Some("B"));
+        assert_eq!(shortcut_for(overlay_items, "Flatten"), Some("F"));
+        assert_eq!(shortcut_for(overlay_items, "Overlay Options..."), Some("Y"));
+
+        let lookup_items = submenu_items(image_items, "Lookup Tables");
+        assert_eq!(
+            item_labels_with_separators(lookup_items),
+            vec![
+                "Invert LUT",
+                "Apply LUT",
+                "-",
+                "Fire",
+                "Grays",
+                "Ice",
+                "Spectrum",
+                "3-3-2 RGB",
+                "Red",
+                "Green",
+                "Blue",
+                "Cyan",
+                "Magenta",
+                "Yellow",
+                "Red/Green",
             ]
         );
     }
@@ -1945,6 +2078,27 @@ mod tests {
             .filter(|entry| entry.get("type") != Some(&json!("separator")))
             .filter_map(|entry| entry.get("label").and_then(Value::as_str))
             .collect()
+    }
+
+    fn item_labels_with_separators(items: &[Value]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|entry| {
+                if entry.get("type") == Some(&json!("separator")) {
+                    Some("-")
+                } else {
+                    entry.get("label").and_then(Value::as_str)
+                }
+            })
+            .collect()
+    }
+
+    fn shortcut_for<'a>(items: &'a [Value], label: &str) -> Option<&'a str> {
+        items
+            .iter()
+            .find(|entry| entry.get("label") == Some(&json!(label)))
+            .and_then(|entry| entry.get("shortcut"))
+            .and_then(Value::as_str)
     }
 
     #[test]
