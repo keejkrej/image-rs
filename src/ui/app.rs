@@ -5450,6 +5450,12 @@ impl ImageUiApp {
                     "color picker opened",
                 ));
             }
+            "image.color.color_picker" => {
+                self.open_color_dialog(ColorDialogMode::Picker);
+                return Some(command_registry::CommandExecuteResult::ok(
+                    "color picker opened",
+                ));
+            }
             _ => {}
         }
 
@@ -5637,6 +5643,7 @@ impl ImageUiApp {
                 Some(command_registry::CommandExecuteResult::ok("zoom maximized"))
             }
             "image.lookup.invert_lut"
+            | "image.color.invert_luts"
             | "image.lookup.fire"
             | "image.lookup.grays"
             | "image.lookup.ice"
@@ -5992,6 +5999,62 @@ impl ImageUiApp {
                 }
                 command_registry::CommandExecuteResult::ok("composite display mode acknowledged")
             }
+            "image.type.8bit_color"
+            | "image.type.rgb_stack"
+            | "image.type.hsb_stack"
+            | "image.type.hsb_32bit"
+            | "image.type.lab_stack" => {
+                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
+                    viewer.status_message = format!("{} acknowledged", request.command_id);
+                    viewer.tool_message = Some(viewer.status_message.clone());
+                }
+                command_registry::CommandExecuteResult::ok(format!(
+                    "{} acknowledged",
+                    request.command_id
+                ))
+            }
+            "image.color.stack_to_rgb" => {
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.convert".to_string(),
+                        params: json!({ "target": "rgb" }),
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "stack to RGB started",
+                        json!({ "job_id": ticket.job_id, "target": "rgb" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "image.color.split_channels"
+            | "image.color.merge_channels"
+            | "image.color.arrange_channels"
+            | "image.color.channels_tool"
+            | "image.color.show_lut"
+            | "image.color.display_luts"
+            | "image.color.edit_lut"
+            | "image.adjust.color_balance"
+            | "image.adjust.color_threshold"
+            | "image.overlay.add_image"
+            | "image.stacks.orthogonal_views"
+            | "image.stacks.project_3d"
+            | "image.stacks.animation.start"
+            | "image.stacks.animation.stop"
+            | "image.stacks.animation.options"
+            | "image.stacks.tools.magic_montage_tools" => {
+                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
+                    viewer.status_message =
+                        format!("{} compatibility command acknowledged", request.command_id);
+                    viewer.tool_message = Some(viewer.status_message.clone());
+                }
+                command_registry::CommandExecuteResult::ok(format!(
+                    "{} compatibility command acknowledged",
+                    request.command_id
+                ))
+            }
             "image.stacks.add_slice" | "image.stacks.delete_slice" => {
                 let viewer_z = self
                     .viewers_ui
@@ -6079,7 +6142,7 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
-            "image.stacks.set_label" => {
+            "image.stacks.label" | "image.stacks.set_label" => {
                 if request.params.is_none() {
                     match self.open_stack_label_dialog(window_label) {
                         Ok(message) => command_registry::CommandExecuteResult::ok(message),
@@ -13269,6 +13332,7 @@ impl LookupTable {
 fn lookup_table_from_command(command_id: &str) -> Option<LookupTable> {
     Some(match command_id {
         "image.lookup.invert_lut" => LookupTable::Inverted,
+        "image.color.invert_luts" => LookupTable::Inverted,
         "image.lookup.fire" => LookupTable::Fire,
         "image.lookup.grays" => LookupTable::Grays,
         "image.lookup.ice" => LookupTable::Ice,

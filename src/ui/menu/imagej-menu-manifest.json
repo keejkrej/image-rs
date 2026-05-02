@@ -93,10 +93,16 @@
           { "type": "item", "id": "image.type.8bit", "label": "8-bit" },
           { "type": "item", "id": "image.type.16bit", "label": "16-bit" },
           { "type": "item", "id": "image.type.32bit", "label": "32-bit" },
+          { "type": "item", "id": "image.type.8bit_color", "label": "8-bit Color" },
           { "type": "item", "id": "image.type.rgb", "label": "RGB Color" },
-          { "type": "item", "id": "image.type.make_composite", "label": "Make Composite" }
+          { "type": "separator" },
+          { "type": "item", "id": "image.type.rgb_stack", "label": "RGB Stack" },
+          { "type": "item", "id": "image.type.hsb_stack", "label": "HSB Stack" },
+          { "type": "item", "id": "image.type.hsb_32bit", "label": "HSB (32-bit)" },
+          { "type": "item", "id": "image.type.lab_stack", "label": "Lab Stack" }
         ]
       },
+      { "type": "separator" },
       {
         "type": "submenu",
         "id": "image.adjust",
@@ -104,7 +110,9 @@
         "items": [
           { "type": "item", "id": "image.adjust.brightness", "label": "Brightness/Contrast..." },
           { "type": "item", "id": "image.adjust.window_level", "label": "Window/Level..." },
+          { "type": "item", "id": "image.adjust.color_balance", "label": "Color Balance..." },
           { "type": "item", "id": "image.adjust.threshold", "label": "Threshold..." },
+          { "type": "item", "id": "image.adjust.color_threshold", "label": "Color Threshold..." },
           { "type": "item", "id": "image.adjust.size", "label": "Size..." },
           { "type": "item", "id": "image.adjust.canvas", "label": "Canvas Size..." },
           { "type": "item", "id": "image.adjust.line_width", "label": "Line Width..." },
@@ -113,10 +121,25 @@
       },
       { "type": "item", "id": "image.show_info", "label": "Show Info...", "shortcut": "I" },
       { "type": "item", "id": "image.properties", "label": "Properties..." },
-      { "type": "item", "id": "image.crop", "label": "Crop", "shortcut": "X" },
-      { "type": "item", "id": "image.duplicate", "label": "Duplicate..." },
-      { "type": "item", "id": "image.rename", "label": "Rename..." },
-      { "type": "item", "id": "image.scale", "label": "Scale..." },
+      {
+        "type": "submenu",
+        "id": "image.color",
+        "label": "Color",
+        "items": [
+          { "type": "item", "id": "image.color.split_channels", "label": "Split Channels" },
+          { "type": "item", "id": "image.color.merge_channels", "label": "Merge Channels..." },
+          { "type": "item", "id": "image.color.arrange_channels", "label": "Arrange Channels..." },
+          { "type": "item", "id": "image.color.invert_luts", "label": "Invert LUTs" },
+          { "type": "item", "id": "image.color.channels_tool", "label": "Channels Tool..." },
+          { "type": "separator" },
+          { "type": "item", "id": "image.color.stack_to_rgb", "label": "Stack to RGB" },
+          { "type": "item", "id": "image.color.make_composite", "command": "image.type.make_composite", "label": "Make Composite" },
+          { "type": "item", "id": "image.color.show_lut", "label": "Show LUT" },
+          { "type": "item", "id": "image.color.display_luts", "label": "Display LUTs" },
+          { "type": "item", "id": "image.color.edit_lut", "label": "Edit LUT..." },
+          { "type": "item", "id": "image.color.color_picker", "label": "Color Picker..." }
+        ]
+      },
       {
         "type": "submenu",
         "id": "image.stacks",
@@ -124,31 +147,50 @@
         "items": [
           { "type": "item", "id": "image.stacks.add_slice", "label": "Add Slice" },
           { "type": "item", "id": "image.stacks.delete_slice", "label": "Delete Slice" },
-          { "type": "separator" },
           { "type": "item", "id": "image.stacks.next", "label": "Next Slice", "shortcut": ">" },
           { "type": "item", "id": "image.stacks.previous", "label": "Previous Slice", "shortcut": "<" },
           { "type": "item", "id": "image.stacks.set", "label": "Set Slice..." },
+          { "type": "separator" },
           { "type": "item", "id": "image.stacks.images_to_stack", "label": "Images to Stack" },
-          { "type": "item", "id": "image.stacks.make_substack", "label": "Make Substack..." },
-          { "type": "item", "id": "image.stacks.reslice", "label": "Reslice..." },
           { "type": "item", "id": "image.stacks.stack_to_images", "label": "Stack to Images" },
-          { "type": "separator" },
           { "type": "item", "id": "image.stacks.make_montage", "label": "Make Montage..." },
-          { "type": "item", "id": "image.stacks.montage_to_stack", "label": "Montage to Stack..." },
-          { "type": "item", "id": "image.stacks.plot_z_profile", "label": "Plot Z-axis Profile" },
-          { "type": "item", "id": "image.stacks.plot_xy_profile", "label": "Plot XY Profile" },
-          { "type": "item", "id": "image.stacks.measure_stack", "label": "Measure Stack..." },
-          { "type": "item", "id": "image.stacks.statistics", "label": "Statistics" },
+          { "type": "item", "id": "image.stacks.reslice", "label": "Reslice..." },
+          { "type": "item", "id": "image.stacks.orthogonal_views", "label": "Orthogonal Views" },
           { "type": "item", "id": "image.stacks.z_project", "label": "Z Project..." },
-          { "type": "item", "id": "image.stacks.combine", "label": "Combine..." },
-          { "type": "item", "id": "image.stacks.concatenate", "label": "Concatenate..." },
-          { "type": "item", "id": "image.stacks.grouped_z_project", "label": "Grouped Z Project..." },
-          { "type": "item", "id": "image.stacks.insert", "label": "Insert..." },
-          { "type": "item", "id": "image.stacks.reduce", "label": "Reduce..." },
-          { "type": "item", "id": "image.stacks.reverse", "label": "Reverse" },
-          { "type": "separator" },
-          { "type": "item", "id": "image.stacks.set_label", "label": "Set Label..." },
-          { "type": "item", "id": "image.stacks.remove_slice_labels", "label": "Remove Slice Labels" }
+          { "type": "item", "id": "image.stacks.project_3d", "label": "3D Project..." },
+          { "type": "item", "id": "image.stacks.plot_z_profile", "label": "Plot Z-axis Profile" },
+          { "type": "item", "id": "image.stacks.measure_stack", "label": "Measure Stack..." },
+          { "type": "item", "id": "image.stacks.label", "label": "Label..." },
+          { "type": "item", "id": "image.stacks.statistics", "label": "Statistics" },
+          {
+            "type": "submenu",
+            "id": "image.stacks.animation",
+            "label": "Animation",
+            "items": [
+              { "type": "item", "id": "image.stacks.animation.start", "label": "Start Animation", "shortcut": "\\" },
+              { "type": "item", "id": "image.stacks.animation.stop", "label": "Stop Animation" },
+              { "type": "item", "id": "image.stacks.animation.options", "label": "Animation Options..." }
+            ]
+          },
+          {
+            "type": "submenu",
+            "id": "image.stacks.tools",
+            "label": "Tools",
+            "items": [
+              { "type": "item", "id": "image.stacks.tools.combine", "command": "image.stacks.combine", "label": "Combine..." },
+              { "type": "item", "id": "image.stacks.tools.concatenate", "command": "image.stacks.concatenate", "label": "Concatenate..." },
+              { "type": "item", "id": "image.stacks.tools.grouped_z_project", "command": "image.stacks.grouped_z_project", "label": "Grouped Z Project..." },
+              { "type": "item", "id": "image.stacks.tools.insert", "command": "image.stacks.insert", "label": "Insert..." },
+              { "type": "item", "id": "image.stacks.tools.magic_montage_tools", "label": "Magic Montage Tools" },
+              { "type": "item", "id": "image.stacks.tools.make_substack", "command": "image.stacks.make_substack", "label": "Make Substack..." },
+              { "type": "item", "id": "image.stacks.tools.montage_to_stack", "command": "image.stacks.montage_to_stack", "label": "Montage to Stack..." },
+              { "type": "item", "id": "image.stacks.tools.plot_xy_profile", "command": "image.stacks.plot_xy_profile", "label": "Plot XY Profile" },
+              { "type": "item", "id": "image.stacks.tools.reduce", "command": "image.stacks.reduce", "label": "Reduce..." },
+              { "type": "item", "id": "image.stacks.tools.remove_slice_labels", "command": "image.stacks.remove_slice_labels", "label": "Remove Slice Labels" },
+              { "type": "item", "id": "image.stacks.tools.reverse", "command": "image.stacks.reverse", "label": "Reverse" },
+              { "type": "item", "id": "image.stacks.tools.set_label", "command": "image.stacks.set_label", "label": "Set Label..." }
+            ]
+          }
         ]
       },
       {
@@ -163,6 +205,11 @@
           { "type": "item", "id": "image.hyperstacks.make_subset", "label": "Make Subset..." }
         ]
       },
+      { "type": "separator" },
+      { "type": "item", "id": "image.crop", "label": "Crop", "shortcut": "X" },
+      { "type": "item", "id": "image.duplicate", "label": "Duplicate..." },
+      { "type": "item", "id": "image.rename", "label": "Rename..." },
+      { "type": "item", "id": "image.scale", "label": "Scale..." },
       {
         "type": "submenu",
         "id": "image.transform",
@@ -203,6 +250,7 @@
         "label": "Overlay",
         "items": [
           { "type": "item", "id": "image.overlay.add_selection", "label": "Add Selection...", "shortcut": "B" },
+          { "type": "item", "id": "image.overlay.add_image", "label": "Add Image..." },
           { "type": "item", "id": "image.overlay.hide", "label": "Hide Overlay" },
           { "type": "item", "id": "image.overlay.show", "label": "Show Overlay" },
           { "type": "item", "id": "image.overlay.from_roi_manager", "label": "From ROI Manager" },
@@ -216,6 +264,7 @@
           { "type": "item", "id": "image.overlay.options", "label": "Overlay Options...", "shortcut": "Y" }
         ]
       },
+      { "type": "separator" },
       {
         "type": "submenu",
         "id": "image.lookup_tables",

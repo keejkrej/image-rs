@@ -385,6 +385,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
         ),
         "image.lookup.apply_lut"
         | "image.lookup.invert_lut"
+        | "image.color.invert_luts"
         | "image.lookup.fire"
         | "image.lookup.grays"
         | "image.lookup.ice"
@@ -405,6 +406,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some("Apply an ImageJ-style display lookup table to the active viewer."),
         ),
         "image.overlay.add_selection"
+        | "image.overlay.add_image"
         | "image.overlay.flatten"
         | "image.overlay.from_roi_manager"
         | "image.overlay.hide"
@@ -537,6 +539,18 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                 Some("Convert the active image pixel type or channel layout."),
             )
         }
+        "image.type.8bit_color"
+        | "image.type.rgb_stack"
+        | "image.type.hsb_stack"
+        | "image.type.hsb_32bit"
+        | "image.type.lab_stack" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Acknowledge ImageJ color type conversion modes not yet native to image-rs."),
+        ),
         "image.type.make_composite" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -545,6 +559,38 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Acknowledge ImageJ composite display mode for macro compatibility."),
         ),
+        "image.color.split_channels"
+        | "image.color.merge_channels"
+        | "image.color.arrange_channels"
+        | "image.color.channels_tool"
+        | "image.color.show_lut"
+        | "image.color.display_luts"
+        | "image.color.edit_lut" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Acknowledge ImageJ Color submenu compatibility commands."),
+        ),
+        "image.color.stack_to_rgb" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some(
+                "Convert the active stack or channel image to RGB using the existing RGB conversion path.",
+            ),
+        ),
+        "image.color.color_picker" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            false,
+            None,
+            Some("Open the ImageJ-style color picker dialog."),
+        ),
         "image.adjust.brightness" | "image.adjust.threshold" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -552,6 +598,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             None,
             Some("Applies automatic normalization or thresholding to the active image."),
+        ),
+        "image.adjust.color_balance" | "image.adjust.color_threshold" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Acknowledge ImageJ color adjustment panels for menu compatibility."),
         ),
         "image.adjust.window_level" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -753,6 +807,25 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             })),
             Some("Compute ImageJ-style statistics for the active Z stack."),
         ),
+        "image.stacks.orthogonal_views" | "image.stacks.project_3d" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Acknowledge ImageJ stack visualization commands."),
+        ),
+        "image.stacks.animation.start"
+        | "image.stacks.animation.stop"
+        | "image.stacks.animation.options"
+        | "image.stacks.tools.magic_montage_tools" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Acknowledge ImageJ stack animation/tool compatibility commands."),
+        ),
         "image.stacks.make_montage" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -826,7 +899,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"axis": "z"})),
             Some("Reverse the active image stack along Z."),
         ),
-        "image.stacks.set_label" => CommandMetadata::with(
+        "image.stacks.label" | "image.stacks.set_label" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             true,
@@ -1686,7 +1759,7 @@ pub fn merge_params(command_id: &str, params: Option<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{CommandScope, command_catalog, manifest_commands, merge_params, metadata};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn command_scope_contains_expected_window_labels() {
@@ -1740,6 +1813,138 @@ mod tests {
             assert!(metadata.scope.contains("viewer-1"));
             assert!(!metadata.scope.contains("main"));
         }
+    }
+
+    #[test]
+    fn image_menu_manifest_matches_imagej_core_layout() {
+        let raw: Value = serde_json::from_str(include_str!("menu/imagej-menu-manifest.json"))
+            .expect("manifest json");
+        let top = raw.as_array().expect("top-level manifest array");
+        let image = top
+            .iter()
+            .find(|entry| entry.get("id") == Some(&json!("image")))
+            .expect("Image menu");
+        let image_items = image
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("Image menu items");
+
+        assert_eq!(
+            item_labels(image_items),
+            vec![
+                "Type",
+                "Adjust",
+                "Show Info...",
+                "Properties...",
+                "Color",
+                "Stacks",
+                "Hyperstacks",
+                "Crop",
+                "Duplicate...",
+                "Rename...",
+                "Scale...",
+                "Transform",
+                "Zoom",
+                "Overlay",
+                "Lookup Tables",
+            ]
+        );
+
+        let type_items = submenu_items(image_items, "Type");
+        assert_eq!(
+            item_labels(type_items),
+            vec![
+                "8-bit",
+                "16-bit",
+                "32-bit",
+                "8-bit Color",
+                "RGB Color",
+                "RGB Stack",
+                "HSB Stack",
+                "HSB (32-bit)",
+                "Lab Stack",
+            ]
+        );
+
+        let color_items = submenu_items(image_items, "Color");
+        assert_eq!(
+            item_labels(color_items),
+            vec![
+                "Split Channels",
+                "Merge Channels...",
+                "Arrange Channels...",
+                "Invert LUTs",
+                "Channels Tool...",
+                "Stack to RGB",
+                "Make Composite",
+                "Show LUT",
+                "Display LUTs",
+                "Edit LUT...",
+                "Color Picker...",
+            ]
+        );
+
+        let stacks_items = submenu_items(image_items, "Stacks");
+        assert_eq!(
+            item_labels(stacks_items),
+            vec![
+                "Add Slice",
+                "Delete Slice",
+                "Next Slice",
+                "Previous Slice",
+                "Set Slice...",
+                "Images to Stack",
+                "Stack to Images",
+                "Make Montage...",
+                "Reslice...",
+                "Orthogonal Views",
+                "Z Project...",
+                "3D Project...",
+                "Plot Z-axis Profile",
+                "Measure Stack...",
+                "Label...",
+                "Statistics",
+                "Animation",
+                "Tools",
+            ]
+        );
+
+        let stack_tools_items = submenu_items(stacks_items, "Tools");
+        assert_eq!(
+            item_labels(stack_tools_items),
+            vec![
+                "Combine...",
+                "Concatenate...",
+                "Grouped Z Project...",
+                "Insert...",
+                "Magic Montage Tools",
+                "Make Substack...",
+                "Montage to Stack...",
+                "Plot XY Profile",
+                "Reduce...",
+                "Remove Slice Labels",
+                "Reverse",
+                "Set Label...",
+            ]
+        );
+    }
+
+    fn submenu_items<'a>(items: &'a [Value], label: &str) -> &'a [Value] {
+        items
+            .iter()
+            .find(|entry| entry.get("label") == Some(&json!(label)))
+            .and_then(|entry| entry.get("items"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| panic!("submenu `{label}` not found"))
+    }
+
+    fn item_labels(items: &[Value]) -> Vec<&str> {
+        items
+            .iter()
+            .filter(|entry| entry.get("type") != Some(&json!("separator")))
+            .filter_map(|entry| entry.get("label").and_then(Value::as_str))
+            .collect()
     }
 
     #[test]
