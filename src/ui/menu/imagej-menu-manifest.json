@@ -52,7 +52,22 @@
       { "type": "item", "id": "edit.cut", "label": "Cut", "shortcut": "Ctrl+X" },
       { "type": "item", "id": "edit.copy", "label": "Copy", "shortcut": "Ctrl+C" },
       { "type": "item", "id": "edit.paste", "label": "Paste", "shortcut": "Ctrl+V" },
+      { "type": "item", "id": "edit.internal_clipboard", "label": "Internal Clipboard" },
+      { "type": "item", "id": "edit.clear", "label": "Clear" },
+      { "type": "item", "id": "edit.fill", "label": "Fill" },
       { "type": "item", "id": "edit.invert", "label": "Invert", "shortcut": "Shift+I" },
+      { "type": "separator" },
+      {
+        "type": "submenu",
+        "id": "edit.selection",
+        "label": "Selection",
+        "items": [
+          { "type": "item", "id": "edit.selection.all", "label": "Select All", "shortcut": "Ctrl+A" },
+          { "type": "item", "id": "edit.selection.none", "label": "Select None", "shortcut": "Shift+A" },
+          { "type": "item", "id": "edit.selection.interpolate", "label": "Interpolate" },
+          { "type": "item", "id": "edit.selection.properties", "label": "Properties..." }
+        ]
+      },
       { "type": "separator" },
       {
         "type": "submenu",
@@ -78,7 +93,8 @@
           { "type": "item", "id": "image.type.8bit", "label": "8-bit" },
           { "type": "item", "id": "image.type.16bit", "label": "16-bit" },
           { "type": "item", "id": "image.type.32bit", "label": "32-bit" },
-          { "type": "item", "id": "image.type.rgb", "label": "RGB Color" }
+          { "type": "item", "id": "image.type.rgb", "label": "RGB Color" },
+          { "type": "item", "id": "image.type.make_composite", "label": "Make Composite" }
         ]
       },
       {
@@ -389,7 +405,7 @@
           { "type": "item", "id": "plugins.macros.install", "label": "Install..." }
         ]
       },
-      { "type": "item", "id": "plugins.commands.find", "label": "Command Finder...", "shortcut": "L" },
+      { "type": "item", "id": "plugins.commands.find", "label": "Find Commands...", "shortcut": "L" },
       { "type": "item", "id": "plugins.utilities.startup", "label": "Startup Macros..." }
     ]
   },

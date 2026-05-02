@@ -2708,8 +2708,9 @@ fn hyperstack_subset(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32>
         output.push(dataset.data[IxDyn(&src)]);
     });
 
-    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output)
-        .map_err(|_| OpsError::UnsupportedLayout("failed to build hyperstack subset".to_string()))?;
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build hyperstack subset".to_string())
+    })?;
     let mut metadata = dataset.metadata.clone();
     metadata.dims = vec![Dim::new(AxisKind::Y, height), Dim::new(AxisKind::X, width)];
     if let Some(axis) = output_z_axis {
@@ -2757,11 +2758,7 @@ fn hyperstack_subset(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32>
     Ok(Dataset::new(data, metadata)?)
 }
 
-fn parse_axis_selection(
-    params: &Value,
-    keys: &[&str],
-    size: usize,
-) -> Result<Vec<usize>> {
+fn parse_axis_selection(params: &Value, keys: &[&str], size: usize) -> Result<Vec<usize>> {
     for key in keys {
         if let Some(selection) = params
             .get(*key)

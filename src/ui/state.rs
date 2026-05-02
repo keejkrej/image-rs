@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -158,6 +159,30 @@ pub fn save_desktop_state(state: &DesktopState) -> std::io::Result<()> {
     let payload = serde_json::to_vec_pretty(state)
         .map_err(|error| std::io::Error::other(format!("serialize desktop state: {error}")))?;
     fs::write(path, payload)
+}
+
+pub fn load_startup_macro() -> std::io::Result<String> {
+    match fs::read_to_string(startup_macro_path()) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn save_startup_macro(contents: &str) -> std::io::Result<()> {
+    let path = startup_macro_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, contents)
+}
+
+pub fn startup_macro_path() -> PathBuf {
+    config_dir().join("image-rs").join("RunAtStartup.ijm")
+}
+
+pub fn installed_macros_dir() -> PathBuf {
+    config_dir().join("image-rs").join("plugins").join("Macros")
 }
 
 pub fn push_recent_file(state: &mut DesktopState, path: &Path) {

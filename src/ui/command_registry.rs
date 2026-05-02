@@ -187,7 +187,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             true,
             false,
-            None,
+            Some(json!({"path": ""})),
             Some("Open files using the native platform file picker."),
         ),
         "file.save_as" => CommandMetadata::with(
@@ -195,7 +195,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             true,
             true,
-            None,
+            Some(json!({"path": "", "format": ""})),
             Some("Save the active image to a new path using the native file picker."),
         ),
         "file.close" => CommandMetadata::with(
@@ -294,6 +294,24 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Use the internal image clipboard for ROI or frame data."),
         ),
+        "edit.internal_clipboard" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Open the current ImageJ-style internal clipboard as an image viewer."),
+        ),
+        "edit.clear" | "edit.fill" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some(
+                "Fill the active selection or current slice with the background/foreground color.",
+            ),
+        ),
         "edit.invert" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -317,6 +335,30 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             false,
             Some(json!({"width": 1.0})),
             Some("Set the default ImageJ-style line selection width."),
+        ),
+        "edit.selection.all" | "edit.selection.none" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Create or clear an ImageJ-style active selection."),
+        ),
+        "edit.selection.interpolate" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"interval": 1.0, "smooth": false, "adjust": false})),
+            Some("Interpolate line, polygon, freehand, and wand selections."),
+        ),
+        "edit.selection.properties" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Report ImageJ-style active selection properties."),
         ),
         "image.zoom.in"
         | "image.zoom.out"
@@ -408,7 +450,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                     "Selects the Point tool; click in viewer to pin coordinate/value telemetry."
                 }
                 _ => {
-                    "Tool selection is implemented; tool-specific drawing/edit behavior is not implemented yet."
+                    "Tool selection is implemented; custom tool slots are reserved for future extension."
                 }
             };
             CommandMetadata::with(CommandScope::Both, true, true, false, None, Some(notes))
@@ -495,6 +537,14 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
                 Some("Convert the active image pixel type or channel layout."),
             )
         }
+        "image.type.make_composite" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Acknowledge ImageJ composite display mode for macro compatibility."),
+        ),
         "image.adjust.brightness" | "image.adjust.threshold" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
@@ -556,8 +606,8 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             true,
             true,
-            None,
-            Some("Duplicate the active image into a new viewer."),
+            Some(json!({"title": ""})),
+            Some("Duplicate the active image into a new viewer, optionally using an ImageJ title."),
         ),
         "image.rename" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -1393,10 +1443,142 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
         | "plugins.utilities.startup" => CommandMetadata::with(
             CommandScope::Both,
             true,
-            false,
+            true,
             false,
             None,
-            Some("Macro/plugin compatibility is intentionally deferred in this pass."),
+            Some(
+                "Macro commands provide native run, record, install, and startup compatibility windows.",
+            ),
+        ),
+        "macro.set_option" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"option": "", "state": true})),
+            Some("Apply or acknowledge ImageJ macro setOption state."),
+        ),
+        "macro.call" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"target": ""})),
+            Some("Acknowledge ImageJ macro call(...) integration hooks."),
+        ),
+        "macro.builtin_call" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"target": ""})),
+            Some("Acknowledge ImageJ macro built-in namespace calls."),
+        ),
+        "macro.select_window" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"title": ""})),
+            Some("Focus an ImageJ macro-selected window by title."),
+        ),
+        "macro.select_image" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"id": 1})),
+            Some("Focus an ImageJ macro-selected image by numeric viewer id."),
+        ),
+        "macro.close_window" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"title": ""})),
+            Some("Close an ImageJ macro-selected window by title."),
+        ),
+        "macro.set_color" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"target": "foreground", "red": 255, "green": 255, "blue": 255})),
+            Some("Set ImageJ macro foreground or background colors from RGB values."),
+        ),
+        "macro.set_roi_name" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"name": ""})),
+            Some("Set the active ImageJ macro ROI name."),
+        ),
+        "macro.set_metadata" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"key": "", "value": ""})),
+            Some("Persist ImageJ macro metadata or properties on the active image."),
+        ),
+        "macro.set_tool" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"tool": "launcher.tool.rect", "mode": null})),
+            Some("Select an ImageJ macro toolbar tool by name or numeric id."),
+        ),
+        "macro.set_paste_mode" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            Some(json!({"mode": "copy"})),
+            Some("Set ImageJ macro clipboard paste mode for subsequent Paste commands."),
+        ),
+        "macro.remove_overlay_rois" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"name": ""})),
+            Some("Remove ImageJ overlay ROIs by name."),
+        ),
+        "macro.remove_overlay_selection" | "macro.activate_overlay_selection" => {
+            CommandMetadata::with(
+                CommandScope::Viewer,
+                true,
+                true,
+                true,
+                Some(json!({"index": 0})),
+                Some("Remove or activate an ImageJ overlay ROI by zero-based index."),
+            )
+        }
+        "macro.make_rectangle" | "macro.make_oval" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0})),
+            Some("Create ImageJ macro rectangular or oval selections from literal coordinates."),
+        ),
+        "macro.make_line" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0})),
+            Some("Create ImageJ macro line selections from literal coordinates."),
+        ),
+        "macro.make_selection" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            Some(json!({"selection_type": "polygon", "points": []})),
+            Some("Create ImageJ macro polygon/freehand/point selections from literal coordinates."),
         ),
         _ => CommandMetadata::unsupported(),
     }
@@ -1503,7 +1685,7 @@ pub fn merge_params(command_id: &str, params: Option<Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandScope, merge_params, metadata};
+    use super::{CommandScope, command_catalog, manifest_commands, merge_params, metadata};
     use serde_json::json;
 
     #[test]
@@ -1791,6 +1973,71 @@ mod tests {
                 "operation": "sqrt",
                 "value": 0.125
             })
+        );
+    }
+
+    #[test]
+    fn command_catalog_entries_are_implemented() {
+        let catalog = command_catalog();
+        let unsupported: Vec<&str> = catalog
+            .entries
+            .iter()
+            .filter(|entry| !entry.implemented)
+            .map(|entry| entry.id.as_str())
+            .collect();
+
+        assert!(
+            unsupported.is_empty(),
+            "unimplemented menu commands: {:?}",
+            unsupported
+        );
+    }
+
+    #[test]
+    fn manifest_commands_are_dispatched_in_app() {
+        let app_source = include_str!("app.rs");
+        let manifest_command_ids = manifest_commands()
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+
+        let mut handled_prefixes = Vec::new();
+        for line in app_source.lines() {
+            if let Some(starts_with_pos) = line.find("starts_with(\"") {
+                let after = &line[starts_with_pos + "starts_with(\"".len()..];
+                if let Some(end) = after.find('"') {
+                    handled_prefixes.push(after[..end].to_string());
+                }
+            }
+
+            if let Some(strip_prefix_pos) = line.find("strip_prefix(\"") {
+                let after = &line[strip_prefix_pos + "strip_prefix(\"".len()..];
+                if let Some(end) = after.find('"') {
+                    handled_prefixes.push(after[..end].to_string());
+                }
+            }
+        }
+
+        let mut missing = Vec::new();
+        'command: for command_id in manifest_command_ids {
+            let quoted = format!("\"{command_id}\"");
+            if app_source.contains(&quoted) {
+                continue 'command;
+            }
+
+            for prefix in &handled_prefixes {
+                if command_id.starts_with(prefix.as_str()) {
+                    continue 'command;
+                }
+            }
+
+            missing.push(command_id);
+        }
+
+        assert!(
+            missing.is_empty(),
+            "manifest commands missing dispatch branches: {:?}",
+            missing
         );
     }
 }

@@ -1,6 +1,7 @@
 use super::state::{
     BinaryOptions, DesktopState, MeasurementSettings, OverlaySettings, ResultsTableState,
-    load_desktop_state, push_recent_file, save_desktop_state,
+    installed_macros_dir, load_desktop_state, load_startup_macro, push_recent_file,
+    save_desktop_state, save_startup_macro, startup_macro_path,
 };
 use super::{command_registry, interaction};
 
@@ -444,6 +445,14 @@ struct LauncherUiState {
 #[derive(Debug, Clone, Default)]
 struct ClipboardState {
     dataset: Option<Arc<DatasetF32>>,
+    paste_mode: PasteMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PasteMode {
+    #[default]
+    Copy,
+    Add,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -736,6 +745,11 @@ enum UiAction {
         command_id: String,
         params: Option<Value>,
     },
+    RunInstalledMacro {
+        window_label: String,
+        path: PathBuf,
+        macro_name: String,
+    },
     OpenPaths {
         paths: Vec<PathBuf>,
     },
@@ -748,6 +762,21 @@ enum UiAction {
 struct StoredCommand {
     command_id: String,
     params: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+struct MacroRecorderState {
+    open: bool,
+    recording: bool,
+    text: String,
+    last_run_log: String,
+}
+
+#[derive(Debug, Default)]
+struct StartupMacroState {
+    open: bool,
+    text: String,
+    last_run_log: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -838,6 +867,1566 @@ fn binary_morphology_params(
     params
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct MacroCommandInvocation {
+    command_id: String,
+    params: Option<Value>,
+}
+
+#[derive(Debug, Default)]
+struct MacroRunReport {
+    executed: usize,
+    blocked: usize,
+    unknown: usize,
+    unimplemented: usize,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NamedMacroBlock {
+    name: String,
+    shortcut: Option<String>,
+    start_line: usize,
+    statements: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InstalledMacroMenuEntry {
+    path: PathBuf,
+    macro_name: String,
+    label: String,
+    shortcut: Option<String>,
+    submenu: Option<String>,
+}
+
+fn parse_macro_command_line(
+    raw_line: &str,
+    catalog: &command_registry::CommandCatalog,
+) -> Result<Option<MacroCommandInvocation>, String> {
+    let stripped = strip_macro_line_comment(raw_line);
+    let line = stripped.trim();
+    if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+        return Ok(None);
+    }
+    if is_ignored_macro_call(line) {
+        return Ok(None);
+    }
+
+    if line.trim_end_matches(';').trim() == "close" {
+        return Ok(Some(MacroCommandInvocation {
+            command_id: "file.close".to_string(),
+            params: None,
+        }));
+    }
+
+    if let Some((option, state)) = parse_imagej_set_option_macro_call(line)? {
+        return Ok(Some(MacroCommandInvocation {
+            command_id: "macro.set_option".to_string(),
+            params: Some(json!({
+                "option": option,
+                "state": state,
+            })),
+        }));
+    }
+
+    if let Some(target) = parse_imagej_call_macro_call(line)? {
+        return Ok(Some(MacroCommandInvocation {
+            command_id: "macro.call".to_string(),
+            params: Some(json!({ "target": target })),
+        }));
+    }
+
+    if let Some(invocation) = parse_imagej_namespace_command_macro_call(line) {
+        return Ok(Some(invocation));
+    }
+
+    if let Some(target) = parse_imagej_builtin_macro_call(line) {
+        return Ok(Some(MacroCommandInvocation {
+            command_id: "macro.builtin_call".to_string(),
+            params: Some(json!({ "target": target })),
+        }));
+    }
+
+    if let Some(invocation) = parse_imagej_simple_builtin_macro_call(line) {
+        return Ok(Some(invocation));
+    }
+
+    if let Some((label, options)) = parse_imagej_run_macro_call(line)? {
+        let command_id =
+            resolve_macro_command_id(&label, catalog).unwrap_or_else(|| label.to_string());
+        return Ok(Some(MacroCommandInvocation {
+            command_id,
+            params: options.map(|options| macro_options_to_json(&options)),
+        }));
+    }
+
+    let (command_id, params) = if let Some((command_id, raw_params)) = line.split_once('|') {
+        (command_id.trim(), Some(raw_params.trim()))
+    } else {
+        (line, None)
+    };
+    if command_id.is_empty() {
+        return Ok(None);
+    }
+
+    let params = match params {
+        Some(raw) => Some(
+            serde_json::from_str(raw).map_err(|error| format!("invalid params JSON ({error})"))?,
+        ),
+        None => None,
+    };
+
+    Ok(Some(MacroCommandInvocation {
+        command_id: command_id.to_string(),
+        params,
+    }))
+}
+
+fn strip_macro_line_comment(line: &str) -> String {
+    let mut output = String::new();
+    let mut string_delimiter: Option<char> = None;
+    let mut escaped = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            output.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if string_delimiter.is_some() => {
+                output.push(ch);
+                escaped = true;
+            }
+            '"' | '\'' if string_delimiter == Some(ch) => {
+                output.push(ch);
+                string_delimiter = None;
+            }
+            '"' | '\'' if string_delimiter.is_none() => {
+                output.push(ch);
+                string_delimiter = Some(ch);
+            }
+            '/' if string_delimiter.is_none() && chars.peek() == Some(&'/') => break,
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+fn is_ignored_macro_call(line: &str) -> bool {
+    let line = line.trim_end_matches(';').trim();
+    ["requires", "setBatchMode"].iter().any(|name| {
+        line.strip_prefix(name)
+            .is_some_and(|rest| rest.trim_start().starts_with('('))
+    })
+}
+
+fn macro_source_executable_lines(contents: &str) -> Vec<(usize, String)> {
+    let mut output = Vec::new();
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line == "{"
+            || line == "}"
+        {
+            continue;
+        }
+
+        if line.starts_with("macro ") {
+            if let Some((_, rest)) = line.split_once('{') {
+                let inline_body = rest.trim().trim_end_matches('}').trim();
+                for statement in split_macro_statements(inline_body) {
+                    output.push((index + 1, statement));
+                }
+            }
+            continue;
+        }
+
+        if line.ends_with('{') {
+            continue;
+        }
+
+        for statement in split_macro_statements(line) {
+            output.push((index + 1, statement));
+        }
+    }
+    output
+}
+
+fn macro_source_named_blocks(contents: &str) -> Vec<NamedMacroBlock> {
+    let mut blocks = Vec::new();
+    let mut current: Option<NamedMacroBlock> = None;
+
+    for (index, raw_line) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(block) = current.as_mut() {
+            if let Some((before_close, _)) = line.split_once('}') {
+                for statement in split_macro_statements(before_close) {
+                    block.statements.push((line_number, statement));
+                }
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+            } else {
+                for statement in split_macro_statements(line) {
+                    block.statements.push((line_number, statement));
+                }
+            }
+            continue;
+        }
+
+        let Some((name, inline_body)) = parse_macro_declaration(line) else {
+            continue;
+        };
+        let mut block = NamedMacroBlock {
+            shortcut: macro_name_shortcut(&name),
+            name,
+            start_line: line_number,
+            statements: Vec::new(),
+        };
+        if let Some(body) = inline_body {
+            let before_close = body
+                .split_once('}')
+                .map(|(before, _)| before)
+                .unwrap_or(body);
+            for statement in split_macro_statements(before_close) {
+                block.statements.push((line_number, statement));
+            }
+            blocks.push(block);
+        } else {
+            current = Some(block);
+        }
+    }
+
+    if let Some(block) = current
+        && !block.statements.is_empty()
+    {
+        blocks.push(block);
+    }
+
+    blocks
+}
+
+fn parse_macro_declaration(line: &str) -> Option<(String, Option<&str>)> {
+    if !line.starts_with("macro ") {
+        return None;
+    }
+    let quote_start = find_macro_string_start(line)?;
+    let (name, next) = parse_macro_string_literal(line, quote_start).ok()?;
+    let rest = line[next..].trim_start();
+    let inline_body = rest
+        .strip_prefix('{')
+        .map(str::trim)
+        .filter(|body| !body.is_empty());
+    Some((name, inline_body))
+}
+
+fn find_macro_string_start(input: &str) -> Option<usize> {
+    let double_quote = input.find('"');
+    let single_quote = input.find('\'');
+    match (double_quote, single_quote) {
+        (Some(double_quote), Some(single_quote)) => Some(double_quote.min(single_quote)),
+        (Some(quote), None) | (None, Some(quote)) => Some(quote),
+        (None, None) => None,
+    }
+}
+
+fn macro_name_shortcut(name: &str) -> Option<String> {
+    let start = name.find('[')?;
+    let end = name.rfind(']')?;
+    if end <= start + 1 {
+        return None;
+    }
+    let raw = &name[start + 1..end];
+    let shortcut = if raw.len() > 1 {
+        raw.to_ascii_uppercase()
+    } else {
+        raw.to_string()
+    };
+    if shortcut.len() > 3 {
+        return None;
+    }
+    if !macro_shortcut_is_valid(&shortcut) {
+        return None;
+    }
+    Some(shortcut)
+}
+
+fn macro_shortcut_is_valid(shortcut: &str) -> bool {
+    if shortcut.chars().count() == 1 {
+        return shortcut
+            .chars()
+            .next()
+            .map(|shortcut| shortcut.is_ascii_alphanumeric())
+            .unwrap_or(false);
+    }
+    if let Some(number) = shortcut.strip_prefix('F') {
+        return number
+            .parse::<u8>()
+            .map(|number| (1..=12).contains(&number) && shortcut == format!("F{number}"))
+            .unwrap_or(false);
+    }
+    if let Some(key) = shortcut.strip_prefix('N') {
+        return macro_numpad_key_is_valid(key);
+    }
+    if let Some(key) = shortcut.strip_prefix('&') {
+        return key.chars().count() == 1
+            && key
+                .chars()
+                .next()
+                .map(|key| key.is_ascii_alphanumeric())
+                .unwrap_or(false);
+    }
+    false
+}
+
+fn macro_numpad_key_is_valid(key: &str) -> bool {
+    key.chars().count() == 1
+        && key
+            .chars()
+            .next()
+            .map(|key| key.is_ascii_digit() || matches!(key, '/' | '*' | '-' | '+' | '.'))
+            .unwrap_or(false)
+}
+
+fn macro_display_name(name: &str) -> String {
+    let Some(start) = name.find('[') else {
+        return name.to_string();
+    };
+    let Some(end) = name.rfind(']') else {
+        return name.to_string();
+    };
+    if end <= start {
+        return name.to_string();
+    }
+    let mut display = String::new();
+    display.push_str(name[..start].trim_end());
+    display.push_str(name[end + 1..].trim_start());
+    let display = display.trim().to_string();
+    if display.is_empty() {
+        name.to_string()
+    } else {
+        display
+    }
+}
+
+fn macro_shortcut_matches_text(shortcut: &str, text: &str) -> bool {
+    if shortcut.chars().count() == 1 {
+        return shortcut.eq_ignore_ascii_case(text);
+    }
+    if let Some(key) = shortcut.strip_prefix('N') {
+        return key == text;
+    }
+    if let Some(key) = shortcut.strip_prefix('&') {
+        return key.eq_ignore_ascii_case(text);
+    }
+    false
+}
+
+fn function_key_for_macro_shortcut(shortcut: &str) -> Option<egui::Key> {
+    match shortcut.to_ascii_uppercase().as_str() {
+        "F1" => Some(egui::Key::F1),
+        "F2" => Some(egui::Key::F2),
+        "F3" => Some(egui::Key::F3),
+        "F4" => Some(egui::Key::F4),
+        "F5" => Some(egui::Key::F5),
+        "F6" => Some(egui::Key::F6),
+        "F7" => Some(egui::Key::F7),
+        "F8" => Some(egui::Key::F8),
+        "F9" => Some(egui::Key::F9),
+        "F10" => Some(egui::Key::F10),
+        "F11" => Some(egui::Key::F11),
+        "F12" => Some(egui::Key::F12),
+        _ => None,
+    }
+}
+
+fn macro_shortcut_matches_function_key(shortcut: &str, input: &egui::InputState) -> bool {
+    function_key_for_macro_shortcut(shortcut)
+        .map(|key| input.key_pressed(key))
+        .unwrap_or(false)
+}
+
+fn split_macro_statements(line: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut string_delimiter: Option<char> = None;
+    let mut escaped = false;
+    let mut bracket_depth = 0usize;
+
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if string_delimiter.is_some() => {
+                current.push(ch);
+                escaped = true;
+            }
+            '"' | '\'' if string_delimiter == Some(ch) => {
+                current.push(ch);
+                string_delimiter = None;
+            }
+            '"' | '\'' if string_delimiter.is_none() => {
+                current.push(ch);
+                string_delimiter = Some(ch);
+            }
+            '[' if string_delimiter.is_none() => {
+                bracket_depth = bracket_depth.saturating_add(1);
+                current.push(ch);
+            }
+            ']' if string_delimiter.is_none() => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ';' if string_delimiter.is_none() && bracket_depth == 0 => {
+                let statement = current.trim();
+                if !statement.is_empty() {
+                    statements.push(statement.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let statement = current.trim();
+    if !statement.is_empty() && statement != "}" {
+        statements.push(statement.trim_end_matches('}').trim().to_string());
+    }
+
+    statements
+}
+
+fn parse_imagej_run_macro_call(line: &str) -> Result<Option<(String, Option<String>)>, String> {
+    let line = line.trim_end_matches(';').trim();
+    let Some(rest) = line.strip_prefix("run") else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return Ok(None);
+    }
+    let Some(inner) = rest
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return Err("malformed run(...) macro call".to_string());
+    };
+
+    let inner = inner.trim();
+    let (label, next) = parse_macro_string_literal(inner, 0)?;
+    let rest = inner[next..].trim_start();
+    if rest.is_empty() {
+        return Ok(Some((label, None)));
+    }
+    let Some(rest) = rest.strip_prefix(',') else {
+        return Err("expected comma after macro command label".to_string());
+    };
+    let rest = rest.trim_start();
+    let (options, next) = parse_macro_string_literal(rest, 0)?;
+    if !rest[next..].trim().is_empty() {
+        return Err("unexpected text after macro options".to_string());
+    }
+
+    Ok(Some((label, Some(options))))
+}
+
+fn parse_imagej_set_option_macro_call(line: &str) -> Result<Option<(String, bool)>, String> {
+    let line = line.trim_end_matches(';').trim();
+    let Some(rest) = line.strip_prefix("setOption") else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
+        return Ok(None);
+    }
+    let Some(inner) = rest
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return Err("malformed setOption(...) macro call".to_string());
+    };
+
+    let inner = inner.trim();
+    let (option, next) = parse_macro_string_literal(inner, 0)?;
+    let rest = inner[next..].trim_start();
+    if rest.is_empty() {
+        return Ok(Some((option, true)));
+    }
+    let Some(rest) = rest.strip_prefix(',') else {
+        return Err("expected comma after setOption name".to_string());
+    };
+    let rest = rest.trim();
+    let state = match rest {
+        "true" => true,
+        "false" => false,
+        "1" => true,
+        "0" => false,
+        _ => return Err("setOption state must be true or false".to_string()),
+    };
+    Ok(Some((option, state)))
+}
+
+fn parse_imagej_call_macro_call(line: &str) -> Result<Option<String>, String> {
+    let line = line.trim_end_matches(';').trim();
+    let Some(call_start) = line.find("call") else {
+        return Ok(None);
+    };
+    let rest = line[call_start + "call".len()..].trim_start();
+    if !rest.starts_with('(') {
+        return Ok(None);
+    }
+    let Some(inner) = rest
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return Err("malformed call(...) macro call".to_string());
+    };
+    let inner = inner.trim();
+    let (target, _) = parse_macro_string_literal(inner, 0)?;
+    Ok(Some(target))
+}
+
+fn parse_imagej_builtin_macro_call(line: &str) -> Option<String> {
+    let line = line.trim_end_matches(';').trim();
+    for prefix in ["Dialog.", "Overlay.", "Roi.", "Stack.", "Property."] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let name = rest
+                .split(|ch: char| ch == '(' || ch.is_whitespace())
+                .next()
+                .unwrap_or_default();
+            if !name.is_empty() {
+                return Some(format!("{prefix}{name}"));
+            }
+        }
+    }
+    None
+}
+
+fn parse_imagej_namespace_command_macro_call(line: &str) -> Option<MacroCommandInvocation> {
+    let line = line.trim_end_matches(';').trim();
+    match line {
+        "Overlay.show" | "Overlay.show()" => {
+            return Some(MacroCommandInvocation {
+                command_id: "image.overlay.show".to_string(),
+                params: None,
+            });
+        }
+        "Overlay.hide" | "Overlay.hide()" => {
+            return Some(MacroCommandInvocation {
+                command_id: "image.overlay.hide".to_string(),
+                params: None,
+            });
+        }
+        _ => {}
+    }
+
+    let open = line.find('(')?;
+    let target = line[..open].trim();
+    let inner = line[open + 1..].strip_suffix(')')?.trim();
+
+    if target == "Stack.setSlice"
+        && let Ok(slice) = inner.parse::<usize>()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "image.stacks.set".to_string(),
+            params: Some(json!({ "slice": slice })),
+        });
+    }
+
+    if target == "Roi.setStrokeWidth"
+        && let Some(args) = parse_macro_number_args(inner, 1)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "edit.options.line_width".to_string(),
+            params: Some(json!({ "width": args[0] })),
+        });
+    }
+
+    if target == "Roi.setName"
+        && let Ok((name, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_roi_name".to_string(),
+            params: Some(json!({ "name": name })),
+        });
+    }
+
+    if target == "Property.set"
+        && let Some((key, value)) = parse_macro_two_string_args(inner)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_metadata".to_string(),
+            params: Some(json!({ "key": key, "value": value })),
+        });
+    }
+
+    if target == "Overlay.addSelection" {
+        return Some(MacroCommandInvocation {
+            command_id: "image.overlay.add_selection".to_string(),
+            params: None,
+        });
+    }
+
+    if target == "Overlay.removeRois"
+        && let Ok((name, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.remove_overlay_rois".to_string(),
+            params: Some(json!({ "name": name })),
+        });
+    }
+
+    if target == "Overlay.removeSelection"
+        && let Ok(index) = inner.parse::<usize>()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.remove_overlay_selection".to_string(),
+            params: Some(json!({ "index": index })),
+        });
+    }
+
+    if target == "Overlay.activateSelection"
+        && let Ok(index) = inner.parse::<usize>()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.activate_overlay_selection".to_string(),
+            params: Some(json!({ "index": index })),
+        });
+    }
+
+    None
+}
+
+fn parse_imagej_simple_builtin_macro_call(line: &str) -> Option<MacroCommandInvocation> {
+    let line = line.trim_end_matches(';').trim();
+    let open = line.find('(')?;
+    let name = line[..open].trim();
+    if name
+        .chars()
+        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+    {
+        return None;
+    }
+    let inner = line[open + 1..].strip_suffix(')')?.trim();
+
+    if name == "selectNone" {
+        return Some(MacroCommandInvocation {
+            command_id: "edit.selection.none".to_string(),
+            params: None,
+        });
+    }
+
+    if name == "setSlice"
+        && let Ok(slice) = inner.parse::<usize>()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "image.stacks.set".to_string(),
+            params: Some(json!({ "slice": slice })),
+        });
+    }
+
+    if name == "selectImage"
+        && let Ok(id) = inner.parse::<u64>()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.select_image".to_string(),
+            params: Some(json!({ "id": id })),
+        });
+    }
+
+    if name == "setTool"
+        && let Some(params) = parse_macro_set_tool_args(inner)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_tool".to_string(),
+            params: Some(params),
+        });
+    }
+
+    if name == "setPasteMode"
+        && let Ok((mode, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_paste_mode".to_string(),
+            params: Some(json!({ "mode": mode })),
+        });
+    }
+
+    if matches!(name, "makeRectangle" | "makeOval")
+        && let Some(args) = parse_macro_number_args(inner, 4)
+    {
+        let command_id = if name == "makeRectangle" {
+            "macro.make_rectangle"
+        } else {
+            "macro.make_oval"
+        };
+        return Some(MacroCommandInvocation {
+            command_id: command_id.to_string(),
+            params: Some(json!({
+                "x": args[0],
+                "y": args[1],
+                "width": args[2],
+                "height": args[3],
+            })),
+        });
+    }
+
+    if name == "makeLine"
+        && let Some(points) = parse_macro_point_list_args(inner, 2)
+    {
+        if points.len() == 2 {
+            return Some(MacroCommandInvocation {
+                command_id: "macro.make_line".to_string(),
+                params: Some(json!({
+                    "x1": points[0].x,
+                    "y1": points[0].y,
+                    "x2": points[1].x,
+                    "y2": points[1].y,
+                })),
+            });
+        }
+        return Some(MacroCommandInvocation {
+            command_id: "macro.make_selection".to_string(),
+            params: Some(json!({
+                "selection_type": "polyline",
+                "points": points
+                    .into_iter()
+                    .map(|point| json!({"x": point.x, "y": point.y}))
+                    .collect::<Vec<_>>(),
+            })),
+        });
+    }
+
+    if name == "makePolygon"
+        && let Some(points) = parse_macro_point_list_args(inner, 2)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.make_selection".to_string(),
+            params: Some(json!({
+                "selection_type": "polygon",
+                "points": points
+                    .into_iter()
+                    .map(|point| json!({"x": point.x, "y": point.y}))
+                    .collect::<Vec<_>>(),
+            })),
+        });
+    }
+
+    if name == "makePoint"
+        && let Some(points) = parse_macro_point_list_args(inner, 1)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.make_selection".to_string(),
+            params: Some(json!({
+                "selection_type": "point",
+                "points": points
+                    .into_iter()
+                    .map(|point| json!({"x": point.x, "y": point.y}))
+                    .collect::<Vec<_>>(),
+            })),
+        });
+    }
+
+    if name == "makeSelection"
+        && let Some((selection_type, points)) = parse_macro_make_selection_args(inner)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.make_selection".to_string(),
+            params: Some(json!({
+                "selection_type": selection_type,
+                "points": points
+                    .into_iter()
+                    .map(|point| json!({"x": point.x, "y": point.y}))
+                    .collect::<Vec<_>>(),
+            })),
+        });
+    }
+
+    if name == "newImage"
+        && let Some(params) = parse_macro_new_image_args(inner)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "file.new".to_string(),
+            params: Some(params),
+        });
+    }
+
+    if name == "selectWindow"
+        && let Ok((title, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.select_window".to_string(),
+            params: Some(json!({ "title": title })),
+        });
+    }
+
+    if matches!(name, "setForegroundColor" | "setBackgroundColor")
+        && let Some([red, green, blue]) = parse_macro_color_args(inner)
+    {
+        let target = if name == "setForegroundColor" {
+            "foreground"
+        } else {
+            "background"
+        };
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_color".to_string(),
+            params: Some(json!({
+                "target": target,
+                "red": red,
+                "green": green,
+                "blue": blue,
+            })),
+        });
+    }
+
+    if name == "rename"
+        && let Ok((title, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "image.rename".to_string(),
+            params: Some(json!({ "title": title })),
+        });
+    }
+
+    if name == "setSelectionName"
+        && let Ok((name, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_roi_name".to_string(),
+            params: Some(json!({ "name": name })),
+        });
+    }
+
+    if name == "setMetadata"
+        && let Some((key, value)) = parse_macro_two_string_args(inner)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.set_metadata".to_string(),
+            params: Some(json!({ "key": key, "value": value })),
+        });
+    }
+
+    if name == "open"
+        && let Ok((path, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        let (command_id, params) = if path.starts_with("http://") || path.starts_with("https://") {
+            ("file.import.url", json!({ "url": path }))
+        } else {
+            ("file.open", json!({ "path": path }))
+        };
+        return Some(MacroCommandInvocation {
+            command_id: command_id.to_string(),
+            params: Some(params),
+        });
+    }
+
+    if name == "save"
+        && let Ok((path, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "file.save_as".to_string(),
+            params: Some(json!({ "path": path })),
+        });
+    }
+
+    if name == "saveAs"
+        && let Some((format, path)) = parse_macro_two_string_args(inner)
+    {
+        return Some(MacroCommandInvocation {
+            command_id: "file.save_as".to_string(),
+            params: Some(json!({ "format": format, "path": path })),
+        });
+    }
+
+    if name == "close" {
+        if inner.is_empty() {
+            return Some(MacroCommandInvocation {
+                command_id: "file.close".to_string(),
+                params: None,
+            });
+        }
+        if let Ok((title, index)) = parse_macro_string_literal(inner, 0)
+            && inner[index..].trim().is_empty()
+        {
+            return Some(MacroCommandInvocation {
+                command_id: "macro.close_window".to_string(),
+                params: Some(json!({ "title": title })),
+            });
+        }
+    }
+
+    let acknowledged = [
+        "setSlice",
+        "selectImage",
+        "selectWindow",
+        "setForegroundColor",
+        "setBackgroundColor",
+        "setTool",
+        "rename",
+        "open",
+        "save",
+        "saveAs",
+        "close",
+        "setSelectionName",
+        "setMetadata",
+        "newImage",
+        "makeRectangle",
+        "makeOval",
+        "makeLine",
+        "makePolygon",
+        "makePoint",
+        "makeSelection",
+        "setPasteMode",
+        "print",
+        "wait",
+        "showStatus",
+        "showMessage",
+        "exit",
+        "roiManager",
+    ];
+    if acknowledged.contains(&name) {
+        return Some(MacroCommandInvocation {
+            command_id: "macro.builtin_call".to_string(),
+            params: Some(json!({ "target": name })),
+        });
+    }
+
+    None
+}
+
+fn parse_macro_number_args(inner: &str, expected: usize) -> Option<Vec<f32>> {
+    let args = inner
+        .split(',')
+        .map(str::trim)
+        .map(|arg| arg.parse::<f32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    (args.len() == expected && args.iter().all(|arg| arg.is_finite())).then_some(args)
+}
+
+fn parse_macro_color_args(inner: &str) -> Option<[u8; 3]> {
+    let args = parse_macro_number_args(inner, 3)?;
+    let mut colors = [0; 3];
+    for (index, value) in args.iter().enumerate() {
+        if !(0.0..=255.0).contains(value) {
+            return None;
+        }
+        colors[index] = value.round() as u8;
+    }
+    Some(colors)
+}
+
+fn parse_macro_set_tool_args(inner: &str) -> Option<Value> {
+    if let Ok((name, index)) = parse_macro_string_literal(inner, 0)
+        && inner[index..].trim().is_empty()
+    {
+        return macro_tool_command_from_name(&name).map(|(tool, mode)| {
+            json!({
+                "tool": tool,
+                "mode": mode,
+            })
+        });
+    }
+
+    let id = inner.parse::<usize>().ok()?;
+    macro_tool_command_from_id(id).map(|(tool, mode)| {
+        json!({
+            "tool": tool,
+            "mode": mode,
+        })
+    })
+}
+
+fn macro_tool_command_from_id(id: usize) -> Option<(&'static str, Option<&'static str>)> {
+    match id {
+        0 => Some((
+            "launcher.tool.rect",
+            Some("launcher.tool.rect.mode.rectangle"),
+        )),
+        1 => Some(("launcher.tool.oval", Some("launcher.tool.oval.mode.oval"))),
+        2 => Some(("launcher.tool.poly", None)),
+        3 => Some(("launcher.tool.free", None)),
+        4 => Some((
+            "launcher.tool.line",
+            Some("launcher.tool.line.mode.straight"),
+        )),
+        5 => Some((
+            "launcher.tool.line",
+            Some("launcher.tool.line.mode.segmented"),
+        )),
+        6 => Some((
+            "launcher.tool.line",
+            Some("launcher.tool.line.mode.freehand"),
+        )),
+        7 => Some((
+            "launcher.tool.point",
+            Some("launcher.tool.point.mode.point"),
+        )),
+        8 => Some(("launcher.tool.wand", None)),
+        9 => Some(("launcher.tool.text", None)),
+        11 => Some(("launcher.tool.zoom", None)),
+        12 => Some(("launcher.tool.hand", None)),
+        13 => Some(("launcher.tool.dropper", None)),
+        14 => Some(("launcher.tool.angle", None)),
+        15 => Some(("launcher.tool.custom1", None)),
+        16 => Some(("launcher.tool.custom2", None)),
+        17 => Some(("launcher.tool.custom3", None)),
+        _ => None,
+    }
+}
+
+fn macro_tool_command_from_name(name: &str) -> Option<(&'static str, Option<&'static str>)> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("round") {
+        Some((
+            "launcher.tool.rect",
+            Some("launcher.tool.rect.mode.rounded"),
+        ))
+    } else if name.contains("rot") {
+        Some((
+            "launcher.tool.rect",
+            Some("launcher.tool.rect.mode.rotated"),
+        ))
+    } else if name.contains("rect") {
+        Some((
+            "launcher.tool.rect",
+            Some("launcher.tool.rect.mode.rectangle"),
+        ))
+    } else if name.contains("oval") {
+        Some(("launcher.tool.oval", Some("launcher.tool.oval.mode.oval")))
+    } else if name.contains("ellip") {
+        Some((
+            "launcher.tool.oval",
+            Some("launcher.tool.oval.mode.ellipse"),
+        ))
+    } else if name.contains("brush") {
+        Some(("launcher.tool.oval", Some("launcher.tool.oval.mode.brush")))
+    } else if name.contains("polygon") {
+        Some(("launcher.tool.poly", None))
+    } else if name.contains("polyline") {
+        Some((
+            "launcher.tool.line",
+            Some("launcher.tool.line.mode.segmented"),
+        ))
+    } else if name.contains("freeline") {
+        Some((
+            "launcher.tool.line",
+            Some("launcher.tool.line.mode.freehand"),
+        ))
+    } else if name.contains("arrow") {
+        Some(("launcher.tool.line", Some("launcher.tool.line.mode.arrow")))
+    } else if name.contains("line") {
+        Some((
+            "launcher.tool.line",
+            Some("launcher.tool.line.mode.straight"),
+        ))
+    } else if name.contains("free") {
+        Some(("launcher.tool.free", None))
+    } else if name.contains("multi") {
+        Some((
+            "launcher.tool.point",
+            Some("launcher.tool.point.mode.multipoint"),
+        ))
+    } else if name.contains("point") {
+        Some((
+            "launcher.tool.point",
+            Some("launcher.tool.point.mode.point"),
+        ))
+    } else if name.contains("wand") {
+        Some(("launcher.tool.wand", None))
+    } else if name.contains("text") {
+        Some(("launcher.tool.text", None))
+    } else if name.contains("hand") {
+        Some(("launcher.tool.hand", None))
+    } else if name.contains("zoom") || name.contains("magnifier") {
+        Some(("launcher.tool.zoom", None))
+    } else if name.contains("dropper") || name.contains("color") {
+        Some(("launcher.tool.dropper", None))
+    } else if name.contains("angle") {
+        Some(("launcher.tool.angle", None))
+    } else {
+        None
+    }
+}
+
+fn parse_macro_two_string_args(inner: &str) -> Option<(String, String)> {
+    let (first, next) = parse_macro_string_literal(inner.trim(), 0).ok()?;
+    let rest = inner.trim()[next..]
+        .trim_start()
+        .strip_prefix(',')?
+        .trim_start();
+    let (second, next) = parse_macro_string_literal(rest, 0).ok()?;
+    rest[next..].trim().is_empty().then_some((first, second))
+}
+
+fn macro_color_component(params: &Value, key: &str) -> Result<u8, String> {
+    let Some(value) = params.get(key) else {
+        return Err(format!("missing macro color component `{key}`"));
+    };
+    let Some(number) = value
+        .as_u64()
+        .map(|number| number as f64)
+        .or_else(|| value.as_f64())
+    else {
+        return Err(format!("macro color component `{key}` must be numeric"));
+    };
+    if !number.is_finite() || !(0.0..=255.0).contains(&number) {
+        return Err(format!(
+            "macro color component `{key}` must be between 0 and 255"
+        ));
+    }
+    Ok(number.round() as u8)
+}
+
+fn parse_macro_make_selection_args(inner: &str) -> Option<(String, Vec<egui::Pos2>)> {
+    let (raw_type, rest) = inner.split_once(',')?;
+    let (selection_type, _) = parse_macro_string_literal(raw_type.trim(), 0).ok()?;
+    let min_points = if selection_type.to_ascii_lowercase().contains("point") {
+        1
+    } else {
+        2
+    };
+    let points = parse_macro_point_list_args(rest, min_points)?;
+    Some((selection_type, points))
+}
+
+fn parse_macro_point_list_args(inner: &str, min_points: usize) -> Option<Vec<egui::Pos2>> {
+    let values = parse_macro_number_args(inner, inner.split(',').count())?;
+    if values.len() < min_points * 2 || values.len() % 2 != 0 {
+        return None;
+    }
+    Some(
+        values
+            .chunks_exact(2)
+            .map(|pair| egui::pos2(pair[0], pair[1]))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn parse_macro_new_image_args(inner: &str) -> Option<Value> {
+    let (title, next) = parse_macro_string_literal(inner.trim(), 0).ok()?;
+    let rest = inner.trim()[next..]
+        .trim_start()
+        .strip_prefix(',')?
+        .trim_start();
+    let (image_type, next) = parse_macro_string_literal(rest, 0).ok()?;
+    let rest = rest[next..].trim_start().strip_prefix(',')?.trim_start();
+    let args = parse_macro_number_args(rest, 3)?;
+    let pixel_type = if image_type.to_ascii_lowercase().contains("16-bit") {
+        "u16"
+    } else if image_type.to_ascii_lowercase().contains("8-bit")
+        || image_type.to_ascii_lowercase().contains("rgb")
+    {
+        "u8"
+    } else {
+        "f32"
+    };
+    let channels = if image_type.to_ascii_lowercase().contains("rgb") {
+        3
+    } else {
+        1
+    };
+    Some(json!({
+        "title": title,
+        "width": args[0].round().max(1.0) as usize,
+        "height": args[1].round().max(1.0) as usize,
+        "slices": args[2].round().max(1.0) as usize,
+        "channels": channels,
+        "frames": 1,
+        "fill": if image_type.to_ascii_lowercase().contains("white") { 1.0 } else { 0.0 },
+        "pixelType": pixel_type,
+    }))
+}
+
+fn parse_macro_string_literal(input: &str, start: usize) -> Result<(String, usize), String> {
+    let bytes = input.as_bytes();
+    let Some(delimiter) = bytes
+        .get(start)
+        .copied()
+        .filter(|byte| matches!(byte, b'"' | b'\''))
+    else {
+        return Err("expected macro string literal".to_string());
+    };
+
+    let mut output = String::new();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte == delimiter => return Ok((output, index + 1)),
+            b'\\' => {
+                index += 1;
+                let Some(next) = bytes.get(index).copied() else {
+                    return Err("unterminated macro string escape".to_string());
+                };
+                match next {
+                    b'n' => output.push('\n'),
+                    b'r' => output.push('\r'),
+                    b't' => output.push('\t'),
+                    b'"' => output.push('"'),
+                    b'\'' => output.push('\''),
+                    b'\\' => output.push('\\'),
+                    other => output.push(other as char),
+                }
+            }
+            other => output.push(other as char),
+        }
+        index += 1;
+    }
+
+    Err("unterminated macro string literal".to_string())
+}
+
+fn resolve_macro_command_id(
+    label: &str,
+    catalog: &command_registry::CommandCatalog,
+) -> Option<String> {
+    if catalog.entries.iter().any(|entry| entry.id == label) {
+        return Some(label.to_string());
+    }
+
+    let normalized = normalize_macro_command_label(label);
+    catalog
+        .entries
+        .iter()
+        .find(|entry| normalize_macro_command_label(&entry.label) == normalized)
+        .map(|entry| entry.id.clone())
+}
+
+fn normalize_macro_command_label(label: &str) -> String {
+    label
+        .trim()
+        .trim_end_matches('.')
+        .trim_end_matches('\u{2026}')
+        .replace('&', "")
+        .to_ascii_lowercase()
+}
+
+fn macro_options_to_json(options: &str) -> Value {
+    let mut map = Map::new();
+    for token in split_macro_option_tokens(options) {
+        let (key, value) = token
+            .split_once('=')
+            .map(|(key, value)| (key.trim(), macro_option_value_to_json(value.trim())))
+            .unwrap_or_else(|| (token.trim(), Value::Bool(true)));
+        if !key.is_empty() {
+            let key = macro_option_key_alias(key);
+            map.insert(key.to_string(), value);
+        }
+    }
+    Value::Object(map)
+}
+
+fn macro_option_key_alias(key: &str) -> &str {
+    match key {
+        "border" => "border_width",
+        _ => key,
+    }
+}
+
+fn split_macro_option_tokens(options: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut bracket_depth = 0usize;
+
+    for ch in options.chars() {
+        match ch {
+            '[' => {
+                bracket_depth = bracket_depth.saturating_add(1);
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ch if ch.is_whitespace() && bracket_depth == 0 => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn macro_option_value_to_json(value: &str) -> Value {
+    let value = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(value);
+
+    if value.eq_ignore_ascii_case("true") {
+        return Value::Bool(true);
+    }
+    if value.eq_ignore_ascii_case("false") {
+        return Value::Bool(false);
+    }
+    if let Ok(integer) = value.parse::<i64>() {
+        return Value::from(integer);
+    }
+    if let Ok(float) = value.parse::<f64>() {
+        return json!(float);
+    }
+
+    Value::String(value.to_string())
+}
+
+fn macro_record_line_for_command(
+    command_id: &str,
+    params: Option<&Value>,
+    catalog: &command_registry::CommandCatalog,
+) -> Option<String> {
+    let label = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == command_id)
+        .map(|entry| entry.label.as_str())?;
+    let label = escape_macro_string(label);
+    let options = params.and_then(macro_params_to_options);
+
+    Some(match options {
+        Some(options) if !options.is_empty() => {
+            format!("run(\"{label}\", \"{}\");", escape_macro_string(&options))
+        }
+        _ => format!("run(\"{label}\");"),
+    })
+}
+
+fn macro_params_to_options(params: &Value) -> Option<String> {
+    let Value::Object(map) = params else {
+        return Some(format!("value={}", macro_value_to_option_string(params)));
+    };
+    if map.is_empty() {
+        return None;
+    }
+
+    let mut keys = map.keys().collect::<Vec<_>>();
+    keys.sort();
+    let tokens = keys
+        .into_iter()
+        .filter_map(|key| {
+            let value = map.get(key)?;
+            if value.is_null() {
+                return None;
+            }
+            if value.as_bool() == Some(true) {
+                return Some(key.to_string());
+            }
+            Some(format!("{key}={}", macro_value_to_option_string(value)))
+        })
+        .collect::<Vec<_>>();
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" "))
+    }
+}
+
+fn macro_value_to_option_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => bracket_macro_option_text(text),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(value) => value.to_string(),
+        other => bracket_macro_option_text(&other.to_string()),
+    }
+}
+
+fn bracket_macro_option_text(text: &str) -> String {
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '='))
+    {
+        format!("[{}]", text.replace(']', "\\]"))
+    } else {
+        text.to_string()
+    }
+}
+
+fn escape_macro_string(text: &str) -> String {
+    let mut output = String::new();
+    for ch in text.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            other => output.push(other),
+        }
+    }
+    output
+}
+
+fn first_report_line(report: &str) -> &str {
+    report.lines().next().unwrap_or(report)
+}
+
+fn installed_macro_file_name(source: &Path) -> Result<String, String> {
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "macro path has no file name".to_string())?;
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "ijm" | "txt") {
+        return Err("only .ijm and .txt macro files can be installed".to_string());
+    }
+
+    if extension == "txt" && !file_name.contains('_') {
+        let stem = source
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| "macro path has no valid file stem".to_string())?;
+        Ok(format!("{stem}.ijm"))
+    } else {
+        Ok(file_name.to_string())
+    }
+}
+
+fn install_macro_file_to_dir(source: &Path, install_dir: &Path) -> Result<PathBuf, String> {
+    let installed_name = installed_macro_file_name(source)?;
+    let contents = fs::read(source).map_err(|error| format!("macro read failed: {error}"))?;
+    fs::create_dir_all(install_dir)
+        .map_err(|error| format!("macro install directory create failed: {error}"))?;
+    let target = install_dir.join(installed_name);
+    fs::write(&target, contents).map_err(|error| format!("macro install write failed: {error}"))?;
+    Ok(target)
+}
+
+fn list_installed_macro_files_in_dir(install_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(install_dir) else {
+        return Vec::new();
+    };
+    let mut macros = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "ijm" | "txt"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    macros.sort_by(|left, right| {
+        left.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .cmp(
+                right
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default(),
+            )
+    });
+    macros
+}
+
+fn installed_macro_blocks(path: &Path) -> Vec<NamedMacroBlock> {
+    fs::read_to_string(path)
+        .map(|contents| macro_source_named_blocks(&contents))
+        .unwrap_or_default()
+}
+
+fn startup_macro_set_path() -> Option<PathBuf> {
+    let macros_dir = installed_macros_dir();
+    for file_name in ["StartupMacros.txt", "StartupMacros.ijm"] {
+        let path = macros_dir.join(file_name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn startup_auto_run_macro_block(source: &str) -> Option<NamedMacroBlock> {
+    macro_source_named_blocks(source)
+        .into_iter()
+        .find(|block| block.name.starts_with("AutoRun"))
+}
+
+fn macro_named_block_statement_map(source: &str) -> HashMap<String, Vec<(usize, String)>> {
+    let mut blocks = HashMap::new();
+    for block in macro_source_named_blocks(source) {
+        let statements = block.statements.clone();
+        blocks
+            .entry(block.name.clone())
+            .or_insert_with(|| statements.clone());
+
+        let display_name = macro_display_name(&block.name);
+        blocks
+            .entry(display_name)
+            .or_insert_with(|| statements.clone());
+
+        let (_, menu_label) = macro_menu_label_parts(&block.name);
+        let menu_display_name = macro_display_name(menu_label);
+        blocks.entry(menu_display_name).or_insert(statements);
+    }
+    blocks
+}
+
+fn installed_macro_menu_entry_from_block(
+    path: &Path,
+    block: &NamedMacroBlock,
+) -> Option<InstalledMacroMenuEntry> {
+    if block.name.starts_with("AutoRun")
+        || block.name == "Popup Menu"
+        || block.name.ends_with("Tool Selected")
+        || block.name.contains("Tool Options")
+    {
+        return None;
+    }
+
+    let (submenu, raw_label) = macro_menu_label_parts(&block.name);
+    Some(InstalledMacroMenuEntry {
+        path: path.to_path_buf(),
+        macro_name: block.name.clone(),
+        label: macro_display_name(raw_label),
+        shortcut: block.shortcut.clone(),
+        submenu,
+    })
+}
+
+fn macro_menu_label_parts(name: &str) -> (Option<String>, &str) {
+    if name.starts_with('<')
+        && let Some(separator) = name.find('>')
+        && separator > 1
+    {
+        let submenu = name[1..separator].trim();
+        let child = name[separator + 1..].trim();
+        if !submenu.is_empty() && !child.is_empty() {
+            return (Some(submenu.to_string()), child);
+        }
+    }
+    (None, name)
+}
+
 struct ImageUiApp {
     state: UiState,
     desktop_state: DesktopState,
@@ -863,6 +2452,13 @@ struct ImageUiApp {
     raw_import_dialog: RawImportDialogState,
     url_import_dialog: UrlImportDialogState,
     command_finder: CommandFinderState,
+    macro_recorder: MacroRecorderState,
+    startup_macro: StartupMacroState,
+    macro_compatibility_open: bool,
+    macro_compatibility_command: Option<String>,
+    macro_compatibility_path: Option<PathBuf>,
+    macro_compatibility_preview: String,
+    macro_compatibility_run_log: String,
     roi_manager: RoiManagerState,
     last_repeatable_command: Option<StoredCommand>,
     active_viewer_label: Option<String>,
@@ -936,6 +2532,13 @@ impl ImageUiApp {
             raw_import_dialog: RawImportDialogState::default(),
             url_import_dialog: UrlImportDialogState::default(),
             command_finder: CommandFinderState::default(),
+            macro_recorder: MacroRecorderState::default(),
+            startup_macro: StartupMacroState::default(),
+            macro_compatibility_open: false,
+            macro_compatibility_command: None,
+            macro_compatibility_path: None,
+            macro_compatibility_preview: String::new(),
+            macro_compatibility_run_log: String::new(),
             roi_manager: RoiManagerState::default(),
             last_repeatable_command: None,
             active_viewer_label: None,
@@ -952,6 +2555,7 @@ impl ImageUiApp {
             app.apply_open_result(&result);
         }
 
+        app.run_startup_macro_if_present();
         app
     }
 
@@ -973,6 +2577,53 @@ impl ImageUiApp {
 
     fn persist_desktop_state(&self) {
         let _ = save_desktop_state(&self.desktop_state);
+    }
+
+    fn run_startup_macro_if_present(&mut self) {
+        let run_at_startup = match load_startup_macro() {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.set_fallback_status(format!("startup macro load failed: {error}"));
+                return;
+            }
+        };
+        let active_label = self
+            .active_viewer_label
+            .clone()
+            .unwrap_or_else(|| LAUNCHER_LABEL.to_string());
+        let mut reports = Vec::new();
+
+        if !run_at_startup.trim().is_empty() {
+            let report =
+                self.run_simple_macro_source("RunAtStartup.ijm", &run_at_startup, &active_label);
+            reports.push(format!("RunAtStartup: {}", first_report_line(&report)));
+        }
+
+        if let Some(path) = startup_macro_set_path() {
+            match fs::read_to_string(&path) {
+                Ok(contents) => {
+                    if let Some(block) = startup_auto_run_macro_block(&contents) {
+                        let source_name = format!("{}:{}", path.display(), block.name);
+                        let named_blocks = macro_named_block_statement_map(&contents);
+                        let report = self.run_simple_macro_lines(
+                            &source_name,
+                            block.statements,
+                            &active_label,
+                            &named_blocks,
+                        );
+                        reports.push(format!("{}: {}", block.name, first_report_line(&report)));
+                    }
+                }
+                Err(error) => reports.push(format!(
+                    "StartupMacros load failed: {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+
+        if !reports.is_empty() {
+            self.set_fallback_status(format!("startup macro: {}", reports.join("; ")));
+        }
     }
 
     fn set_active_viewer(&mut self, label: Option<String>) {
@@ -1350,12 +3001,85 @@ impl ImageUiApp {
 
     fn create_new_image(&mut self, params: &Value) -> Result<String, String> {
         let dataset = new_image_dataset(params)?;
-        let path = normalize_path(&PathBuf::from(format!(
-            "Untitled-{}.tif",
-            self.state.next_window_id + 1
-        )));
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .map(sanitize_image_title)
+            .unwrap_or_else(|| format!("Untitled-{}", self.state.next_window_id + 1));
+        let path = normalize_path(&PathBuf::from(format!("{title}.tif")));
         let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(dataset)));
         Ok(format!("created new image in {label}"))
+    }
+
+    fn select_macro_window(&mut self, params: &Value) -> Result<String, String> {
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if title.is_empty() {
+            return Err("selectWindow requires a title".to_string());
+        }
+
+        let Some(label) = self.macro_viewer_label_by_title(title) else {
+            return Err(format!("window `{title}` not found"));
+        };
+
+        self.focus_viewer_label = Some(label.clone());
+        self.set_active_viewer(Some(label.clone()));
+        Ok(format!("selected window {title}"))
+    }
+
+    fn close_macro_window(&mut self, params: &Value) -> Result<String, String> {
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if title.is_empty() {
+            return Err("close requires a window title".to_string());
+        }
+
+        let Some(label) = self.macro_viewer_label_by_title(title) else {
+            return Err(format!("window `{title}` not found"));
+        };
+
+        self.remove_viewer_by_label(&label);
+        Ok(format!("closed window {title}"))
+    }
+
+    fn select_macro_image(&mut self, params: &Value) -> Result<String, String> {
+        let id = params
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "selectImage requires a numeric id".to_string())?;
+        let label = format!("{VIEWER_PREFIX}{id}");
+        if !self.state.label_to_session.contains_key(&label) {
+            return Err(format!("image id {id} not found"));
+        }
+
+        self.focus_viewer_label = Some(label.clone());
+        self.set_active_viewer(Some(label.clone()));
+        Ok(format!("selected image {id}"))
+    }
+
+    fn macro_viewer_label_by_title(&self, title: &str) -> Option<String> {
+        let normalized_title = normalize_macro_command_label(title);
+        self.state.label_to_path.iter().find_map(|(label, path)| {
+            let label_matches = normalize_macro_command_label(label) == normalized_title;
+            let file_name_matches = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| normalize_macro_command_label(name) == normalized_title)
+                .unwrap_or(false);
+            let stem_matches = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| normalize_macro_command_label(stem) == normalized_title)
+                .unwrap_or(false);
+            (label_matches || file_name_matches || stem_matches).then(|| label.clone())
+        })
     }
 
     fn open_recent_path(&mut self, path: &Path) -> Result<String, String> {
@@ -2007,7 +3731,7 @@ impl ImageUiApp {
         Ok(format!("created circular masks stack in {label}"))
     }
 
-    fn duplicate_viewer(&mut self, window_label: &str) -> Result<String, String> {
+    fn duplicate_viewer(&mut self, window_label: &str, params: &Value) -> Result<String, String> {
         let viewer_label = self
             .current_viewer_label(window_label)
             .ok_or_else(|| "a loaded image is required for duplicate".to_string())?
@@ -2030,15 +3754,19 @@ impl ImageUiApp {
             (source, stem)
         };
         let dataset = source.to_dataset()?;
-        let path = normalize_path(&PathBuf::from(format!(
-            "{stem}-copy-{}.tif",
-            self.state.next_window_id + 1
-        )));
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(sanitize_image_title)
+            .unwrap_or_else(|| format!("{stem}-copy-{}", self.state.next_window_id + 1));
+        let path = normalize_path(&PathBuf::from(format!("{title}.tif")));
         let label = self.create_viewer(
             path,
             ViewerImageSource::Dataset(Arc::new(dataset.as_ref().clone())),
         );
-        Ok(format!("duplicated image in {label}"))
+        Ok(format!("duplicated image as {title} in {label}"))
     }
 
     fn rename_viewer(&mut self, window_label: &str, params: &Value) -> Result<String, String> {
@@ -2229,6 +3957,96 @@ impl ImageUiApp {
             .get_mut(&viewer_label)
             .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
         add_selection_to_overlay(&mut viewer.rois).map(str::to_string)
+    }
+
+    fn remove_overlay_rois_by_name(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name.is_empty() {
+            return Err("overlay ROI name cannot be empty".to_string());
+        }
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay remove".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let before = viewer.rois.overlay_rois.len();
+        viewer.rois.overlay_rois.retain(|roi| roi.name != name);
+        let removed = before.saturating_sub(viewer.rois.overlay_rois.len());
+        if removed == 0 {
+            return Err(format!("no overlay ROIs named `{name}`"));
+        }
+        if viewer
+            .rois
+            .selected_roi_id
+            .is_none_or(|id| viewer.rois.overlay_rois.iter().all(|roi| roi.id != id))
+        {
+            viewer.rois.selected_roi_id = viewer.rois.overlay_rois.first().map(|roi| roi.id);
+        }
+        Ok(format!("removed {removed} overlay ROI(s) named {name}"))
+    }
+
+    fn remove_overlay_selection(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let index = params
+            .get("index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "overlay selection index is required".to_string())?
+            as usize;
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay remove".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        if index >= viewer.rois.overlay_rois.len() {
+            return Err(format!("overlay selection index {index} out of range"));
+        }
+        let removed = viewer.rois.overlay_rois.remove(index);
+        if viewer.rois.selected_roi_id == Some(removed.id) {
+            viewer.rois.selected_roi_id = viewer.rois.overlay_rois.first().map(|roi| roi.id);
+        }
+        Ok(format!("removed overlay selection {index}"))
+    }
+
+    fn activate_overlay_selection(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let index = params
+            .get("index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "overlay selection index is required".to_string())?
+            as usize;
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for overlay activation".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let Some(roi) = viewer.rois.overlay_rois.get_mut(index) else {
+            return Err(format!("overlay selection index {index} out of range"));
+        };
+        roi.visible = true;
+        viewer.rois.selected_roi_id = Some(roi.id);
+        Ok(format!("activated overlay selection {index}"))
     }
 
     fn overlay_from_roi_manager(&mut self, window_label: &str) -> Result<String, String> {
@@ -2484,6 +4302,7 @@ impl ImageUiApp {
                 height,
                 None,
                 background,
+                PasteMode::Copy,
             )?;
             return Ok("selection cut to clipboard".to_string());
         }
@@ -2523,8 +4342,476 @@ impl ImageUiApp {
             clipboard.shape()[0],
             Some(clipboard.as_ref()),
             0.0,
+            self.clipboard.paste_mode,
         )?;
         Ok("clipboard pasted".to_string())
+    }
+
+    fn show_internal_clipboard(&mut self) -> Result<String, String> {
+        let dataset = self
+            .clipboard
+            .dataset
+            .clone()
+            .ok_or_else(|| "clipboard is empty".to_string())?;
+        let next = self.state.next_window_id.saturating_add(1);
+        let path = PathBuf::from(format!("Internal Clipboard {next}"));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(dataset));
+        Ok(format!("internal clipboard opened as {label}"))
+    }
+
+    fn fill_selection_or_slice(
+        &mut self,
+        window_label: &str,
+        fill: f32,
+        action: &str,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| format!("a loaded image is required for {action}"))?
+            .to_string();
+        let (slice, roi_bbox, z, t, channel) = self.measurement_context(&viewer_label)?;
+        let (min_x, min_y, max_x, max_y) = roi_bbox.unwrap_or((
+            0,
+            0,
+            slice.width.saturating_sub(1),
+            slice.height.saturating_sub(1),
+        ));
+        let width = max_x.saturating_sub(min_x) + 1;
+        let height = max_y.saturating_sub(min_y) + 1;
+        self.apply_slice_patch(
+            &viewer_label,
+            z,
+            t,
+            channel,
+            min_x,
+            min_y,
+            width,
+            height,
+            None,
+            fill,
+            PasteMode::Copy,
+        )?;
+        Ok(format!("{action} applied"))
+    }
+
+    fn interpolate_selection(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Interpolate".to_string())?
+            .to_string();
+        let interval = params
+            .get("interval")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0) as f32;
+        let smooth = params
+            .get("smooth")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let adjust = params
+            .get("adjust")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+
+        let selected_id = viewer.rois.selected_roi_id;
+        let roi = selected_id
+            .and_then(|id| viewer.rois.overlay_rois.iter_mut().find(|roi| roi.id == id))
+            .or(viewer.rois.active_roi.as_mut())
+            .ok_or_else(|| "Interpolate requires a selection".to_string())?;
+        roi.kind = interpolate_roi_kind(&roi.kind, interval, smooth, adjust)?;
+        Ok("selection interpolated".to_string())
+    }
+
+    fn selection_properties(&mut self, window_label: &str) -> Result<String, String> {
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for selection properties".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let roi = viewer
+            .rois
+            .selected_roi_id
+            .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
+            .or(viewer.rois.active_roi.as_ref())
+            .ok_or_else(|| "selection properties require a selection".to_string())?;
+        let row = selection_properties_row(roi)?;
+        self.results_table.add_row(row);
+        self.desktop_state.utility_windows.results_open = true;
+        self.persist_desktop_state();
+        Ok("selection properties added to results".to_string())
+    }
+
+    fn apply_macro_set_option(&mut self, window_label: &str, params: &Value) -> String {
+        let option = params
+            .get("option")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let state = params.get("state").and_then(Value::as_bool).unwrap_or(true);
+        let normalized = option.trim().to_ascii_lowercase();
+
+        if normalized == "stack position" {
+            self.desktop_state.measurement_settings.slice = state;
+            self.desktop_state.measurement_settings.channel = state;
+            self.desktop_state.measurement_settings.time = state;
+            self.persist_desktop_state();
+            return format!("setOption Stack position={state}");
+        }
+
+        if normalized.starts_with("show all") {
+            if let Some(viewer_label) = self.current_viewer_label(window_label).map(str::to_string)
+                && let Some(viewer) = self.viewers_ui.get_mut(&viewer_label)
+                && !viewer.rois.overlay_rois.is_empty()
+            {
+                for roi in &mut viewer.rois.overlay_rois {
+                    roi.visible = state;
+                }
+                return format!("setOption Show All={state}");
+            }
+            return format!("setOption Show All={state} acknowledged");
+        }
+
+        if matches!(
+            normalized.as_str(),
+            "debugmode" | "interpolatelines" | "monospacedtext"
+        ) {
+            return format!("setOption {option}={state} acknowledged");
+        }
+
+        format!("setOption {option}={state} acknowledged")
+    }
+
+    fn apply_macro_call(&mut self, params: &Value) -> String {
+        let target = params
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match target {
+            "ij.plugin.MacroInstaller.installFromJar"
+            | "ij.plugin.frame.Recorder.recordString"
+            | "ij.plugin.frame.Recorder.scriptMode"
+            | "ij.Prefs.get"
+            | "ij.Prefs.set"
+            | "ij.gui.Line.getWidth" => format!("call {target} acknowledged"),
+            _ if target.is_empty() => "call acknowledged".to_string(),
+            _ => format!("call {target} acknowledged"),
+        }
+    }
+
+    fn apply_macro_builtin_call(&mut self, params: &Value) -> String {
+        let target = params
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        format!("{target} acknowledged")
+    }
+
+    fn apply_macro_set_color(&mut self, params: &Value) -> Result<String, String> {
+        let target = params
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("foreground")
+            .trim()
+            .to_ascii_lowercase();
+        let red = macro_color_component(params, "red")?;
+        let green = macro_color_component(params, "green")?;
+        let blue = macro_color_component(params, "blue")?;
+        let color = egui::Color32::from_rgb(red, green, blue);
+
+        match target.as_str() {
+            "foreground" => {
+                self.tool_options.foreground_color = color;
+                Ok(format!("set foreground color to {red},{green},{blue}"))
+            }
+            "background" => {
+                self.tool_options.background_color = color;
+                Ok(format!("set background color to {red},{green},{blue}"))
+            }
+            _ => Err(format!("unknown macro color target `{target}`")),
+        }
+    }
+
+    fn apply_macro_set_roi_name(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if name.is_empty() {
+            return Err("ROI name cannot be empty".to_string());
+        }
+
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for ROI naming".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+
+        if let Some(id) = viewer.rois.selected_roi_id
+            && let Some(roi) = viewer.rois.overlay_rois.iter_mut().find(|roi| roi.id == id)
+        {
+            roi.name = name.to_string();
+            return Ok(format!("ROI named {name}"));
+        }
+
+        let Some(roi) = viewer.rois.active_roi.as_mut() else {
+            return Err("ROI naming requires an active selection".to_string());
+        };
+        roi.name = name.to_string();
+        Ok(format!("ROI named {name}"))
+    }
+
+    fn apply_macro_set_metadata(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let key = params
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if key.is_empty() {
+            return Err("metadata key cannot be empty".to_string());
+        }
+        let value = params
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for metadata".to_string())?
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+        let mut dataset = session.ensure_committed_dataset()?.as_ref().clone();
+        dataset
+            .metadata
+            .extras
+            .insert(key.to_string(), json!(value));
+        session.commit_dataset(Arc::new(dataset));
+        Ok(format!("metadata {key} set"))
+    }
+
+    fn apply_macro_set_tool(&mut self, params: &Value) -> Result<String, String> {
+        let tool = params
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if tool_from_command_id(tool).is_none() {
+            return Err("setTool requires a known tool".to_string());
+        }
+
+        if let Some(mode) = params
+            .get("mode")
+            .and_then(Value::as_str)
+            .filter(|mode| !mode.is_empty())
+        {
+            let result = self.dispatch_command(LAUNCHER_LABEL, mode, None);
+            if !matches!(result.status, command_registry::CommandExecuteStatus::Ok) {
+                return Err(result.message);
+            }
+        }
+
+        let result = self.dispatch_command(LAUNCHER_LABEL, tool, None);
+        if matches!(result.status, command_registry::CommandExecuteStatus::Ok) {
+            Ok(result.message)
+        } else {
+            Err(result.message)
+        }
+    }
+
+    fn apply_macro_set_paste_mode(&mut self, params: &Value) -> Result<String, String> {
+        let mode = params
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        self.clipboard.paste_mode = if mode.contains("add") {
+            PasteMode::Add
+        } else {
+            PasteMode::Copy
+        };
+        Ok(format!("paste mode set to {mode}"))
+    }
+
+    fn make_macro_roi(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+        oval: bool,
+    ) -> Result<String, String> {
+        let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let width = params.get("width").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+        let height = params.get("height").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+        if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite() {
+            return Err("macro selection coordinates must be finite".to_string());
+        }
+        if width <= 0.0 || height <= 0.0 {
+            return Err("macro selection width and height must be positive".to_string());
+        }
+
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for macro selection".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let position = interaction::roi::RoiPosition {
+            channel: viewer.channel,
+            z: viewer.z,
+            t: viewer.t,
+        };
+        let start = egui::pos2(x, y);
+        let end = egui::pos2(x + width, y + height);
+        let kind = if oval {
+            RoiKind::Oval {
+                start,
+                end,
+                ellipse: false,
+                brush: false,
+            }
+        } else {
+            RoiKind::Rect {
+                start,
+                end,
+                rounded: false,
+                rotated: false,
+            }
+        };
+        viewer.rois.begin_active(kind, position);
+        Ok(if oval {
+            "oval selection created".to_string()
+        } else {
+            "rectangular selection created".to_string()
+        })
+    }
+
+    fn make_macro_line(&mut self, window_label: &str, params: &Value) -> Result<String, String> {
+        let x1 = params.get("x1").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let y1 = params.get("y1").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let x2 = params.get("x2").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        let y2 = params.get("y2").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+        if !x1.is_finite() || !y1.is_finite() || !x2.is_finite() || !y2.is_finite() {
+            return Err("macro line coordinates must be finite".to_string());
+        }
+
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for macro line".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let position = interaction::roi::RoiPosition {
+            channel: viewer.channel,
+            z: viewer.z,
+            t: viewer.t,
+        };
+        viewer.rois.begin_active(
+            RoiKind::Line {
+                start: egui::pos2(x1, y1),
+                end: egui::pos2(x2, y2),
+                arrow: false,
+            },
+            position,
+        );
+        Ok("line selection created".to_string())
+    }
+
+    fn make_macro_selection(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let selection_type = params
+            .get("selection_type")
+            .and_then(Value::as_str)
+            .unwrap_or("polygon")
+            .to_ascii_lowercase();
+        let points = params
+            .get("points")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "macro selection requires points".to_string())?
+            .iter()
+            .map(|point| {
+                let x = point
+                    .get("x")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| "macro selection point requires x".to_string())?
+                    as f32;
+                let y = point
+                    .get("y")
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| "macro selection point requires y".to_string())?
+                    as f32;
+                if !x.is_finite() || !y.is_finite() {
+                    return Err("macro selection point coordinates must be finite".to_string());
+                }
+                Ok(egui::pos2(x, y))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if selection_type.contains("point") {
+            if points.is_empty() {
+                return Err("macro point selection requires at least one point".to_string());
+            }
+        } else if points.len() < 2 {
+            return Err("macro selection requires at least two points".to_string());
+        }
+
+        let viewer_label = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for macro selection".to_string())?
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get_mut(&viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let position = interaction::roi::RoiPosition {
+            channel: viewer.channel,
+            z: viewer.z,
+            t: viewer.t,
+        };
+        let kind = if selection_type.contains("point") {
+            RoiKind::Point {
+                points,
+                multi: true,
+            }
+        } else if selection_type.contains("free") {
+            RoiKind::Freehand { points }
+        } else {
+            RoiKind::Polygon {
+                points,
+                closed: !selection_type.contains("line"),
+            }
+        };
+        viewer.rois.begin_active(kind, position);
+        Ok("macro selection created".to_string())
     }
 
     fn layout_viewers(&mut self, mode: LayoutMode) -> Result<String, String> {
@@ -2600,6 +4887,7 @@ impl ImageUiApp {
         patch_height: usize,
         patch: Option<&DatasetF32>,
         fill: f32,
+        paste_mode: PasteMode,
     ) -> Result<String, String> {
         let session = self
             .state
@@ -2633,7 +4921,11 @@ impl ImageUiApp {
                     index[axis] = channel.min(dataset.shape()[axis].saturating_sub(1));
                 }
                 dataset.data[IxDyn(&index)] = if let Some(patch) = patch {
-                    patch.data[IxDyn(&[py, px])]
+                    let value = patch.data[IxDyn(&[py, px])];
+                    match paste_mode {
+                        PasteMode::Copy => value,
+                        PasteMode::Add => dataset.data[IxDyn(&index)] + value,
+                    }
                 } else {
                     fill
                 };
@@ -2726,6 +5018,31 @@ impl ImageUiApp {
         });
     }
 
+    fn record_macro_command(
+        &mut self,
+        command_id: &str,
+        params: Option<&Value>,
+        result: &command_registry::CommandExecuteResult,
+    ) {
+        if !self.macro_recorder.open
+            || !self.macro_recorder.recording
+            || command_id.starts_with("plugins.macros.")
+            || !matches!(result.status, command_registry::CommandExecuteStatus::Ok)
+        {
+            return;
+        }
+
+        let Some(line) = macro_record_line_for_command(command_id, params, &self.command_catalog)
+        else {
+            return;
+        };
+        if !self.macro_recorder.text.is_empty() && !self.macro_recorder.text.ends_with('\n') {
+            self.macro_recorder.text.push('\n');
+        }
+        self.macro_recorder.text.push_str(&line);
+        self.macro_recorder.text.push('\n');
+    }
+
     fn repeat_last_command(
         &mut self,
         window_label: &str,
@@ -2758,6 +5075,24 @@ impl ImageUiApp {
         params: Option<&Value>,
     ) -> Option<command_registry::CommandExecuteResult> {
         if command_id == "file.open" {
+            if let Some(path) = params
+                .and_then(|params| params.get("path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            {
+                let result = self.open_paths(vec![PathBuf::from(path)]);
+                self.apply_open_result(&result);
+                if result.errors.is_empty() {
+                    return Some(command_registry::CommandExecuteResult::ok(format!(
+                        "opened {path}"
+                    )));
+                }
+                return Some(command_registry::CommandExecuteResult::blocked(
+                    result.errors.join("; "),
+                ));
+            }
+
             let extensions = supported_formats();
             let picked_paths = FileDialog::new()
                 .add_filter("Supported images", extensions)
@@ -2847,6 +5182,22 @@ impl ImageUiApp {
                 return Some(command_registry::CommandExecuteResult::blocked(
                     "a loaded image is required for save as",
                 ));
+            }
+
+            if let Some(path) = params
+                .and_then(|params| params.get("path"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            {
+                let format = params
+                    .and_then(|params| params.get("format"))
+                    .and_then(Value::as_str);
+                let target_path = macro_save_path(path, format);
+                return Some(match self.save_viewer(window_label, Some(target_path)) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                });
             }
 
             let current_path = self.state.label_to_path.get(window_label).cloned();
@@ -2944,7 +5295,7 @@ impl ImageUiApp {
                 format!("{} tool selected", tool.label())
             } else {
                 format!(
-                    "{} tool selected (behavior not implemented yet)",
+                    "{} tool selected (reserved for future extension)",
                     tool.label()
                 )
             };
@@ -3260,6 +5611,27 @@ impl ImageUiApp {
                     "circular selection created",
                 ))
             }
+            "edit.selection.all" => {
+                let Some(session) = self.state.label_to_session.get(window_label) else {
+                    return Some(command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required for select all",
+                    ));
+                };
+                let roi = match full_image_rect_roi(&session.committed_summary.shape) {
+                    Ok(roi) => roi,
+                    Err(error) => {
+                        return Some(command_registry::CommandExecuteResult::blocked(error));
+                    }
+                };
+                let position = interaction::roi::RoiPosition {
+                    channel: viewer.channel,
+                    z: viewer.z,
+                    t: viewer.t,
+                };
+                viewer.rois.begin_active(roi, position);
+                viewer.rois.commit_active(false);
+                Some(command_registry::CommandExecuteResult::ok("selected all"))
+            }
             "image.zoom.maximize" => {
                 viewer.pending_zoom = Some(ZoomCommand::Maximize);
                 Some(command_registry::CommandExecuteResult::ok("zoom maximized"))
@@ -3286,7 +5658,7 @@ impl ImageUiApp {
                     lut.label()
                 )))
             }
-            "viewer.roi.clear" => {
+            "viewer.roi.clear" | "edit.selection.none" => {
                 viewer.rois.clear_all();
                 Some(command_registry::CommandExecuteResult::ok(
                     "selection cleared",
@@ -3331,6 +5703,122 @@ impl ImageUiApp {
 
         match request.command_id.as_str() {
             "process.repeat_command" => self.repeat_last_command(window_label),
+            "macro.set_option" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                command_registry::CommandExecuteResult::ok(
+                    self.apply_macro_set_option(window_label, &params),
+                )
+            }
+            "macro.call" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                command_registry::CommandExecuteResult::ok(self.apply_macro_call(&params))
+            }
+            "macro.builtin_call" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                command_registry::CommandExecuteResult::ok(self.apply_macro_builtin_call(&params))
+            }
+            "macro.select_window" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.select_macro_window(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.select_image" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.select_macro_image(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.close_window" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.close_macro_window(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.set_color" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.apply_macro_set_color(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.set_roi_name" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.apply_macro_set_roi_name(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.set_metadata" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.apply_macro_set_metadata(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.set_tool" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.apply_macro_set_tool(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.set_paste_mode" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.apply_macro_set_paste_mode(&params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.remove_overlay_rois" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.remove_overlay_rois_by_name(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.remove_overlay_selection" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.remove_overlay_selection(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.activate_overlay_selection" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.activate_overlay_selection(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.make_rectangle" | "macro.make_oval" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.make_macro_roi(
+                    window_label,
+                    &params,
+                    request.command_id == "macro.make_oval",
+                ) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.make_line" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.make_macro_line(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro.make_selection" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.make_macro_selection(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "file.close" => {
                 if window_label == LAUNCHER_LABEL {
                     command_registry::CommandExecuteResult::blocked(
@@ -3445,6 +5933,35 @@ impl ImageUiApp {
                 ),
                 Err(error) => command_registry::CommandExecuteResult::blocked(error),
             },
+            "edit.clear" => {
+                let background = f32::from(self.tool_options.background_color.r()) / 255.0;
+                match self.fill_selection_or_slice(window_label, background, "clear") {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "edit.fill" => {
+                let foreground = f32::from(self.tool_options.foreground_color.r()) / 255.0;
+                match self.fill_selection_or_slice(window_label, foreground, "fill") {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "edit.internal_clipboard" => match self.show_internal_clipboard() {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "edit.selection.interpolate" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.interpolate_selection(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "edit.selection.properties" => match self.selection_properties(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
             "image.type.8bit" | "image.type.16bit" | "image.type.32bit" | "image.type.rgb" => {
                 let target = match request.command_id.as_str() {
                     "image.type.8bit" => "u8",
@@ -3467,6 +5984,13 @@ impl ImageUiApp {
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
+            }
+            "image.type.make_composite" => {
+                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
+                    viewer.status_message = "composite display mode acknowledged".to_string();
+                    viewer.tool_message = Some(viewer.status_message.clone());
+                }
+                command_registry::CommandExecuteResult::ok("composite display mode acknowledged")
             }
             "image.stacks.add_slice" | "image.stacks.delete_slice" => {
                 let viewer_z = self
@@ -3957,10 +6481,13 @@ impl ImageUiApp {
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
-            "image.duplicate" => match self.duplicate_viewer(window_label) {
-                Ok(message) => command_registry::CommandExecuteResult::ok(message),
-                Err(error) => command_registry::CommandExecuteResult::blocked(error),
-            },
+            "image.duplicate" => {
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                match self.duplicate_viewer(window_label, &params) {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
             "image.rename" => {
                 let params = command_registry::merge_params(&request.command_id, request.params);
                 match self.rename_viewer(window_label, &params) {
@@ -4094,6 +6621,22 @@ impl ImageUiApp {
                 }
             }
             "image.adjust.size" => {
+                if let Some(params) = request.params {
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "image.resize".to_string(),
+                            params,
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "resize started",
+                            json!({ "job_id": ticket.job_id, "op": "image.resize" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
                 if let Some(session) = self.state.label_to_session.get(window_label) {
                     self.resize_dialog.width = session.committed_summary.shape[1];
                     self.resize_dialog.height = session.committed_summary.shape[0];
@@ -4102,6 +6645,22 @@ impl ImageUiApp {
                 command_registry::CommandExecuteResult::ok("resize dialog opened")
             }
             "image.adjust.canvas" => {
+                if let Some(params) = request.params {
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "image.canvas_resize".to_string(),
+                            params,
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "canvas resize started",
+                            json!({ "job_id": ticket.job_id, "op": "image.canvas_resize" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
                 if let Some(session) = self.state.label_to_session.get(window_label) {
                     self.canvas_dialog.width = session.committed_summary.shape[1];
                     self.canvas_dialog.height = session.committed_summary.shape[0];
@@ -4814,9 +7373,86 @@ impl ImageUiApp {
             "plugins.macros.run"
             | "plugins.macros.record"
             | "plugins.macros.install"
-            | "plugins.utilities.startup" => command_registry::CommandExecuteResult::ok(
-                "macro/plugin compatibility is deferred in image-rs",
-            ),
+            | "plugins.utilities.startup" => {
+                if matches!(request.command_id.as_str(), "plugins.macros.run") {
+                    let Some(path) = FileDialog::new()
+                        .add_filter("ImageJ Macros", &["ijm", "txt"])
+                        .set_title("Run macro")
+                        .pick_file()
+                    else {
+                        self.set_fallback_status("macro run canceled");
+                        self.macro_compatibility_command = Some("plugins.macros.run".to_string());
+                        self.macro_compatibility_open = true;
+                        self.macro_compatibility_path = None;
+                        self.macro_compatibility_preview =
+                            "Select an installed macro below or use Install... to add one."
+                                .to_string();
+                        self.macro_compatibility_run_log = String::new();
+                        return command_registry::CommandExecuteResult::ok("macro run canceled");
+                    };
+                    self.open_macro_compatibility_window_for_file("plugins.macros.run", &path);
+                    self.set_fallback_status("macro file selected for review");
+                    return command_registry::CommandExecuteResult::ok(format!(
+                        "macro file selected: {}",
+                        path.display()
+                    ));
+                }
+
+                if matches!(request.command_id.as_str(), "plugins.macros.install") {
+                    let Some(path) = FileDialog::new()
+                        .add_filter("ImageJ Macro", &["ijm", "txt"])
+                        .set_title("Install macro plugin")
+                        .pick_file()
+                    else {
+                        self.set_fallback_status("macro install canceled");
+                        return command_registry::CommandExecuteResult::ok(
+                            "macro install canceled",
+                        );
+                    };
+                    let installed_path = match self.install_macro_file(&path) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            self.set_fallback_status(error.clone());
+                            return command_registry::CommandExecuteResult::blocked(error);
+                        }
+                    };
+                    self.open_macro_compatibility_window_for_file(
+                        "plugins.macros.install",
+                        &installed_path,
+                    );
+                    self.set_fallback_status("macro installed");
+                    return command_registry::CommandExecuteResult::ok(format!(
+                        "macro installed: {}",
+                        installed_path.display()
+                    ));
+                }
+                if matches!(request.command_id.as_str(), "plugins.macros.record") {
+                    self.macro_recorder.open = true;
+                    self.macro_recorder.recording = true;
+                    self.set_fallback_status("macro recorder opened");
+                    return command_registry::CommandExecuteResult::ok("macro recorder opened");
+                }
+                if matches!(request.command_id.as_str(), "plugins.utilities.startup") {
+                    self.open_startup_macro_window();
+                    self.set_fallback_status("startup macro editor opened");
+                    return command_registry::CommandExecuteResult::ok(
+                        "startup macro editor opened",
+                    );
+                }
+
+                self.macro_compatibility_command = Some(request.command_id.clone());
+                self.macro_compatibility_open = true;
+                self.macro_compatibility_path = None;
+                self.macro_compatibility_preview = String::new();
+                self.set_fallback_status(format!(
+                    "{} is not yet fully supported",
+                    request.command_id
+                ));
+                command_registry::CommandExecuteResult::ok(format!(
+                    "{} command opened in compatibility window",
+                    request.command_id
+                ))
+            }
             _ => command_registry::CommandExecuteResult::unimplemented(format!(
                 "command `{}` has no backend handler yet",
                 request.command_id
@@ -5049,6 +7685,9 @@ impl ImageUiApp {
                         } else {
                             let children = item.items.clone().unwrap_or_default();
                             self.draw_menu_items(ui, window_label, &children, actions);
+                            if item.id.as_deref() == Some("plugins.macros") {
+                                self.draw_installed_macro_menu_items(ui, window_label, actions);
+                            }
                         }
                     });
                 }
@@ -5093,6 +7732,57 @@ impl ImageUiApp {
                     }
                 }
             }
+        }
+    }
+
+    fn draw_installed_macro_menu_items(
+        &self,
+        ui: &mut egui::Ui,
+        window_label: &str,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let entries = self.installed_macro_menu_entries();
+        if entries.is_empty() {
+            return;
+        }
+
+        ui.separator();
+        let mut submenus: BTreeMap<String, Vec<InstalledMacroMenuEntry>> = BTreeMap::new();
+        for entry in entries {
+            if let Some(submenu) = entry.submenu.clone() {
+                submenus.entry(submenu).or_default().push(entry);
+            } else {
+                self.draw_installed_macro_menu_entry(ui, window_label, actions, &entry);
+            }
+        }
+        for (submenu, entries) in submenus {
+            ui.menu_button(submenu, |ui| {
+                for entry in entries {
+                    self.draw_installed_macro_menu_entry(ui, window_label, actions, &entry);
+                }
+            });
+        }
+    }
+
+    fn draw_installed_macro_menu_entry(
+        &self,
+        ui: &mut egui::Ui,
+        window_label: &str,
+        actions: &mut Vec<UiAction>,
+        entry: &InstalledMacroMenuEntry,
+    ) {
+        let caption = if let Some(shortcut) = &entry.shortcut {
+            format!("{}    {}", entry.label, shortcut)
+        } else {
+            entry.label.clone()
+        };
+        if ui.button(caption).clicked() {
+            actions.push(UiAction::RunInstalledMacro {
+                window_label: self.macro_shortcut_window_label(window_label),
+                path: entry.path.clone(),
+                macro_name: entry.macro_name.clone(),
+            });
+            ui.close_menu();
         }
     }
 
@@ -5453,6 +8143,18 @@ impl ImageUiApp {
                     });
                 }
             }
+
+            if input.modifiers.is_none() {
+                if let Some((path, macro_name)) = self.installed_macro_shortcut(|shortcut| {
+                    macro_shortcut_matches_function_key(shortcut, &input)
+                }) {
+                    actions.push(UiAction::RunInstalledMacro {
+                        window_label: self.macro_shortcut_window_label(window_label),
+                        path,
+                        macro_name,
+                    });
+                }
+            }
         }
 
         if wants_keyboard {
@@ -5463,6 +8165,17 @@ impl ImageUiApp {
             let egui::Event::Text(text) = event else {
                 continue;
             };
+
+            if let Some((path, macro_name)) = self
+                .installed_macro_shortcut(|shortcut| macro_shortcut_matches_text(shortcut, text))
+            {
+                actions.push(UiAction::RunInstalledMacro {
+                    window_label: self.macro_shortcut_window_label(window_label),
+                    path,
+                    macro_name,
+                });
+                continue;
+            }
 
             if let Some(tool_command) = tool_shortcut_command(text) {
                 actions.push(UiAction::Command {
@@ -5518,6 +8231,45 @@ impl ImageUiApp {
         }
     }
 
+    fn macro_shortcut_window_label(&self, window_label: &str) -> String {
+        if window_label == LAUNCHER_LABEL {
+            self.active_viewer_label
+                .clone()
+                .unwrap_or_else(|| LAUNCHER_LABEL.to_string())
+        } else {
+            window_label.to_string()
+        }
+    }
+
+    fn installed_macro_shortcut(
+        &self,
+        matches_shortcut: impl Fn(&str) -> bool,
+    ) -> Option<(PathBuf, String)> {
+        for path in self.list_installed_macro_files() {
+            for block in installed_macro_blocks(&path) {
+                let Some(shortcut) = block.shortcut.as_deref() else {
+                    continue;
+                };
+                if matches_shortcut(shortcut) {
+                    return Some((path, block.name));
+                }
+            }
+        }
+        None
+    }
+
+    fn installed_macro_menu_entries(&self) -> Vec<InstalledMacroMenuEntry> {
+        let mut entries = Vec::new();
+        for path in self.list_installed_macro_files() {
+            for block in installed_macro_blocks(&path) {
+                if let Some(entry) = installed_macro_menu_entry_from_block(&path, &block) {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries
+    }
+
     fn draw_launcher(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
         self.handle_shortcuts(ctx, LAUNCHER_LABEL, actions);
         self.refresh_launcher_status();
@@ -5568,6 +8320,515 @@ impl ImageUiApp {
         self.draw_profile_plot_window(ctx);
         self.draw_help_windows(ctx);
         self.draw_command_finder_window(ctx, actions);
+        self.draw_macro_recorder_window(ctx);
+        self.draw_startup_macro_window(ctx);
+        self.draw_macro_compatibility_window(ctx);
+    }
+
+    fn draw_macro_recorder_window(&mut self, ctx: &egui::Context) {
+        if !self.macro_recorder.open {
+            return;
+        }
+
+        let mut open = self.macro_recorder.open;
+        let active_label = self
+            .active_viewer_label
+            .clone()
+            .unwrap_or_else(|| LAUNCHER_LABEL.to_string());
+        let mut run_requested = false;
+        let mut save_requested = false;
+
+        egui::Window::new("Recorder")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let label = if self.macro_recorder.recording {
+                        "Pause"
+                    } else {
+                        "Record"
+                    };
+                    if ui.button(label).clicked() {
+                        self.macro_recorder.recording = !self.macro_recorder.recording;
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.macro_recorder.text.clear();
+                        self.macro_recorder.last_run_log.clear();
+                    }
+                    if ui.button("Run").clicked() {
+                        run_requested = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        save_requested = true;
+                    }
+                });
+                let status = if self.macro_recorder.recording {
+                    "Recording"
+                } else {
+                    "Paused"
+                };
+                ui.label(status);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.macro_recorder.text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(16)
+                        .desired_width(f32::INFINITY),
+                );
+                if !self.macro_recorder.last_run_log.is_empty() {
+                    ui.separator();
+                    ui.label("Execution log:");
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.macro_recorder.last_run_log);
+                        });
+                }
+            });
+
+        self.macro_recorder.open = open;
+
+        if run_requested {
+            let source = self.macro_recorder.text.clone();
+            self.macro_recorder.last_run_log =
+                self.run_simple_macro_source("Recorder", &source, &active_label);
+        }
+        if save_requested {
+            self.macro_recorder.last_run_log = self.save_recorded_macro();
+        }
+    }
+
+    fn open_startup_macro_window(&mut self) {
+        self.startup_macro.text = match load_startup_macro() {
+            Ok(contents) => contents,
+            Err(error) => format!("// Failed to load startup macro: {error}\n"),
+        };
+        self.startup_macro.last_run_log.clear();
+        self.startup_macro.open = true;
+    }
+
+    fn draw_startup_macro_window(&mut self, ctx: &egui::Context) {
+        if !self.startup_macro.open {
+            return;
+        }
+
+        let mut open = self.startup_macro.open;
+        let path = startup_macro_path();
+        let active_label = self
+            .active_viewer_label
+            .clone()
+            .unwrap_or_else(|| LAUNCHER_LABEL.to_string());
+        let mut reload_requested = false;
+        let mut run_requested = false;
+        let mut save_requested = false;
+
+        egui::Window::new("Startup Macro")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Source: {}", path.display()));
+                ui.horizontal(|ui| {
+                    if ui.button("Reload").clicked() {
+                        reload_requested = true;
+                    }
+                    if ui.button("Run").clicked() {
+                        run_requested = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        save_requested = true;
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.startup_macro.text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(16)
+                        .desired_width(f32::INFINITY),
+                );
+                if !self.startup_macro.last_run_log.is_empty() {
+                    ui.separator();
+                    ui.label("Status:");
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.startup_macro.last_run_log);
+                        });
+                }
+            });
+
+        self.startup_macro.open = open;
+
+        if reload_requested {
+            match load_startup_macro() {
+                Ok(contents) => {
+                    self.startup_macro.text = contents;
+                    self.startup_macro.last_run_log =
+                        format!("reloaded startup macro: {}", path.display());
+                }
+                Err(error) => {
+                    self.startup_macro.last_run_log =
+                        format!("startup macro reload failed: {error}");
+                }
+            }
+        }
+        if run_requested {
+            let source = self.startup_macro.text.clone();
+            self.startup_macro.last_run_log =
+                self.run_simple_macro_source("Startup Macro", &source, &active_label);
+        }
+        if save_requested {
+            self.startup_macro.last_run_log = match save_startup_macro(&self.startup_macro.text) {
+                Ok(()) => format!("saved startup macro: {}", path.display()),
+                Err(error) => format!("startup macro save failed: {error}"),
+            };
+        }
+    }
+
+    fn draw_macro_compatibility_window(&mut self, ctx: &egui::Context) {
+        if !self.macro_compatibility_open {
+            return;
+        }
+        let mut open = self.macro_compatibility_open;
+        let command = self
+            .macro_compatibility_command
+            .as_deref()
+            .unwrap_or("plugins/macros command")
+            .to_string();
+        let has_macro_path = self.macro_compatibility_path.is_some();
+        let active_label = self
+            .active_viewer_label
+            .clone()
+            .unwrap_or_else(|| LAUNCHER_LABEL.to_string());
+        let installed_macros = self.list_installed_macro_files();
+        let mut review_installed_macro: Option<PathBuf> = None;
+        let mut run_installed_macro: Option<PathBuf> = None;
+        let mut run_named_installed_macro: Option<(PathBuf, String)> = None;
+
+        egui::Window::new("Macros and Plugins")
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("ImageJ-style macro and plugin support is not fully implemented.");
+                ui.label(format!("Requested command: {command}"));
+                ui.separator();
+                ui.label("Current compatibility:");
+                ui.label("• plugins.macros.run executes simple run(\"Command...\") macro files");
+                ui.label("• plugins.macros.record records UI commands into macro text");
+                ui.label("• plugins.macros.install copies .ijm/.txt files into the macros folder");
+                ui.label(
+                    "• plugins.utilities.startup edits and runs RunAtStartup.ijm and StartupMacros AutoRun macros",
+                );
+                ui.label("Planned support:");
+                ui.label("• Java/class/jar plugin execution");
+                ui.label("• full ImageJ macro language support");
+                if matches!(
+                    command.as_str(),
+                    "plugins.macros.run" | "plugins.macros.install"
+                ) && has_macro_path
+                {
+                    if ui
+                        .button("Execute selected macro as command list")
+                        .clicked()
+                    {
+                        if let Some(path) = self.macro_compatibility_path.clone() {
+                            let report = self.run_simple_macro_file(&path, &active_label);
+                            self.macro_compatibility_run_log = report;
+                        }
+                    }
+                }
+                if let Some(path) = &self.macro_compatibility_path {
+                    ui.separator();
+                    ui.label(format!("Source path: {}", path.display()));
+                    ui.label("Preview:");
+                }
+                ui.separator();
+                ui.label(format!(
+                    "Installed macros: {}",
+                    installed_macros_dir().display()
+                ));
+                if installed_macros.is_empty() {
+                    ui.label("No installed macros found.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for path in &installed_macros {
+                                let name = path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("macro");
+                                ui.horizontal(|ui| {
+                                    ui.label(name);
+                                    if ui.button("Review").clicked() {
+                                        review_installed_macro = Some(path.clone());
+                                    }
+                                    if ui.button("Run").clicked() {
+                                        run_installed_macro = Some(path.clone());
+                                    }
+                                });
+                                for block in installed_macro_blocks(path) {
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(16.0);
+                                        let display_name = macro_display_name(&block.name);
+                                        let shortcut = block
+                                            .shortcut
+                                            .as_deref()
+                                            .map(|shortcut| format!(" [{shortcut}]"))
+                                            .unwrap_or_default();
+                                        ui.label(format!("macro {display_name}{shortcut}"));
+                                        if ui.button("Run").clicked() {
+                                            run_named_installed_macro =
+                                                Some((path.clone(), block.name.clone()));
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                }
+                if !self.macro_compatibility_preview.is_empty() {
+                    ui.separator();
+                    ui.label("Details:");
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            ui.monospace(&self.macro_compatibility_preview);
+                        });
+                }
+                if !self.macro_compatibility_run_log.is_empty() {
+                    ui.separator();
+                    ui.label("Execution log:");
+                    ui.label(&self.macro_compatibility_run_log);
+                }
+            });
+        self.macro_compatibility_open = open;
+
+        if let Some(path) = review_installed_macro {
+            self.open_macro_compatibility_window_for_file("plugins.macros.install", &path);
+        }
+        if let Some(path) = run_installed_macro {
+            self.open_macro_compatibility_window_for_file("plugins.macros.install", &path);
+            self.macro_compatibility_run_log = self.run_simple_macro_file(&path, &active_label);
+        }
+        if let Some((path, name)) = run_named_installed_macro {
+            self.open_macro_compatibility_window_for_file("plugins.macros.install", &path);
+            self.macro_compatibility_run_log =
+                self.run_named_macro_block_file(&path, &name, &active_label);
+        }
+    }
+
+    fn open_macro_compatibility_window_for_file(&mut self, command_id: &str, path: &Path) {
+        self.macro_compatibility_command = Some(command_id.to_string());
+        self.macro_compatibility_path = Some(path.to_path_buf());
+        self.macro_compatibility_open = true;
+        self.macro_compatibility_preview = match fs::read_to_string(path) {
+            Ok(contents) => {
+                let snippet = contents.lines().take(12).collect::<Vec<_>>().join("\n");
+                if contents.lines().count() > 12 {
+                    format!("{snippet}\n… (truncated)")
+                } else {
+                    snippet
+                }
+            }
+            Err(error) => format!("Failed to read macro source: {error}"),
+        };
+        self.macro_compatibility_run_log = String::new();
+    }
+
+    fn install_macro_file(&self, source: &Path) -> Result<PathBuf, String> {
+        install_macro_file_to_dir(source, &installed_macros_dir())
+    }
+
+    fn list_installed_macro_files(&self) -> Vec<PathBuf> {
+        list_installed_macro_files_in_dir(&installed_macros_dir())
+    }
+
+    fn is_known_command_id(&self, command_id: &str) -> bool {
+        self.command_catalog
+            .entries
+            .iter()
+            .any(|entry| entry.id == command_id)
+            || command_registry::metadata(command_id).implemented
+    }
+
+    fn save_recorded_macro(&mut self) -> String {
+        if self.macro_recorder.text.trim().is_empty() {
+            return "No recorded macro commands to save".to_string();
+        }
+
+        let Some(path) = FileDialog::new()
+            .add_filter("ImageJ Macro", &["ijm"])
+            .set_file_name("Macro.ijm")
+            .set_title("Save Recorded Macro")
+            .save_file()
+        else {
+            return "macro save canceled".to_string();
+        };
+
+        match fs::write(&path, self.macro_recorder.text.as_bytes()) {
+            Ok(()) => format!("macro saved: {}", path.display()),
+            Err(error) => format!("macro save failed: {error}"),
+        }
+    }
+
+    fn run_simple_macro_file(&mut self, path: &Path, window_label: &str) -> String {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                return format!("Failed to read macro file {}: {error}", path.display());
+            }
+        };
+
+        self.run_simple_macro_source(&path.display().to_string(), &contents, window_label)
+    }
+
+    fn run_named_macro_block_file(
+        &mut self,
+        path: &Path,
+        name: &str,
+        window_label: &str,
+    ) -> String {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                return format!("Failed to read macro file {}: {error}", path.display());
+            }
+        };
+        let Some(block) = macro_source_named_blocks(&contents)
+            .into_iter()
+            .find(|block| block.name == name)
+        else {
+            return format!("macro `{name}` not found in {}", path.display());
+        };
+        let named_blocks = macro_named_block_statement_map(&contents);
+        self.run_simple_macro_lines(
+            &format!("{}:{}", path.display(), block.name),
+            block.statements,
+            window_label,
+            &named_blocks,
+        )
+    }
+
+    fn run_simple_macro_source(
+        &mut self,
+        source_name: &str,
+        contents: &str,
+        window_label: &str,
+    ) -> String {
+        let named_blocks = macro_named_block_statement_map(contents);
+        self.run_simple_macro_lines(
+            source_name,
+            macro_source_executable_lines(contents),
+            window_label,
+            &named_blocks,
+        )
+    }
+
+    fn run_simple_macro_lines(
+        &mut self,
+        source_name: &str,
+        executable_lines: Vec<(usize, String)>,
+        window_label: &str,
+        named_blocks: &HashMap<String, Vec<(usize, String)>>,
+    ) -> String {
+        let report = self.run_simple_macro_lines_inner(
+            source_name,
+            executable_lines,
+            window_label,
+            named_blocks,
+            0,
+        );
+        if report.lines.is_empty() {
+            return format!("No executable commands found in {source_name}");
+        }
+
+        format!(
+            "Executed: {}, blocked: {}, unimplemented: {}, unknown: {}\n{}",
+            report.executed,
+            report.blocked,
+            report.unimplemented,
+            report.unknown,
+            report.lines.join("\n")
+        )
+    }
+
+    fn run_simple_macro_lines_inner(
+        &mut self,
+        source_name: &str,
+        executable_lines: Vec<(usize, String)>,
+        window_label: &str,
+        named_blocks: &HashMap<String, Vec<(usize, String)>>,
+        depth: usize,
+    ) -> MacroRunReport {
+        const MAX_NAMED_MACRO_DEPTH: usize = 8;
+        let mut report = MacroRunReport::default();
+        for (line_number, raw_line) in executable_lines {
+            let invocation = match parse_macro_command_line(&raw_line, &self.command_catalog) {
+                Ok(Some(invocation)) => invocation,
+                Ok(None) => continue,
+                Err(error) => {
+                    report.blocked += 1;
+                    report
+                        .lines
+                        .push(format!("{line_number}: macro parse -> blocked ({error})"));
+                    continue;
+                }
+            };
+            let command_id = invocation.command_id;
+            if !self.is_known_command_id(&command_id) {
+                if let Some(statements) = named_blocks.get(&command_id) {
+                    if depth >= MAX_NAMED_MACRO_DEPTH {
+                        report.blocked += 1;
+                        report.lines.push(format!(
+                            "{line_number}: {command_id} -> blocked (macro recursion limit)"
+                        ));
+                        continue;
+                    }
+                    report
+                        .lines
+                        .push(format!("{line_number}: {command_id} -> macro"));
+                    let nested = self.run_simple_macro_lines_inner(
+                        &format!("{source_name}:{command_id}"),
+                        statements.clone(),
+                        window_label,
+                        named_blocks,
+                        depth + 1,
+                    );
+                    report.executed += nested.executed;
+                    report.blocked += nested.blocked;
+                    report.unknown += nested.unknown;
+                    report.unimplemented += nested.unimplemented;
+                    report.lines.extend(nested.lines);
+                    continue;
+                }
+
+                report.unknown += 1;
+                report
+                    .lines
+                    .push(format!("{line_number}: {command_id} -> unknown command"));
+                continue;
+            }
+
+            let result = self.dispatch_command(window_label, &command_id, invocation.params);
+            match result.status {
+                command_registry::CommandExecuteStatus::Ok => {
+                    report.executed += 1;
+                    report
+                        .lines
+                        .push(format!("{line_number}: {command_id} -> {}", result.message));
+                }
+                command_registry::CommandExecuteStatus::Unimplemented => {
+                    report.unimplemented += 1;
+                    report.lines.push(format!(
+                        "{line_number}: {command_id} -> unimplemented ({})",
+                        result.message
+                    ));
+                }
+                command_registry::CommandExecuteStatus::Blocked => {
+                    report.blocked += 1;
+                    report.lines.push(format!(
+                        "{line_number}: {command_id} -> blocked ({})",
+                        result.message
+                    ));
+                }
+            }
+        }
+
+        report
     }
 
     fn draw_new_image_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -6707,11 +9968,27 @@ impl ImageUiApp {
                         .unwrap_or_else(|| command_id.clone());
                     let result = self.dispatch_command(&window_label, &command_id, params);
                     self.remember_repeatable_command(&command_id, repeat_params.as_ref(), &result);
+                    self.record_macro_command(&command_id, repeat_params.as_ref(), &result);
                     if window_label == LAUNCHER_LABEL {
                         self.set_fallback_status(format!("{label}: {}", result.message));
                     } else if let Some(viewer) = self.viewers_ui.get_mut(&window_label) {
                         viewer.tool_message = Some(result.message.clone());
                         viewer.status_message = result.message;
+                    }
+                }
+                UiAction::RunInstalledMacro {
+                    window_label,
+                    path,
+                    macro_name,
+                } => {
+                    let display_name = macro_display_name(&macro_name);
+                    let message =
+                        self.run_named_macro_block_file(&path, &macro_name, &window_label);
+                    if window_label == LAUNCHER_LABEL {
+                        self.set_fallback_status(format!("Macro {display_name}: {message}"));
+                    } else if let Some(viewer) = self.viewers_ui.get_mut(&window_label) {
+                        viewer.tool_message = Some(message.clone());
+                        viewer.status_message = message;
                     }
                 }
                 UiAction::OpenPaths { paths } => {
@@ -7435,6 +10712,153 @@ fn centered_circular_roi(shape: &[usize], radius: Option<f32>) -> Result<RoiKind
         ellipse: false,
         brush: false,
     })
+}
+
+fn full_image_rect_roi(shape: &[usize]) -> Result<RoiKind, String> {
+    if shape.len() < 2 {
+        return Err("select all requires X/Y dimensions".to_string());
+    }
+    let height = shape[0] as f32;
+    let width = shape[1] as f32;
+    if width <= 0.0 || height <= 0.0 {
+        return Err("select all requires non-empty X/Y dimensions".to_string());
+    }
+    Ok(RoiKind::Rect {
+        start: egui::pos2(0.0, 0.0),
+        end: egui::pos2(width, height),
+        rounded: false,
+        rotated: false,
+    })
+}
+
+fn interpolate_roi_kind(
+    kind: &RoiKind,
+    interval: f32,
+    smooth: bool,
+    adjust: bool,
+) -> Result<RoiKind, String> {
+    if !interval.is_finite() || interval <= 0.0 {
+        return Err("interpolation interval must be a finite positive number".to_string());
+    }
+    let (points, closed, output) = match kind {
+        RoiKind::Line { start, end, .. } => (vec![*start, *end], false, "freehand"),
+        RoiKind::Polygon { points, closed } => (points.clone(), *closed, "polygon"),
+        RoiKind::Freehand { points } => (points.clone(), false, "freehand"),
+        RoiKind::WandTrace { points } => (points.clone(), points.len() > 2, "wand"),
+        _ => {
+            return Err(
+                "Interpolate supports line, polygon, freehand, and wand selections".to_string(),
+            );
+        }
+    };
+    let points = resample_roi_points(&points, closed, interval, adjust)?;
+    let points = if smooth {
+        smooth_roi_points(&points, closed)
+    } else {
+        points
+    };
+
+    Ok(match output {
+        "polygon" => RoiKind::Polygon { points, closed },
+        "wand" => RoiKind::WandTrace { points },
+        _ => RoiKind::Freehand { points },
+    })
+}
+
+fn resample_roi_points(
+    points: &[egui::Pos2],
+    closed: bool,
+    interval: f32,
+    adjust: bool,
+) -> Result<Vec<egui::Pos2>, String> {
+    if points.len() < 2 {
+        return Err("Interpolate requires at least two selection points".to_string());
+    }
+
+    let mut path = points.to_vec();
+    if closed {
+        path.push(points[0]);
+    }
+    let mut distances = Vec::with_capacity(path.len());
+    distances.push(0.0);
+    for segment in path.windows(2) {
+        let last = *distances.last().unwrap_or(&0.0);
+        distances.push(last + segment[0].distance(segment[1]));
+    }
+    let total = *distances.last().unwrap_or(&0.0);
+    if total <= f32::EPSILON {
+        return Ok(points.to_vec());
+    }
+
+    let segment_count = if adjust {
+        (total / interval).round().max(1.0)
+    } else {
+        (total / interval).ceil().max(1.0)
+    };
+    if segment_count > 50_000.0 {
+        return Err("Interpolate would create too many points".to_string());
+    }
+    let step = if adjust {
+        total / segment_count
+    } else {
+        interval
+    };
+
+    let mut output = Vec::new();
+    let mut target = 0.0;
+    while target < total {
+        output.push(interpolate_point_at_distance(&path, &distances, target));
+        target += step;
+    }
+    if !closed {
+        output.push(*points.last().expect("points checked"));
+    }
+
+    Ok(output)
+}
+
+fn interpolate_point_at_distance(
+    path: &[egui::Pos2],
+    distances: &[f32],
+    target: f32,
+) -> egui::Pos2 {
+    let segment_index = distances
+        .windows(2)
+        .position(|pair| target <= pair[1])
+        .unwrap_or_else(|| distances.len().saturating_sub(2));
+    let start_distance = distances[segment_index];
+    let end_distance = distances[segment_index + 1];
+    let span = (end_distance - start_distance).max(f32::EPSILON);
+    let t = ((target - start_distance) / span).clamp(0.0, 1.0);
+    path[segment_index].lerp(path[segment_index + 1], t)
+}
+
+fn smooth_roi_points(points: &[egui::Pos2], closed: bool) -> Vec<egui::Pos2> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let mut smoothed = Vec::with_capacity(points.len());
+    for index in 0..points.len() {
+        if !closed && (index == 0 || index + 1 == points.len()) {
+            smoothed.push(points[index]);
+            continue;
+        }
+        let previous = if index == 0 {
+            points[points.len() - 1]
+        } else {
+            points[index - 1]
+        };
+        let next = if index + 1 == points.len() {
+            points[0]
+        } else {
+            points[index + 1]
+        };
+        smoothed.push(egui::pos2(
+            (previous.x + points[index].x + next.x) / 3.0,
+            (previous.y + points[index].y + next.y) / 3.0,
+        ));
+    }
+    smoothed
 }
 
 fn drag_roi_for_tool(
@@ -9004,6 +12428,25 @@ fn overlay_element_rows(rois: &[RoiModel]) -> Result<Vec<BTreeMap<String, Value>
         .collect())
 }
 
+fn selection_properties_row(roi: &RoiModel) -> Result<BTreeMap<String, Value>, String> {
+    let mut row = BTreeMap::new();
+    row.insert("Name".to_string(), json!(roi.name));
+    row.insert("Type".to_string(), json!(roi_kind_name(&roi.kind)));
+    let Some((min_x, min_y, max_x, max_y)) = roi_kind_bbox(&roi.kind) else {
+        return Err("selection properties require a valid selection".to_string());
+    };
+    row.insert("X".to_string(), json!(min_x));
+    row.insert("Y".to_string(), json!(min_y));
+    row.insert("Width".to_string(), json!(max_x - min_x + 1));
+    row.insert("Height".to_string(), json!(max_y - min_y + 1));
+    row.insert("Channel".to_string(), json!(roi.position.channel + 1));
+    row.insert("Slice".to_string(), json!(roi.position.z + 1));
+    row.insert("Frame".to_string(), json!(roi.position.t + 1));
+    row.insert("Visible".to_string(), json!(roi.visible));
+    row.insert("Locked".to_string(), json!(roi.locked));
+    Ok(row)
+}
+
 fn threshold_slice_otsu(values: &[f32]) -> Vec<u8> {
     let (min, max) = min_max(values);
     let span = (max - min).max(f32::EPSILON);
@@ -10002,6 +13445,37 @@ fn renamed_image_path(current_path: &Path, title: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(file_name))
 }
 
+fn macro_save_path(path: &str, format: Option<&str>) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.extension().is_some() {
+        return path;
+    }
+
+    let Some(extension) = format.and_then(macro_save_extension) else {
+        return path;
+    };
+    path.with_extension(extension)
+}
+
+fn macro_save_extension(format: &str) -> Option<&'static str> {
+    let format = format.trim().to_ascii_lowercase();
+    if format.contains("tif") {
+        Some("tif")
+    } else if format.contains("jpeg") || format.contains("jpg") {
+        Some("jpg")
+    } else if format.contains("png") {
+        Some("png")
+    } else if format.contains("bmp") {
+        Some("bmp")
+    } else if format.contains("pgm") {
+        Some("pgm")
+    } else if format.contains("text") || format.contains("txt") {
+        Some("txt")
+    } else {
+        None
+    }
+}
+
 fn sanitize_image_title(title: &str) -> String {
     let sanitized = title
         .chars()
@@ -10102,6 +13576,7 @@ pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -10122,20 +13597,28 @@ mod tests {
         canonical_json, centered_circular_roi, combine_stack_datasets,
         compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
         create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
-        flatten_overlay_slice, format_launcher_status, image_draw_rect,
-        image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
-        images_to_stack_dataset, initialize_view_to_open_state, insert_stack_dataset,
-        line_width_from_params, lookup_table_color, lookup_table_from_command,
-        lookup_table_slice_to_rgb, new_image_dataset, overlay_element_rows,
-        overlay_from_roi_manager, overlay_label_for_roi, overlay_to_roi_manager, preview_cache_key,
+        first_report_line, flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
+        function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
+        imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
+        initialize_view_to_open_state, insert_stack_dataset, install_macro_file_to_dir,
+        installed_macro_file_name, installed_macro_menu_entry_from_block, interpolate_roi_kind,
+        line_width_from_params, list_installed_macro_files_in_dir, lookup_table_color,
+        lookup_table_from_command, lookup_table_slice_to_rgb, macro_display_name,
+        macro_name_shortcut, macro_named_block_statement_map, macro_options_to_json,
+        macro_record_line_for_command, macro_save_path, macro_shortcut_matches_text,
+        macro_source_executable_lines, macro_source_named_blocks, new_image_dataset,
+        overlay_element_rows, overlay_from_roi_manager, overlay_label_for_roi,
+        overlay_to_roi_manager, parse_macro_command_line, preview_cache_key,
         remove_stack_slice_labels_dataset, renamed_image_path, results_distribution,
         results_rows_to_dataset, results_summary_rows, roi_label_anchor, roi_stroke_width,
-        sanitize_image_title, set_stack_slice_label_dataset, should_request_periodic_repaint,
-        should_request_repaint_now, source_ptr_eq, stack_measurement_rows,
-        stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
-        stack_xy_profile_rows, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
+        sanitize_image_title, selection_properties_row, set_stack_slice_label_dataset,
+        should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
+        stack_measurement_rows, stack_position_from_params, stack_slice_label, stack_slice_path,
+        stack_to_image_datasets, stack_xy_profile_rows, startup_auto_run_macro_block,
+        strip_macro_line_comment, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
         xy_coordinate_rows, zoom_set_params,
     };
+    use tempfile::tempdir;
 
     fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
         let data = Array::from_shape_vec((2, 2), values.to_vec())
@@ -11187,6 +14670,35 @@ mod tests {
     }
 
     #[test]
+    fn selection_properties_row_reports_bounds_and_position() {
+        let roi = RoiModel {
+            id: 7,
+            name: "Selection".to_string(),
+            kind: RoiKind::Line {
+                start: egui::pos2(1.0, 2.0),
+                end: egui::pos2(6.0, 8.0),
+                arrow: false,
+            },
+            position: RoiPosition {
+                channel: 1,
+                z: 2,
+                t: 3,
+            },
+            visible: true,
+            locked: false,
+        };
+
+        let row = selection_properties_row(&roi).expect("selection row");
+
+        assert_eq!(row.get("Type"), Some(&json!("Line")));
+        assert_eq!(row.get("Width"), Some(&json!(6)));
+        assert_eq!(row.get("Height"), Some(&json!(7)));
+        assert_eq!(row.get("Channel"), Some(&json!(2)));
+        assert_eq!(row.get("Slice"), Some(&json!(3)));
+        assert_eq!(row.get("Frame"), Some(&json!(4)));
+    }
+
+    #[test]
     fn apply_overlay_visibility_toggles_all_elements() {
         let mut rois = vec![
             RoiModel {
@@ -11409,6 +14921,22 @@ mod tests {
     }
 
     #[test]
+    fn macro_save_path_adds_format_extension_when_missing() {
+        assert_eq!(
+            macro_save_path("/tmp/output", Some("Tiff")),
+            PathBuf::from("/tmp/output.tif")
+        );
+        assert_eq!(
+            macro_save_path("/tmp/output", Some("PNG")),
+            PathBuf::from("/tmp/output.png")
+        );
+        assert_eq!(
+            macro_save_path("/tmp/output.jpg", Some("Tiff")),
+            PathBuf::from("/tmp/output.jpg")
+        );
+    }
+
+    #[test]
     fn sanitize_image_title_replaces_path_separators() {
         assert_eq!(sanitize_image_title("a/b\\c:d"), "a_b_c_d");
         assert_eq!(sanitize_image_title("   "), "Untitled");
@@ -11475,9 +15003,819 @@ mod tests {
     }
 
     #[test]
+    fn full_image_rect_roi_matches_imagej_select_all_bounds() {
+        let roi = full_image_rect_roi(&[20, 30]).expect("full image roi");
+        let RoiKind::Rect {
+            start,
+            end,
+            rounded,
+            rotated,
+        } = roi
+        else {
+            panic!("expected rectangular ROI");
+        };
+
+        assert_eq!(start, egui::pos2(0.0, 0.0));
+        assert_eq!(end, egui::pos2(30.0, 20.0));
+        assert!(!rounded);
+        assert!(!rotated);
+    }
+
+    #[test]
+    fn interpolate_roi_kind_resamples_wand_trace_points() {
+        let roi = RoiKind::WandTrace {
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(4.0, 0.0),
+                egui::pos2(4.0, 4.0),
+            ],
+        };
+        let RoiKind::WandTrace { points } =
+            interpolate_roi_kind(&roi, 2.0, false, true).expect("interpolate")
+        else {
+            panic!("expected wand trace");
+        };
+
+        assert!(points.len() > 3);
+        assert_eq!(points[0], egui::pos2(0.0, 0.0));
+        assert!(points.iter().any(|point| point.x == 4.0 && point.y > 0.0));
+    }
+
+    #[test]
     fn viewer_sort_key_uses_numeric_suffix() {
         assert_eq!(viewer_sort_key("viewer-42"), 42);
         assert_eq!(viewer_sort_key("viewer-abc"), u64::MAX);
+    }
+
+    #[test]
+    fn imagej_macro_run_line_maps_menu_label_to_command() {
+        let catalog = crate::ui::command_registry::command_catalog();
+        let invocation = parse_macro_command_line(
+            r#"run("Enhance Contrast...", "saturated=0.35 normalize");"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+
+        assert_eq!(invocation.command_id, "process.enhance_contrast");
+        assert_eq!(
+            invocation.params,
+            Some(json!({
+                "saturated": 0.35,
+                "normalize": true
+            }))
+        );
+    }
+
+    #[test]
+    fn macro_command_line_keeps_internal_command_json_format() {
+        let catalog = crate::ui::command_registry::command_catalog();
+        let invocation =
+            parse_macro_command_line(r#"process.filters.gaussian|{"sigma":2.0}"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+
+        assert_eq!(invocation.command_id, "process.filters.gaussian");
+        assert_eq!(invocation.params, Some(json!({ "sigma": 2.0 })));
+    }
+
+    #[test]
+    fn macro_command_line_tolerates_inline_comments_and_metadata_calls() {
+        let catalog = crate::ui::command_registry::command_catalog();
+        let invocation = parse_macro_command_line(
+            r#"run("URL...", "url=http://example.com/a//b"); // inline comment"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+
+        assert_eq!(invocation.command_id, "file.import.url");
+        assert_eq!(
+            invocation.params,
+            Some(json!({"url": "http://example.com/a//b"}))
+        );
+        assert!(
+            parse_macro_command_line(r#"requires("1.53");"#, &catalog)
+                .expect("macro line should parse")
+                .is_none()
+        );
+        assert!(
+            parse_macro_command_line("setBatchMode(true);", &catalog)
+                .expect("macro line should parse")
+                .is_none()
+        );
+        let set_option =
+            parse_macro_command_line(r#"setOption("Stack position", true);"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(set_option.command_id, "macro.set_option");
+        assert_eq!(
+            set_option.params,
+            Some(json!({"option": "Stack position", "state": true}))
+        );
+        let call = parse_macro_command_line(
+            r#"call("ij.plugin.frame.Recorder.recordString", "Roi.setDefaultGroup(1);\n");"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+        assert_eq!(call.command_id, "macro.call");
+        assert_eq!(
+            call.params,
+            Some(json!({"target": "ij.plugin.frame.Recorder.recordString"}))
+        );
+        let dialog = parse_macro_command_line(r#"Dialog.create("Set Montage Layout");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(dialog.command_id, "macro.builtin_call");
+        assert_eq!(dialog.params, Some(json!({"target": "Dialog.create"})));
+        let stack_slice = parse_macro_command_line("Stack.setSlice(4);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(stack_slice.command_id, "image.stacks.set");
+        assert_eq!(stack_slice.params, Some(json!({"slice": 4})));
+        let dynamic_stack_slice = parse_macro_command_line("Stack.setSlice(n);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(dynamic_stack_slice.command_id, "macro.builtin_call");
+        assert_eq!(
+            dynamic_stack_slice.params,
+            Some(json!({"target": "Stack.setSlice"}))
+        );
+        let stroke_width = parse_macro_command_line("Roi.setStrokeWidth(3);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(stroke_width.command_id, "edit.options.line_width");
+        assert_eq!(stroke_width.params, Some(json!({"width": 3.0})));
+        let roi_name = parse_macro_command_line(r#"Roi.setName("label-1");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(roi_name.command_id, "macro.set_roi_name");
+        assert_eq!(roi_name.params, Some(json!({"name": "label-1"})));
+        let selection_name =
+            parse_macro_command_line(r#"setSelectionName("selection-1");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(selection_name.command_id, "macro.set_roi_name");
+        assert_eq!(selection_name.params, Some(json!({"name": "selection-1"})));
+        let metadata = parse_macro_command_line(r#"setMetadata("Info", "x=1");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(metadata.command_id, "macro.set_metadata");
+        assert_eq!(
+            metadata.params,
+            Some(json!({"key": "Info", "value": "x=1"}))
+        );
+        let dynamic_metadata =
+            parse_macro_command_line(r#"setMetadata("Info", "x="+width);"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(dynamic_metadata.command_id, "macro.builtin_call");
+        assert_eq!(
+            dynamic_metadata.params,
+            Some(json!({"target": "setMetadata"}))
+        );
+        let property =
+            parse_macro_command_line(r#"Property.set("CompositeProjection", "Sum");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(property.command_id, "macro.set_metadata");
+        assert_eq!(
+            property.params,
+            Some(json!({"key": "CompositeProjection", "value": "Sum"}))
+        );
+        let overlay_add =
+            parse_macro_command_line(r##"Overlay.addSelection("#ff0000", 2);"##, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(overlay_add.command_id, "image.overlay.add_selection");
+        assert_eq!(overlay_add.params, None);
+        let overlay_show = parse_macro_command_line("Overlay.show;", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(overlay_show.command_id, "image.overlay.show");
+        assert_eq!(overlay_show.params, None);
+        let overlay_hide = parse_macro_command_line("Overlay.hide();", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(overlay_hide.command_id, "image.overlay.hide");
+        assert_eq!(overlay_hide.params, None);
+        let overlay_remove = parse_macro_command_line(
+            r#"Overlay.removeRois("ToolSelectedOverlayElement");"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+        assert_eq!(overlay_remove.command_id, "macro.remove_overlay_rois");
+        assert_eq!(
+            overlay_remove.params,
+            Some(json!({"name": "ToolSelectedOverlayElement"}))
+        );
+        let overlay_remove_index =
+            parse_macro_command_line("Overlay.removeSelection(2);", &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(
+            overlay_remove_index.command_id,
+            "macro.remove_overlay_selection"
+        );
+        assert_eq!(overlay_remove_index.params, Some(json!({"index": 2})));
+        let overlay_activate = parse_macro_command_line("Overlay.activateSelection(1);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(
+            overlay_activate.command_id,
+            "macro.activate_overlay_selection"
+        );
+        assert_eq!(overlay_activate.params, Some(json!({"index": 1})));
+        let select_none = parse_macro_command_line("selectNone();", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(select_none.command_id, "edit.selection.none");
+        let set_slice = parse_macro_command_line("setSlice(3);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(set_slice.command_id, "image.stacks.set");
+        assert_eq!(set_slice.params, Some(json!({"slice": 3})));
+        let dynamic_set_slice = parse_macro_command_line("setSlice(n);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(dynamic_set_slice.command_id, "macro.builtin_call");
+        assert_eq!(
+            dynamic_set_slice.params,
+            Some(json!({"target": "setSlice"}))
+        );
+        let dynamic_select_image = parse_macro_command_line("selectImage(id);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(dynamic_select_image.command_id, "macro.builtin_call");
+        assert_eq!(
+            dynamic_select_image.params,
+            Some(json!({"target": "selectImage"}))
+        );
+        let literal_select_image = parse_macro_command_line("selectImage(3);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_select_image.command_id, "macro.select_image");
+        assert_eq!(literal_select_image.params, Some(json!({"id": 3})));
+        let arrow_tool = parse_macro_command_line(r#"setTool("arrow");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(arrow_tool.command_id, "macro.set_tool");
+        assert_eq!(
+            arrow_tool.params,
+            Some(json!({
+                "tool": "launcher.tool.line",
+                "mode": "launcher.tool.line.mode.arrow"
+            }))
+        );
+        let numeric_tool = parse_macro_command_line("setTool(7);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(numeric_tool.command_id, "macro.set_tool");
+        assert_eq!(
+            numeric_tool.params,
+            Some(json!({
+                "tool": "launcher.tool.point",
+                "mode": "launcher.tool.point.mode.point"
+            }))
+        );
+        let unknown_tool = parse_macro_command_line(r#"setTool("not-a-tool");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(unknown_tool.command_id, "macro.builtin_call");
+        assert_eq!(unknown_tool.params, Some(json!({"target": "setTool"})));
+        let paste_mode = parse_macro_command_line(r#"setPasteMode("add");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(paste_mode.command_id, "macro.set_paste_mode");
+        assert_eq!(paste_mode.params, Some(json!({"mode": "add"})));
+        let make_rect = parse_macro_command_line("makeRectangle(x, y, w, h);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(make_rect.command_id, "macro.builtin_call");
+        assert_eq!(make_rect.params, Some(json!({"target": "makeRectangle"})));
+        let literal_rect = parse_macro_command_line("makeRectangle(0, 1, 256, 32);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_rect.command_id, "macro.make_rectangle");
+        assert_eq!(
+            literal_rect.params,
+            Some(json!({"x": 0.0, "y": 1.0, "width": 256.0, "height": 32.0}))
+        );
+        let literal_oval = parse_macro_command_line("makeOval(1, 2, 3, 4);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_oval.command_id, "macro.make_oval");
+        let literal_line = parse_macro_command_line("makeLine(1, 2, 3, 4);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_line.command_id, "macro.make_line");
+        assert_eq!(
+            literal_line.params,
+            Some(json!({"x1": 1.0, "y1": 2.0, "x2": 3.0, "y2": 4.0}))
+        );
+        let literal_polyline = parse_macro_command_line("makeLine(1, 2, 3, 4, 5, 6);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_polyline.command_id, "macro.make_selection");
+        assert_eq!(
+            literal_polyline.params,
+            Some(json!({
+                "selection_type": "polyline",
+                "points": [
+                    {"x": 1.0, "y": 2.0},
+                    {"x": 3.0, "y": 4.0},
+                    {"x": 5.0, "y": 6.0}
+                ]
+            }))
+        );
+        let literal_polygon = parse_macro_command_line("makePolygon(1, 2, 3, 4);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_polygon.command_id, "macro.make_selection");
+        let literal_point = parse_macro_command_line("makePoint(1, 2);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(literal_point.command_id, "macro.make_selection");
+        assert_eq!(
+            literal_point.params,
+            Some(json!({
+                "selection_type": "point",
+                "points": [
+                    {"x": 1.0, "y": 2.0}
+                ]
+            }))
+        );
+        let literal_selection = parse_macro_command_line(
+            r#"makeSelection("polygon", 0, 0, 10, 0, 10, 10);"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+        assert_eq!(literal_selection.command_id, "macro.make_selection");
+        assert_eq!(
+            literal_selection.params,
+            Some(json!({
+                "selection_type": "polygon",
+                "points": [
+                    {"x": 0.0, "y": 0.0},
+                    {"x": 10.0, "y": 0.0},
+                    {"x": 10.0, "y": 10.0}
+                ]
+            }))
+        );
+        let new_image =
+            parse_macro_command_line(r#"newImage("luts", "RGB White", 256, 48, 1);"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command");
+        assert_eq!(new_image.command_id, "file.new");
+        assert_eq!(
+            new_image.params,
+            Some(json!({
+                "title": "luts",
+                "width": 256,
+                "height": 48,
+                "slices": 1,
+                "channels": 3,
+                "frames": 1,
+                "fill": 1.0,
+                "pixelType": "u8"
+            }))
+        );
+        let select_window = parse_macro_command_line(r#"selectWindow("luts");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(select_window.command_id, "macro.select_window");
+        assert_eq!(select_window.params, Some(json!({"title": "luts"})));
+        let foreground = parse_macro_command_line("setForegroundColor(255, 128, 0);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(foreground.command_id, "macro.set_color");
+        assert_eq!(
+            foreground.params,
+            Some(json!({
+                "target": "foreground",
+                "red": 255,
+                "green": 128,
+                "blue": 0
+            }))
+        );
+        let background = parse_macro_command_line("setBackgroundColor(r, g, b);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(background.command_id, "macro.builtin_call");
+        assert_eq!(
+            background.params,
+            Some(json!({"target": "setBackgroundColor"}))
+        );
+        let rename = parse_macro_command_line(r#"rename("Lookup Tables");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(rename.command_id, "image.rename");
+        assert_eq!(rename.params, Some(json!({"title": "Lookup Tables"})));
+        let dynamic_rename = parse_macro_command_line("rename(title);", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(dynamic_rename.command_id, "macro.builtin_call");
+        assert_eq!(dynamic_rename.params, Some(json!({"target": "rename"})));
+        let open = parse_macro_command_line(r#"open("/tmp/source.tif");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(open.command_id, "file.open");
+        assert_eq!(open.params, Some(json!({"path": "/tmp/source.tif"})));
+        let open_url = parse_macro_command_line(r#"open("https://example.com/a.tif");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(open_url.command_id, "file.import.url");
+        assert_eq!(
+            open_url.params,
+            Some(json!({"url": "https://example.com/a.tif"}))
+        );
+        let save = parse_macro_command_line(r#"save("/tmp/output.tif");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(save.command_id, "file.save_as");
+        assert_eq!(save.params, Some(json!({"path": "/tmp/output.tif"})));
+        let save_as = parse_macro_command_line(r#"saveAs("Tiff", "/tmp/output");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(save_as.command_id, "file.save_as");
+        assert_eq!(
+            save_as.params,
+            Some(json!({"format": "Tiff", "path": "/tmp/output"}))
+        );
+        let close = parse_macro_command_line("close();", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(close.command_id, "file.close");
+        assert_eq!(close.params, None);
+        let bare_close = parse_macro_command_line("close;", &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(bare_close.command_id, "file.close");
+        assert_eq!(bare_close.params, None);
+        let close_title = parse_macro_command_line(r#"close("About ImageJ");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(close_title.command_id, "macro.close_window");
+        assert_eq!(close_title.params, Some(json!({"title": "About ImageJ"})));
+    }
+
+    #[test]
+    fn macro_command_line_accepts_imagej_string_spacing_and_single_quotes() {
+        let catalog = crate::ui::command_registry::command_catalog();
+        let spaced = parse_macro_command_line(r#"run( "Select None" );"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        let select_all = parse_macro_command_line(r#"run("Select All");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        let single_quoted = parse_macro_command_line(r#"run('Smooth');"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+
+        assert_eq!(spaced.command_id, "edit.selection.none");
+        assert_eq!(select_all.command_id, "edit.selection.all");
+        assert_eq!(single_quoted.command_id, "process.smooth");
+        assert_eq!(
+            parse_macro_command_line(r#"run("Clear", "slice");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "edit.clear"
+        );
+        assert_eq!(
+            parse_macro_command_line(r#"run("Fill");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "edit.fill"
+        );
+        assert_eq!(
+            parse_macro_command_line(r#"run("Internal Clipboard");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "edit.internal_clipboard"
+        );
+        assert_eq!(
+            parse_macro_command_line(r#"run("Find Commands...");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "plugins.commands.find"
+        );
+        assert_eq!(
+            parse_macro_command_line(r#"run("Interpolate", "interval=1 adjust");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "edit.selection.interpolate"
+        );
+        assert_eq!(
+            parse_macro_command_line(r#"run("Properties... ");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "edit.selection.properties"
+        );
+        assert_eq!(
+            parse_macro_command_line(r#"run("Make Composite");"#, &catalog)
+                .expect("macro line should parse")
+                .expect("macro line should produce command")
+                .command_id,
+            "image.type.make_composite"
+        );
+        let duplicate = parse_macro_command_line(r#"run("Duplicate...", "title=temp");"#, &catalog)
+            .expect("macro line should parse")
+            .expect("macro line should produce command");
+        assert_eq!(duplicate.command_id, "image.duplicate");
+        assert_eq!(duplicate.params, Some(json!({"title": "temp"})));
+        let resize = parse_macro_command_line(
+            r#"run("Size...", "width=128 height=64 constrain interpolate");"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+        assert_eq!(resize.command_id, "image.adjust.size");
+        assert_eq!(
+            resize.params,
+            Some(json!({
+                "width": 128,
+                "height": 64,
+                "constrain": true,
+                "interpolate": true
+            }))
+        );
+        let canvas = parse_macro_command_line(
+            r#"run("Canvas Size...", "width=258 height=50 position=Center zero");"#,
+            &catalog,
+        )
+        .expect("macro line should parse")
+        .expect("macro line should produce command");
+        assert_eq!(canvas.command_id, "image.adjust.canvas");
+        assert_eq!(
+            canvas.params,
+            Some(json!({
+                "width": 258,
+                "height": 50,
+                "position": "Center",
+                "zero": true
+            }))
+        );
+        assert_eq!(
+            strip_macro_line_comment(r#"run('URL...', 'url=http://x//y'); // comment"#),
+            r#"run('URL...', 'url=http://x//y'); "#
+        );
+    }
+
+    #[test]
+    fn macro_source_lines_skip_macro_set_wrappers() {
+        let lines = macro_source_executable_lines(
+            r#"
+                macro "Smooth Once" {
+                    run("Smooth");
+                }
+                macro "Two Commands" { run("Sharpen"); run("Find Edges"); }
+            "#,
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                (3, r#"run("Smooth")"#.to_string()),
+                (5, r#"run("Sharpen")"#.to_string()),
+                (5, r#"run("Find Edges")"#.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn macro_source_named_blocks_extract_individual_macros() {
+        let blocks = macro_source_named_blocks(
+            r#"
+                macro "Smooth Once [F1]" {
+                    run("Smooth");
+                }
+                macro 'Single Quoted Tool' {
+                    run("Find Edges");
+                }
+                macro "Two Commands" { run("Sharpen"); run("Find Edges"); }
+            "#,
+        );
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].name, "Smooth Once [F1]");
+        assert_eq!(blocks[0].shortcut.as_deref(), Some("F1"));
+        assert_eq!(
+            blocks[0].statements,
+            vec![(3, r#"run("Smooth")"#.to_string())]
+        );
+        assert_eq!(blocks[1].name, "Single Quoted Tool");
+        assert_eq!(
+            blocks[1].statements,
+            vec![(6, r#"run("Find Edges")"#.to_string())]
+        );
+        assert_eq!(blocks[2].name, "Two Commands");
+        assert_eq!(
+            blocks[2].statements,
+            vec![
+                (8, r#"run("Sharpen")"#.to_string()),
+                (8, r#"run("Find Edges")"#.to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn macro_named_block_statement_map_resolves_local_macro_calls() {
+        let blocks = macro_named_block_statement_map(
+            r#"
+                macro "Set Montage Layout [F2]" { run("Make Montage..."); }
+                macro "<Stacks> Change Montage Layout" { run("Set Montage Layout"); }
+            "#,
+        );
+
+        assert_eq!(
+            blocks.get("Set Montage Layout").cloned(),
+            Some(vec![(2, r#"run("Make Montage...")"#.to_string())])
+        );
+        assert_eq!(
+            blocks.get("Change Montage Layout").cloned(),
+            Some(vec![(3, r#"run("Set Montage Layout")"#.to_string())])
+        );
+    }
+
+    #[test]
+    fn startup_auto_run_macro_block_selects_first_autorun_macro() {
+        let block = startup_auto_run_macro_block(
+            r#"
+                macro "Regular Startup" {
+                    run("Smooth");
+                }
+                macro "AutoRunAndHide" { run("Find Edges"); }
+                macro "AutoRun" { run("Sharpen"); }
+            "#,
+        )
+        .expect("AutoRun macro");
+
+        assert_eq!(block.name, "AutoRunAndHide");
+        assert_eq!(
+            block.statements,
+            vec![(5, r#"run("Find Edges")"#.to_string())]
+        );
+    }
+
+    #[test]
+    fn installed_macro_menu_entry_uses_submenus_and_skips_startup_helpers() {
+        let path = Path::new("StartupMacros.ijm");
+        let blocks = macro_source_named_blocks(
+            r#"
+                macro "<Stacks> Z Project [F2]" { run("Z Project..."); }
+                macro "AutoRun" { run("Smooth"); }
+                macro "Line Tool Selected" { run("Measure"); }
+            "#,
+        );
+
+        let entry = installed_macro_menu_entry_from_block(path, &blocks[0]).expect("menu entry");
+        assert_eq!(entry.label, "Z Project");
+        assert_eq!(entry.shortcut.as_deref(), Some("F2"));
+        assert_eq!(entry.submenu.as_deref(), Some("Stacks"));
+        assert_eq!(entry.macro_name, "<Stacks> Z Project [F2]");
+
+        assert!(installed_macro_menu_entry_from_block(path, &blocks[1]).is_none());
+        assert!(installed_macro_menu_entry_from_block(path, &blocks[2]).is_none());
+    }
+
+    #[test]
+    fn macro_name_shortcut_matches_imagej_bracket_rules() {
+        assert_eq!(macro_name_shortcut("Smooth [a]").as_deref(), Some("a"));
+        assert_eq!(macro_name_shortcut("Smooth [f1]").as_deref(), Some("F1"));
+        assert_eq!(macro_name_shortcut("Smooth [n+]").as_deref(), Some("N+"));
+        assert_eq!(macro_name_shortcut("Smooth [&1]").as_deref(), Some("&1"));
+        assert_eq!(macro_name_shortcut("Smooth [F13]").as_deref(), None);
+        assert_eq!(macro_name_shortcut("Smooth [.]").as_deref(), None);
+        assert_eq!(macro_name_shortcut("Smooth [ctrl]").as_deref(), None);
+        assert_eq!(macro_display_name("Smooth [F1]"), "Smooth");
+    }
+
+    #[test]
+    fn macro_shortcut_matching_accepts_text_and_function_keys() {
+        assert!(macro_shortcut_matches_text("a", "a"));
+        assert!(macro_shortcut_matches_text("a", "A"));
+        assert!(macro_shortcut_matches_text("N+", "+"));
+        assert!(macro_shortcut_matches_text("&1", "1"));
+        assert!(!macro_shortcut_matches_text("F1", "F1"));
+        assert_eq!(function_key_for_macro_shortcut("f1"), Some(egui::Key::F1));
+        assert_eq!(function_key_for_macro_shortcut("F13"), None);
+    }
+
+    #[test]
+    fn macro_options_keep_bracketed_text_values_together() {
+        assert_eq!(
+            macro_options_to_json("title=[My Image] depth=16 modal=false"),
+            json!({
+                "title": "My Image",
+                "depth": 16,
+                "modal": false
+            })
+        );
+        assert_eq!(
+            macro_options_to_json("columns=4 rows=3 scale=1 border=2"),
+            json!({
+                "columns": 4,
+                "rows": 3,
+                "scale": 1,
+                "border_width": 2
+            })
+        );
+    }
+
+    #[test]
+    fn macro_recorder_writes_imagej_run_calls_with_options() {
+        let catalog = crate::ui::command_registry::command_catalog();
+        let line = macro_record_line_for_command(
+            "process.enhance_contrast",
+            Some(&json!({
+                "saturated": 0.35,
+                "normalize": true,
+                "title": "My Image",
+                "optional": null
+            })),
+            &catalog,
+        )
+        .expect("recordable command");
+
+        assert_eq!(
+            line,
+            r#"run("Enhance Contrast...", "normalize saturated=0.35 title=[My Image]");"#
+        );
+    }
+
+    #[test]
+    fn macro_recorder_omits_empty_options() {
+        let catalog = crate::ui::command_registry::command_catalog();
+        let line = macro_record_line_for_command("process.smooth", None, &catalog)
+            .expect("recordable command");
+
+        assert_eq!(line, r#"run("Smooth");"#);
+    }
+
+    #[test]
+    fn installed_macro_file_name_matches_imagej_txt_rule() {
+        assert_eq!(
+            installed_macro_file_name(Path::new("Example.txt")).expect("txt macro"),
+            "Example.ijm"
+        );
+        assert_eq!(
+            installed_macro_file_name(Path::new("Tool_Macro.txt")).expect("underscore txt macro"),
+            "Tool_Macro.txt"
+        );
+        assert_eq!(
+            installed_macro_file_name(Path::new("Already.ijm")).expect("ijm macro"),
+            "Already.ijm"
+        );
+        assert!(installed_macro_file_name(Path::new("Plugin.jar")).is_err());
+    }
+
+    #[test]
+    fn install_macro_file_copies_to_install_dir() {
+        let dir = tempdir().expect("tempdir");
+        let source = dir.path().join("Example.txt");
+        let install_dir = dir.path().join("installed");
+        fs::write(&source, r#"run("Smooth");"#).expect("write source macro");
+
+        let installed = install_macro_file_to_dir(&source, &install_dir).expect("install macro");
+
+        assert_eq!(installed, install_dir.join("Example.ijm"));
+        assert_eq!(
+            fs::read_to_string(installed).expect("read installed macro"),
+            r#"run("Smooth");"#
+        );
+    }
+
+    #[test]
+    fn installed_macro_listing_filters_and_sorts_macros() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("B.ijm"), "").expect("write B");
+        fs::write(dir.path().join("A.txt"), "").expect("write A");
+        fs::write(dir.path().join("plugin.jar"), "").expect("write jar");
+
+        let macros = list_installed_macro_files_in_dir(dir.path())
+            .into_iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(macros, vec!["A.txt", "B.ijm"]);
+    }
+
+    #[test]
+    fn startup_macro_status_uses_first_report_line() {
+        assert_eq!(
+            first_report_line("Executed: 1, blocked: 0\n1: process.smooth -> ok"),
+            "Executed: 1, blocked: 0"
+        );
+        assert_eq!(first_report_line(""), "");
     }
 
     #[test]

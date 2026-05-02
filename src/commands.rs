@@ -56,14 +56,15 @@ pub use thunderstorm::{
 pub use transform::{
     ImageBinOp, ImageCalibrateOp, ImageCanvasResizeOp, ImageConvertOp, ImageConvolveOp,
     ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp, ImageFindEdgesOp,
-    ImageFindMaximaOp, ImageFlipOp, ImageHyperstackReduceDimensionalityOp,
-    ImageHyperstackSubsetOp, ImageHyperstackToStackOp, ImageMedianFilterOp, ImageRankFilter3dOp,
-    ImageRankFilterOp, ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op,
-    ImageRotateOp, ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp,
-    ImageSharpenOp, ImageStackAddSliceOp, ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp,
+    ImageFindMaximaOp, ImageFlipOp, ImageHyperstackReduceDimensionalityOp, ImageHyperstackSubsetOp,
+    ImageHyperstackToStackOp, ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp,
+    ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp,
+    ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp,
+    ImageStackAddSliceOp, ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp,
     ImageStackMontageOp, ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp,
-    ImageStackSubstackOp, ImageStackToHyperstackOp, ImageStackZProjectOp, ImageSubtractBackgroundOp,
-    ImageSurfacePlotOp, ImageSwapQuadrantsOp, ImageTranslateOp, ImageUnsharpMaskOp,
+    ImageStackSubstackOp, ImageStackToHyperstackOp, ImageStackZProjectOp,
+    ImageSubtractBackgroundOp, ImageSurfacePlotOp, ImageSwapQuadrantsOp, ImageTranslateOp,
+    ImageUnsharpMaskOp,
 };
 
 pub(crate) use axes::spatial_axes;
