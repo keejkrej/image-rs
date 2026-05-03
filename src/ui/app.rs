@@ -3557,7 +3557,7 @@ impl ImageUiApp {
             .current_viewer_label(window_label)
             .unwrap_or(window_label)
             .to_string();
-        let low = params
+        let mut low = params
             .get(low_key)
             .and_then(Value::as_f64)
             .map(|value| value as f32)
@@ -3568,7 +3568,7 @@ impl ImageUiApp {
                     .map(|session| session.committed_summary.min)
                     .unwrap_or(0.0)
             });
-        let high = params
+        let mut high = params
             .get(high_key)
             .and_then(Value::as_f64)
             .map(|value| value as f32)
@@ -3579,6 +3579,14 @@ impl ImageUiApp {
                     .map(|session| session.committed_summary.max)
                     .unwrap_or(1.0)
             });
+
+        if let Some((range_low, range_high)) = unsigned_16bit_display_range_for_params(
+            self.state.label_to_session.get(&target),
+            params,
+        ) {
+            low = range_low;
+            high = range_high;
+        }
 
         if !low.is_finite() || !high.is_finite() || high <= low {
             return Err(format!(
@@ -12970,6 +12978,31 @@ fn selected_roi_can_spline_fit(viewer: &ViewerUiState) -> bool {
     )
 }
 
+fn unsigned_16bit_display_range_for_params(
+    session: Option<&ViewerSession>,
+    params: &Value,
+) -> Option<(f32, f32)> {
+    let session = session?;
+    let dataset = session.committed_source.to_dataset().ok()?;
+    if dataset.metadata.pixel_type != PixelType::U16 {
+        return None;
+    }
+    let range = params
+        .get("unsigned_16bit_range")
+        .and_then(Value::as_str)
+        .unwrap_or("Automatic");
+    let bits = match range {
+        "8-bit (0-255)" => 8_u32,
+        "10-bit (0-1023)" => 10,
+        "12-bit (0-4095)" => 12,
+        "14-bit (0-16383)" => 14,
+        "15-bit (0-32767)" => 15,
+        "16-bit (0-65535)" => 16,
+        _ => return None,
+    };
+    Some((0.0, ((1_u32 << bits) - 1) as f32))
+}
+
 fn selected_roi_spline_fit(viewer: &ViewerUiState) -> bool {
     match selected_roi_model(viewer).map(|roi| &roi.kind) {
         Some(RoiKind::Polygon { spline_fit, .. }) => *spline_fit,
@@ -19174,6 +19207,41 @@ mod tests {
         assert_eq!(
             app.state.label_to_session[&second].display_range,
             Some((0.5, 2.5))
+        );
+    }
+
+    #[test]
+    fn adjust_set_display_range_applies_imagej_unsigned_16bit_range_choice() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/u16-display-range.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U16,
+                )),
+            ),
+        );
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.brightness",
+            Some(json!({
+                "min": 100.0,
+                "max": 200.0,
+                "unsigned_16bit_range": "12-bit (0-4095)"
+            })),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(
+            app.state.label_to_session[&label].display_range,
+            Some((0.0, 4095.0))
         );
     }
 
