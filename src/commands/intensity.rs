@@ -30,7 +30,9 @@ impl Operation for IntensityNormalizeOp {
     fn schema(&self) -> OpSchema {
         OpSchema {
             name: self.name().to_string(),
-            description: "Normalize values into [0, 1] using optional min/max.".to_string(),
+            description:
+                "Normalize values into the dataset pixel type range using optional min/max."
+                    .to_string(),
             params: vec![
                 ParamSpec {
                     name: "min".to_string(),
@@ -67,9 +69,10 @@ impl Operation for IntensityNormalizeOp {
         } else {
             max - min
         };
+        let output_max = pixel_type_max(dataset.metadata.pixel_type);
         let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
         values.par_iter_mut().for_each(|value| {
-            *value = ((*value - min) / scale).clamp(0.0, 1.0);
+            *value = scale_unit_to_pixel_type(((*value - min) / scale).clamp(0.0, 1.0), output_max);
         });
         let normalized = Array::from_shape_vec(IxDyn(dataset.shape()), values)
             .expect("shape is unchanged and valid");
@@ -98,7 +101,7 @@ impl Operation for IntensityEnhanceContrastOp {
                 ParamSpec {
                     name: "normalize".to_string(),
                     description:
-                        "When true, remap pixels into [0, 1]; otherwise record display bounds."
+                        "When true, remap pixels into the dataset pixel type range; otherwise record display bounds."
                             .to_string(),
                     required: false,
                     kind: "bool".to_string(),
@@ -135,10 +138,12 @@ impl Operation for IntensityEnhanceContrastOp {
         }
 
         let scale = high - low;
+        let output_max = pixel_type_max(dataset.metadata.pixel_type);
         let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
         values.par_iter_mut().for_each(|value| {
             if value.is_finite() {
-                *value = ((*value - low) / scale).clamp(0.0, 1.0);
+                *value =
+                    scale_unit_to_pixel_type(((*value - low) / scale).clamp(0.0, 1.0), output_max);
             }
         });
         let output =
@@ -178,7 +183,8 @@ impl Operation for IntensityInvertOp {
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
         let (min, max) = match dataset.metadata.pixel_type {
-            PixelType::U8 | PixelType::U16 => (0.0, 1.0),
+            PixelType::U8 => (0.0, 255.0),
+            PixelType::U16 => (0.0, 65_535.0),
             PixelType::F32 => {
                 let (source_min, source_max) = dataset.min_max().unwrap_or((0.0, 1.0));
                 (
@@ -511,10 +517,9 @@ fn execute_bitwise_math(
     };
     let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
     values.par_iter_mut().for_each(|pixel| {
-        let sample = (*pixel).clamp(0.0, 1.0) * max_sample as f32;
-        let sample = sample.round() as u32;
+        let sample = (*pixel).clamp(0.0, max_sample as f32).round() as u32;
         let result = operation.apply_bitwise(sample, mask).min(max_sample);
-        *pixel = result as f32 / max_sample as f32;
+        *pixel = result as f32;
     });
     let output = Array::from_shape_vec(IxDyn(dataset.shape()), values)
         .expect("shape is unchanged and valid");
@@ -535,7 +540,8 @@ impl Operation for IntensityWindowOp {
     fn schema(&self) -> OpSchema {
         OpSchema {
             name: self.name().to_string(),
-            description: "Apply a [low, high] window and clamp to [0, 1].".to_string(),
+            description: "Apply a [low, high] window and clamp to the dataset pixel type range."
+                .to_string(),
             params: vec![
                 ParamSpec {
                     name: "low".to_string(),
@@ -561,13 +567,34 @@ impl Operation for IntensityWindowOp {
                 "`high` must be greater than `low`".to_string(),
             ));
         }
+        let output_max = pixel_type_max(dataset.metadata.pixel_type);
         let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
         values.par_iter_mut().for_each(|value| {
-            *value = ((*value - low) / (high - low)).clamp(0.0, 1.0);
+            *value = scale_unit_to_pixel_type(
+                ((*value - low) / (high - low)).clamp(0.0, 1.0),
+                output_max,
+            );
         });
         let windowed = Array::from_shape_vec(IxDyn(dataset.shape()), values)
             .expect("shape is unchanged and valid");
         let output_dataset = Dataset::new(windowed, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
+    }
+}
+
+fn pixel_type_max(pixel_type: PixelType) -> f32 {
+    match pixel_type {
+        PixelType::U8 => 255.0,
+        PixelType::U16 => 65_535.0,
+        PixelType::F32 => 1.0,
+    }
+}
+
+fn scale_unit_to_pixel_type(value: f32, output_max: f32) -> f32 {
+    let scaled = value * output_max;
+    if output_max > 1.0 {
+        scaled.round()
+    } else {
+        scaled
     }
 }

@@ -591,13 +591,21 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Open the ImageJ-style color picker dialog."),
         ),
-        "image.adjust.brightness" | "image.adjust.threshold" => CommandMetadata::with(
+        "image.adjust.brightness" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            true,
+            true,
+            None,
+            Some("Adjust the active viewer display range without changing image pixels."),
+        ),
+        "image.adjust.threshold" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             false,
             true,
             None,
-            Some("Applies automatic normalization or thresholding to the active image."),
+            Some("Apply thresholding to the active image."),
         ),
         "image.adjust.color_balance" | "image.adjust.color_threshold" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -610,10 +618,10 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
         "image.adjust.window_level" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
-            false,
             true,
-            Some(json!({"low": 0.0, "high": 1.0})),
-            Some("Apply an ImageJ-style window/level clamp to the active image."),
+            true,
+            None,
+            Some("Adjust the active viewer window/level without changing image pixels."),
         ),
         "image.adjust.size" | "image.adjust.canvas" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -1113,7 +1121,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             false,
             true,
-            Some(json!({"operation": "add", "value": 25.0 / 255.0})),
+            Some(json!({"operation": "add", "value": 25.0})),
             Some("Run ImageJ-style per-pixel math on the active image."),
         ),
         "process.math.subtract" => CommandMetadata::with(
@@ -1121,7 +1129,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             false,
             true,
-            Some(json!({"operation": "subtract", "value": 25.0 / 255.0})),
+            Some(json!({"operation": "subtract", "value": 25.0})),
             Some("Run ImageJ-style per-pixel math on the active image."),
         ),
         "process.math.multiply" => CommandMetadata::with(
@@ -1177,7 +1185,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             false,
             true,
-            Some(json!({"operation": "max", "value": 1.0})),
+            Some(json!({"operation": "max", "value": 255.0})),
             Some("Run ImageJ-style per-pixel math on the active image."),
         ),
         "process.math.gamma" => CommandMetadata::with(
@@ -1193,7 +1201,7 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             false,
             true,
-            Some(json!({"operation": "set", "value": 25.0 / 255.0})),
+            Some(json!({"operation": "set", "value": 25.0})),
             Some("Run ImageJ-style per-pixel math on the active image."),
         ),
         "process.math.nan_background" => CommandMetadata::with(
@@ -2321,6 +2329,14 @@ mod tests {
                 "light_background": false,
                 "dont_subtract": false
             })
+        );
+        assert_eq!(
+            merge_params("process.math.add", None),
+            json!({"operation": "add", "value": 25.0})
+        );
+        assert_eq!(
+            merge_params("process.math.max", None),
+            json!({"operation": "max", "value": 255.0})
         );
         assert_eq!(
             merge_params("process.math.sqrt", Some(json!({ "operation": "log" }))),

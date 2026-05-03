@@ -124,12 +124,12 @@ fn add_integer_gaussian_noise(
         .data
         .iter()
         .map(|value| {
-            let raw = (value.clamp(0.0, 1.0) * sample_max as f32).round() as i32;
+            let raw = value.clamp(0.0, sample_max as f32).round() as i32;
             if sigma == 0.0 {
-                return raw as f32 / sample_max as f32;
+                return raw as f32;
             }
             let noisy = redraw_integer_noise(raw, sigma, sample_max, rng);
-            noisy as f32 / sample_max as f32
+            noisy as f32
         })
         .collect()
 }
@@ -179,7 +179,7 @@ fn salt_and_pepper(dataset: &DatasetF32, percent: f32, seed: u64) -> Result<Data
                 x_axis,
                 y_axis,
                 &mut rng,
-                1.0,
+                255.0,
             );
             set_random_xy(
                 &mut output,

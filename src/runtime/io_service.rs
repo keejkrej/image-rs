@@ -58,7 +58,7 @@ impl IoService {
                 .iter()
                 .copied()
                 .take(voxel_count)
-                .map(|value| f32::from(value) / 255.0)
+                .map(f32::from)
                 .collect::<Vec<_>>(),
             PixelType::U16 => bytes
                 .chunks_exact(2)
@@ -69,7 +69,7 @@ impl IoService {
                     } else {
                         u16::from_be_bytes([chunk[0], chunk[1]])
                     };
-                    f32::from(raw) / 65_535.0
+                    f32::from(raw)
                 })
                 .collect::<Vec<_>>(),
             PixelType::F32 => bytes
@@ -109,5 +109,36 @@ impl IoService {
             ..Metadata::default()
         };
         Ok(Dataset::new(data, metadata)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_raw_preserves_integer_sample_values() {
+        let service = IoService;
+        let u8_dataset = service
+            .read_raw(&[0, 10, 128, 255], 2, 2, 1, 1, PixelType::U8, true, 0)
+            .expect("u8 raw");
+        assert_eq!(u8_dataset.metadata.pixel_type, PixelType::U8);
+        assert_eq!(
+            u8_dataset.data.iter().copied().collect::<Vec<_>>(),
+            vec![0.0, 10.0, 128.0, 255.0]
+        );
+
+        let mut bytes = Vec::new();
+        for value in [0_u16, 10, 4096, 65_535] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let u16_dataset = service
+            .read_raw(&bytes, 2, 2, 1, 1, PixelType::U16, true, 0)
+            .expect("u16 raw");
+        assert_eq!(u16_dataset.metadata.pixel_type, PixelType::U16);
+        assert_eq!(
+            u16_dataset.data.iter().copied().collect::<Vec<_>>(),
+            vec![0.0, 10.0, 4096.0, 65_535.0]
+        );
     }
 }

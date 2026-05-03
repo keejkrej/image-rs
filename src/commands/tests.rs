@@ -102,13 +102,35 @@ fn contains_required_operations() {
 }
 
 #[test]
-fn intensity_invert_uses_integer_normalized_range() {
-    let mut dataset = test_dataset(vec![0.0, 0.25, 0.75, 1.0], (2, 2));
+fn intensity_invert_uses_integer_pixel_type_range() {
+    let mut dataset = test_dataset(vec![0.0, 64.0, 128.0, 255.0], (2, 2));
     dataset.metadata.pixel_type = PixelType::U8;
 
     let output = execute_operation("intensity.invert", &dataset, &json!({})).expect("invert");
     let values = output.dataset.data.iter().copied().collect::<Vec<_>>();
-    assert_eq!(values, vec![1.0, 0.75, 0.25, 0.0]);
+    assert_eq!(values, vec![255.0, 191.0, 127.0, 0.0]);
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+}
+
+#[test]
+fn intensity_normalize_uses_integer_pixel_type_range() {
+    let mut dataset = test_dataset(vec![0.0, 5.0, 10.0, 20.0], (2, 2));
+    dataset.metadata.pixel_type = PixelType::U8;
+
+    let output = execute_operation(
+        "intensity.normalize",
+        &dataset,
+        &json!({
+            "min": 0.0,
+            "max": 10.0
+        }),
+    )
+    .expect("normalize");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 128.0, 255.0, 255.0]
+    );
     assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
 }
 
@@ -156,6 +178,28 @@ fn intensity_enhance_contrast_clips_saturated_tails_and_normalizes() {
     assert!((values[1] - 0.0).abs() < 1.0e-6);
     assert!((values[6] - 1.0).abs() < 1.0e-6);
     assert!((values[3] - 0.4).abs() < 1.0e-6);
+}
+
+#[test]
+fn intensity_enhance_contrast_uses_integer_pixel_type_range() {
+    let mut dataset = test_dataset(vec![0.0, 5.0, 10.0, 20.0], (2, 2));
+    dataset.metadata.pixel_type = PixelType::U8;
+
+    let output = execute_operation(
+        "intensity.enhance_contrast",
+        &dataset,
+        &json!({
+            "saturated_percent": 0.0,
+            "normalize": true
+        }),
+    )
+    .expect("enhance contrast");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 64.0, 128.0, 255.0]
+    );
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
 }
 
 #[test]
@@ -242,10 +286,10 @@ fn intensity_math_applies_unary_operations() {
 fn intensity_math_applies_bitwise_operations_to_integer_pixels() {
     let mut dataset = test_dataset(
         vec![
-            0b1111_0000 as f32 / 255.0,
-            0b0000_1111 as f32 / 255.0,
-            0b1010_1010 as f32 / 255.0,
-            0b0101_0101 as f32 / 255.0,
+            0b1111_0000 as f32,
+            0b0000_1111 as f32,
+            0b1010_1010 as f32,
+            0b0101_0101 as f32,
         ],
         (2, 2),
     );
@@ -264,7 +308,7 @@ fn intensity_math_applies_bitwise_operations_to_integer_pixels() {
         .dataset
         .data
         .iter()
-        .map(|value| (value * 255.0).round() as u8)
+        .map(|value| value.round() as u8)
         .collect::<Vec<_>>();
     assert_eq!(samples, vec![0b1111_0000, 0, 0b1010_0000, 0b0101_0000]);
 
@@ -281,7 +325,7 @@ fn intensity_math_applies_bitwise_operations_to_integer_pixels() {
         .dataset
         .data
         .iter()
-        .map(|value| (value * 255.0).round() as u8)
+        .map(|value| value.round() as u8)
         .collect::<Vec<_>>();
     assert_eq!(
         samples,
@@ -748,6 +792,40 @@ fn image_convert_rgb_adds_channel_axis() {
     let output =
         execute_operation("image.convert", &dataset, &json!({"target": "rgb"})).expect("convert");
     assert_eq!(output.dataset.shape(), &[2, 2, 3]);
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            0.0, 0.0, 0.0, //
+            255.0, 255.0, 255.0, //
+            128.0, 128.0, 128.0, //
+            64.0, 64.0, 64.0,
+        ]
+    );
+}
+
+#[test]
+fn image_convert_pixel_types_use_raw_integer_ranges() {
+    let dataset = test_dataset(vec![0.0, 1.0, 0.5, 0.25], (2, 2));
+    let u8_output =
+        execute_operation("image.convert", &dataset, &json!({"target": "u8"})).expect("u8");
+    assert_eq!(u8_output.dataset.metadata.pixel_type, PixelType::U8);
+    assert_eq!(
+        u8_output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 255.0, 128.0, 64.0]
+    );
+
+    let u16_output = execute_operation(
+        "image.convert",
+        &u8_output.dataset,
+        &json!({"target": "u16"}),
+    )
+    .expect("u16");
+    assert_eq!(u16_output.dataset.metadata.pixel_type, PixelType::U16);
+    assert_eq!(
+        u16_output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 65_535.0, 32_896.0, 16_448.0]
+    );
 }
 
 #[test]
@@ -2484,7 +2562,7 @@ fn image_remove_outliers_replaces_bright_and_dark_impulses() {
     let mut bright = test_dataset(
         vec![
             0.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, //
+            0.0, 255.0, 0.0, //
             0.0, 0.0, 0.0,
         ],
         (3, 3),
@@ -2560,7 +2638,7 @@ fn image_remove_outliers_preserves_pixels_within_threshold() {
 
 #[test]
 fn salt_and_pepper_noise_is_seeded_and_u8_only() {
-    let mut dataset = test_dataset(vec![0.5; 100], (10, 10));
+    let mut dataset = test_dataset(vec![128.0; 100], (10, 10));
     dataset.metadata.pixel_type = PixelType::U8;
 
     let first = execute_operation(
@@ -2585,8 +2663,8 @@ fn salt_and_pepper_noise_is_seeded_and_u8_only() {
 
     let values = first.dataset.data.iter().copied().collect::<Vec<_>>();
     assert!(values.iter().any(|value| *value == 0.0));
-    assert!(values.iter().any(|value| *value == 1.0));
-    assert!(values.iter().any(|value| *value == 0.5));
+    assert!(values.iter().any(|value| *value == 255.0));
+    assert!(values.iter().any(|value| *value == 128.0));
 
     let f32_error = execute_operation(
         "noise.salt_and_pepper",
@@ -2599,7 +2677,7 @@ fn salt_and_pepper_noise_is_seeded_and_u8_only() {
 
 #[test]
 fn gaussian_noise_is_seeded_and_keeps_integer_samples_in_range() {
-    let mut dataset = test_dataset(vec![0.5; 100], (10, 10));
+    let mut dataset = test_dataset(vec![128.0; 100], (10, 10));
     dataset.metadata.pixel_type = PixelType::U8;
 
     let first = execute_operation(
@@ -2624,8 +2702,9 @@ fn gaussian_noise_is_seeded_and_keeps_integer_samples_in_range() {
     assert_eq!(first.dataset.data, second.dataset.data);
     assert_eq!(first.dataset.metadata.pixel_type, PixelType::U8);
     let values = first.dataset.data.iter().copied().collect::<Vec<_>>();
-    assert!(values.iter().any(|value| (*value - 0.5).abs() > 1.0e-6));
-    assert!(values.iter().all(|value| (0.0..=1.0).contains(value)));
+    assert!(values.iter().any(|value| (*value - 128.0).abs() > 1.0e-6));
+    assert!(values.iter().all(|value| (0.0..=255.0).contains(value)));
+    assert!(values.iter().all(|value| value.fract() == 0.0));
 }
 
 #[test]
@@ -2677,6 +2756,26 @@ fn find_edges_highlights_gradient() {
 }
 
 #[test]
+fn find_edges_preserves_integer_sample_range() {
+    let mut dataset = test_dataset(
+        vec![
+            0.0, 0.0, 0.0, //
+            0.0, 255.0, 255.0, //
+            0.0, 255.0, 255.0, //
+        ],
+        (3, 3),
+    );
+    dataset.metadata.pixel_type = PixelType::U8;
+
+    let output = execute_operation("image.find_edges", &dataset, &json!({})).expect("edges");
+
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+    let center = output.dataset.data[IxDyn(&[1, 1])];
+    assert!(center > 1.0);
+    assert!(center <= 255.0);
+}
+
+#[test]
 fn image_find_maxima_marks_prominent_local_peaks() {
     let dataset = test_dataset(
         vec![
@@ -2697,7 +2796,7 @@ fn image_find_maxima_marks_prominent_local_peaks() {
     .expect("find maxima");
 
     assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
-    assert_eq!(output.dataset.data[IxDyn(&[1, 1])], 1.0);
+    assert_eq!(output.dataset.data[IxDyn(&[1, 1])], 255.0);
     assert_eq!(
         output
             .dataset
@@ -2721,7 +2820,7 @@ fn image_find_maxima_supports_edges_and_light_background_minima() {
     );
     let included =
         execute_operation("image.find_maxima", &edge_peak, &json!({})).expect("include edges");
-    assert_eq!(included.dataset.data[IxDyn(&[0, 0])], 1.0);
+    assert_eq!(included.dataset.data[IxDyn(&[0, 0])], 255.0);
     let excluded = execute_operation(
         "image.find_maxima",
         &edge_peak,
@@ -2747,7 +2846,7 @@ fn image_find_maxima_supports_edges_and_light_background_minima() {
         }),
     )
     .expect("find minima");
-    assert_eq!(minima.dataset.data[IxDyn(&[1, 1])], 1.0);
+    assert_eq!(minima.dataset.data[IxDyn(&[1, 1])], 255.0);
 }
 
 #[test]
@@ -3044,6 +3143,34 @@ fn image_rank_filter_top_hat_can_return_grayscale_close() {
 }
 
 #[test]
+fn image_rank_filter_light_top_hat_uses_integer_type_max() {
+    let mut dataset = test_dataset(
+        vec![
+            255.0, 255.0, 255.0, //
+            255.0, 0.0, 255.0, //
+            255.0, 255.0, 255.0, //
+        ],
+        (3, 3),
+    );
+    dataset.metadata.pixel_type = PixelType::U8;
+
+    let output = execute_operation(
+        "image.rank_filter",
+        &dataset,
+        &json!({
+            "filter": "top_hat",
+            "radius": 1.0,
+            "light_background": true
+        }),
+    )
+    .expect("top hat");
+
+    assert_eq!(output.dataset.data[IxDyn(&[1, 1])], 0.0);
+    assert_eq!(output.dataset.data[IxDyn(&[0, 0])], 255.0);
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+}
+
+#[test]
 fn image_subtract_background_subtracts_dark_background_estimate() {
     let dataset = test_dataset(
         vec![
@@ -3313,7 +3440,7 @@ fn image_fft_power_spectrum_processes_xy_planes_independently() {
         output.dataset.data[IxDyn(&[0, 1, 0])],
         output.dataset.data[IxDyn(&[1, 0, 0])],
     ];
-    assert!(constant_plane.iter().all(|value| *value <= 1.0 / 255.0));
+    assert!(constant_plane.iter().all(|value| *value <= 1.0));
     assert!(output.dataset.data[IxDyn(&[0, 1, 1])] > output.dataset.data[IxDyn(&[0, 0, 1])]);
 }
 
@@ -4242,6 +4369,28 @@ fn window_operation_validates_bounds() {
 }
 
 #[test]
+fn window_operation_uses_integer_pixel_type_range() {
+    let mut dataset = test_dataset(vec![0.0, 5.0, 10.0, 20.0], (2, 2));
+    dataset.metadata.pixel_type = PixelType::U8;
+
+    let output = execute_operation(
+        "intensity.window",
+        &dataset,
+        &json!({
+            "low": 0.0,
+            "high": 10.0
+        }),
+    )
+    .expect("window");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 128.0, 255.0, 255.0]
+    );
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+}
+
+#[test]
 fn otsu_threshold_returns_measurement() {
     let dataset = test_dataset(vec![0.05, 0.1, 0.2, 0.8, 0.9, 0.95], (2, 3));
     let output = execute_operation("threshold.otsu", &dataset, &json!({})).expect("otsu");
@@ -4268,7 +4417,7 @@ fn make_binary_threshold_creates_imagej_style_u8_mask() {
     assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
     assert_eq!(
         output.dataset.data.iter().copied().collect::<Vec<_>>(),
-        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+        vec![0.0, 0.0, 0.0, 255.0, 255.0, 255.0]
     );
     assert_eq!(
         output.dataset.metadata.extras.get("threshold_min"),
@@ -4292,7 +4441,7 @@ fn make_binary_threshold_supports_light_background_and_explicit_range() {
     .expect("make binary light background");
     assert_eq!(
         light.dataset.data.iter().copied().collect::<Vec<_>>(),
-        vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+        vec![255.0, 255.0, 255.0, 0.0, 0.0, 0.0]
     );
 
     let ranged = execute_operation(
@@ -4303,7 +4452,7 @@ fn make_binary_threshold_supports_light_background_and_explicit_range() {
     .expect("make binary explicit range");
     assert_eq!(
         ranged.dataset.data.iter().copied().collect::<Vec<_>>(),
-        vec![0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+        vec![0.0, 255.0, 255.0, 255.0, 0.0, 0.0]
     );
 }
 
@@ -4316,7 +4465,7 @@ fn make_binary_threshold_defaults_to_imagej_isodata_polarity() {
 
     assert_eq!(
         output.dataset.data.iter().copied().collect::<Vec<_>>(),
-        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+        vec![0.0, 0.0, 0.0, 255.0, 255.0, 255.0]
     );
     let threshold = output
         .measurements

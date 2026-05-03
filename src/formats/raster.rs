@@ -105,7 +105,7 @@ impl NativeRasterImage {
             } => {
                 let values = pixels
                     .iter()
-                    .map(|pixel| f32::from(*pixel) / 255.0)
+                    .map(|pixel| f32::from(*pixel))
                     .collect::<Vec<_>>();
                 let data = Array::from_shape_vec((*height, *width), values)
                     .expect("shape checked")
@@ -120,7 +120,7 @@ impl NativeRasterImage {
             } => {
                 let values = pixels
                     .iter()
-                    .map(|pixel| f32::from(*pixel) / 65_535.0)
+                    .map(|pixel| f32::from(*pixel))
                     .collect::<Vec<_>>();
                 let data = Array::from_shape_vec((*height, *width), values)
                     .expect("shape checked")
@@ -135,7 +135,7 @@ impl NativeRasterImage {
             } => {
                 let values = pixels
                     .iter()
-                    .map(|pixel| f32::from(*pixel) / 255.0)
+                    .map(|pixel| f32::from(*pixel))
                     .collect::<Vec<_>>();
                 let data = Array::from_shape_vec((*height, *width, 3usize), values)
                     .expect("shape checked")
@@ -179,7 +179,7 @@ fn dataset_from_dynamic_image(image: DynamicImage, path: Option<&Path>) -> Resul
             let (width, height) = buffer.dimensions();
             let values = buffer
                 .pixels()
-                .map(|pixel| f32::from(pixel.0[0]) / 255.0)
+                .map(|pixel| f32::from(pixel.0[0]))
                 .collect::<Vec<_>>();
             let data = Array::from_shape_vec((height as usize, width as usize), values)
                 .expect("shape checked")
@@ -198,7 +198,7 @@ fn dataset_from_dynamic_image(image: DynamicImage, path: Option<&Path>) -> Resul
             let (width, height) = buffer.dimensions();
             let values = buffer
                 .pixels()
-                .map(|pixel| f32::from(pixel.0[0]) / 65_535.0)
+                .map(|pixel| f32::from(pixel.0[0]))
                 .collect::<Vec<_>>();
             let data = Array::from_shape_vec((height as usize, width as usize), values)
                 .expect("shape checked")
@@ -217,9 +217,9 @@ fn dataset_from_dynamic_image(image: DynamicImage, path: Option<&Path>) -> Resul
             let (width, height) = buffer.dimensions();
             let mut values = Vec::with_capacity(height as usize * width as usize * 3);
             for pixel in buffer.pixels() {
-                values.push(f32::from(pixel.0[0]) / 65_535.0);
-                values.push(f32::from(pixel.0[1]) / 65_535.0);
-                values.push(f32::from(pixel.0[2]) / 65_535.0);
+                values.push(f32::from(pixel.0[0]));
+                values.push(f32::from(pixel.0[1]));
+                values.push(f32::from(pixel.0[2]));
             }
             let data = Array::from_shape_vec((height as usize, width as usize, 3usize), values)
                 .expect("shape checked")
@@ -241,9 +241,9 @@ fn dataset_from_dynamic_image(image: DynamicImage, path: Option<&Path>) -> Resul
             let (width, height) = rgb.dimensions();
             let mut values = Vec::with_capacity(height as usize * width as usize * 3);
             for pixel in rgb.pixels() {
-                values.push(f32::from(pixel.0[0]) / 255.0);
-                values.push(f32::from(pixel.0[1]) / 255.0);
-                values.push(f32::from(pixel.0[2]) / 255.0);
+                values.push(f32::from(pixel.0[0]));
+                values.push(f32::from(pixel.0[1]));
+                values.push(f32::from(pixel.0[2]));
             }
             let data = Array::from_shape_vec((height as usize, width as usize, 3usize), values)
                 .expect("shape checked")
@@ -314,7 +314,7 @@ pub(crate) fn write_common_raster(path: &Path, dataset: &DatasetF32) -> Result<(
     if shape.len() == 2 {
         let (height, width) = (shape[0], shape[1]);
         let values = dataset.data.iter().copied().collect::<Vec<_>>();
-        let bytes = scale_to_u8(&values);
+        let bytes = samples_to_u8_for_pixel_type(&values, dataset.metadata.pixel_type);
         let image = ImageBuffer::<Luma<u8>, _>::from_vec(width as u32, height as u32, bytes)
             .ok_or_else(|| IoError::UnsupportedLayout("failed to construct gray image".into()))?;
         image.save(path)?;
@@ -330,7 +330,7 @@ pub(crate) fn write_common_raster(path: &Path, dataset: &DatasetF32) -> Result<(
                     values.push(dataset.data[IxDyn(&[y, x, 0])]);
                 }
             }
-            let bytes = scale_to_u8(&values);
+            let bytes = samples_to_u8_for_pixel_type(&values, dataset.metadata.pixel_type);
             let image = ImageBuffer::<Luma<u8>, _>::from_vec(width as u32, height as u32, bytes)
                 .ok_or_else(|| {
                     IoError::UnsupportedLayout("failed to construct gray image".into())
@@ -344,15 +344,18 @@ pub(crate) fn write_common_raster(path: &Path, dataset: &DatasetF32) -> Result<(
             let mut bytes = Vec::with_capacity(height * width * 3);
             for y in 0..height {
                 for x in 0..width {
-                    bytes.push(
-                        (dataset.data[IxDyn(&[y, x, 0])].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    );
-                    bytes.push(
-                        (dataset.data[IxDyn(&[y, x, 1])].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    );
-                    bytes.push(
-                        (dataset.data[IxDyn(&[y, x, 2])].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    );
+                    bytes.push(sample_to_u8_for_pixel_type(
+                        dataset.data[IxDyn(&[y, x, 0])],
+                        dataset.metadata.pixel_type,
+                    ));
+                    bytes.push(sample_to_u8_for_pixel_type(
+                        dataset.data[IxDyn(&[y, x, 1])],
+                        dataset.metadata.pixel_type,
+                    ));
+                    bytes.push(sample_to_u8_for_pixel_type(
+                        dataset.data[IxDyn(&[y, x, 2])],
+                        dataset.metadata.pixel_type,
+                    ));
                 }
             }
             let image = ImageBuffer::<Rgb<u8>, _>::from_vec(width as u32, height as u32, bytes)
@@ -437,6 +440,24 @@ fn blend_channel(channel: u8, alpha: f32) -> u8 {
     (f32::from(channel) * alpha + 255.0 * (1.0 - alpha)).round() as u8
 }
 
+fn samples_to_u8_for_pixel_type(values: &[f32], pixel_type: PixelType) -> Vec<u8> {
+    match pixel_type {
+        PixelType::U8 | PixelType::U16 => values
+            .iter()
+            .map(|value| sample_to_u8_for_pixel_type(*value, pixel_type))
+            .collect(),
+        PixelType::F32 => scale_to_u8(values),
+    }
+}
+
+fn sample_to_u8_for_pixel_type(value: f32, pixel_type: PixelType) -> u8 {
+    match pixel_type {
+        PixelType::U8 => value.clamp(0.0, 255.0).round() as u8,
+        PixelType::U16 => (value.clamp(0.0, 65_535.0) / 257.0).round() as u8,
+        PixelType::F32 => (value.clamp(0.0, 1.0) * 255.0).round() as u8,
+    }
+}
+
 fn min_max_u8(values: &[u8]) -> (f32, f32) {
     let Some(first) = values.first().copied() else {
         return (0.0, 0.0);
@@ -447,7 +468,7 @@ fn min_max_u8(values: &[u8]) -> (f32, f32) {
         min = min.min(value);
         max = max.max(value);
     }
-    (f32::from(min) / 255.0, f32::from(max) / 255.0)
+    (f32::from(min), f32::from(max))
 }
 
 fn min_max_u16(values: &[u16]) -> (f32, f32) {
@@ -460,5 +481,5 @@ fn min_max_u16(values: &[u16]) -> (f32, f32) {
         min = min.min(value);
         max = max.max(value);
     }
-    (f32::from(min) / 65_535.0, f32::from(max) / 65_535.0)
+    (f32::from(min), f32::from(max))
 }

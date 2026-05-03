@@ -48,6 +48,75 @@ fn png_and_jpeg_decode_channel_mapping() {
 }
 
 #[test]
+fn png_decode_preserves_integer_sample_values() {
+    let dir = tempdir().expect("tempdir");
+    let gray8_path = dir.path().join("gray8.png");
+    let gray16_path = dir.path().join("gray16.png");
+
+    ImageBuffer::<Luma<u8>, Vec<u8>>::from_vec(2, 2, vec![0, 10, 128, 255])
+        .expect("gray8")
+        .save(&gray8_path)
+        .expect("save gray8");
+    ImageBuffer::<Luma<u16>, Vec<u16>>::from_vec(2, 2, vec![0, 10, 4096, 65_535])
+        .expect("gray16")
+        .save(&gray16_path)
+        .expect("save gray16");
+
+    let gray8 = read_dataset(&gray8_path).expect("read gray8");
+    let gray16 = read_dataset(&gray16_path).expect("read gray16");
+
+    assert_eq!(gray8.metadata.pixel_type, PixelType::U8);
+    assert_eq!(
+        gray8.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 10.0, 128.0, 255.0]
+    );
+    assert_eq!(gray16.metadata.pixel_type, PixelType::U16);
+    assert_eq!(
+        gray16.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 10.0, 4096.0, 65_535.0]
+    );
+}
+
+#[test]
+fn tiff_roundtrip_preserves_integer_sample_values() {
+    let dir = tempdir().expect("tempdir");
+    let u8_path = dir.path().join("u8.tiff");
+    let u16_path = dir.path().join("u16.tiff");
+
+    let u8_dataset = Dataset::new(
+        Array::from_shape_vec((2, 2), vec![0.0, 10.0, 128.0, 255.0])
+            .expect("u8 shape")
+            .into_dyn(),
+        Metadata::from_shape(&[2, 2], PixelType::U8),
+    )
+    .expect("u8 dataset");
+    let u16_dataset = Dataset::new(
+        Array::from_shape_vec((2, 2), vec![0.0, 10.0, 4096.0, 65_535.0])
+            .expect("u16 shape")
+            .into_dyn(),
+        Metadata::from_shape(&[2, 2], PixelType::U16),
+    )
+    .expect("u16 dataset");
+
+    write_dataset(&u8_path, &u8_dataset).expect("write u8");
+    write_dataset(&u16_path, &u16_dataset).expect("write u16");
+
+    let restored_u8 = read_dataset(&u8_path).expect("read u8");
+    let restored_u16 = read_dataset(&u16_path).expect("read u16");
+
+    assert_eq!(restored_u8.metadata.pixel_type, PixelType::U8);
+    assert_eq!(
+        restored_u8.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 10.0, 128.0, 255.0]
+    );
+    assert_eq!(restored_u16.metadata.pixel_type, PixelType::U16);
+    assert_eq!(
+        restored_u16.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 10.0, 4096.0, 65_535.0]
+    );
+}
+
+#[test]
 fn read_native_image_fast_path_recognizes_common_rasters() {
     let dir = tempdir().expect("tempdir");
     let gray8_path = dir.path().join("gray8.png");

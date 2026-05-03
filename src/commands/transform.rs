@@ -2085,9 +2085,34 @@ impl Operation for ImageSurfacePlotOp {
 }
 
 fn convert_pixel_type(dataset: &DatasetF32, pixel_type: PixelType) -> Result<DatasetF32> {
+    let values = dataset
+        .data
+        .iter()
+        .copied()
+        .map(|value| convert_sample_value(value, dataset.metadata.pixel_type, pixel_type))
+        .collect::<Vec<_>>();
+    let data = ArrayD::from_shape_vec(IxDyn(dataset.shape()), values).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build converted pixel type dataset".to_string())
+    })?;
     let mut metadata = dataset.metadata.clone();
     metadata.pixel_type = pixel_type;
-    Ok(Dataset::new(dataset.data.clone(), metadata)?)
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn convert_sample_value(value: f32, source: PixelType, target: PixelType) -> f32 {
+    match target {
+        PixelType::U8 => match source {
+            PixelType::U8 => value.clamp(0.0, 255.0).round(),
+            PixelType::U16 => (value.clamp(0.0, 65_535.0) / 257.0).round(),
+            PixelType::F32 => (value.clamp(0.0, 1.0) * 255.0).round(),
+        },
+        PixelType::U16 => match source {
+            PixelType::U8 => (value.clamp(0.0, 255.0) * 257.0).round(),
+            PixelType::U16 => value.clamp(0.0, 65_535.0).round(),
+            PixelType::F32 => (value.clamp(0.0, 1.0) * 65_535.0).round(),
+        },
+        PixelType::F32 => value,
+    }
 }
 
 fn convert_to_rgb(dataset: &DatasetF32) -> Result<DatasetF32> {
@@ -2104,6 +2129,7 @@ fn convert_to_rgb(dataset: &DatasetF32) -> Result<DatasetF32> {
     dims.push(Dim::new(AxisKind::Channel, 3));
     let mut values = Vec::with_capacity(dataset.data.len() * 3);
     for value in dataset.data.iter().copied() {
+        let value = convert_sample_value(value, dataset.metadata.pixel_type, PixelType::U8);
         values.push(value);
         values.push(value);
         values.push(value);
@@ -2147,9 +2173,10 @@ fn convert_to_grayscale(dataset: &DatasetF32) -> Result<DatasetF32> {
         g_idx[channel_axis] = 1;
         let mut b_idx = coord.to_vec();
         b_idx[channel_axis] = 2;
-        output[write_at] = dataset.data[IxDyn(&r_idx)] * 0.299
+        let gray = dataset.data[IxDyn(&r_idx)] * 0.299
             + dataset.data[IxDyn(&g_idx)] * 0.587
             + dataset.data[IxDyn(&b_idx)] * 0.114;
+        output[write_at] = convert_sample_value(gray, dataset.metadata.pixel_type, PixelType::U8);
         write_at += 1;
     });
 
@@ -4134,7 +4161,7 @@ fn remove_outliers_xy(
         .iter()
         .map(|(left, right)| (right - left + 1) as usize)
         .sum::<usize>();
-    let sample_scale = outlier_sample_scale(dataset.metadata.pixel_type);
+    let sample_scale = 1.0;
     let mut window = Vec::with_capacity(kernel_points);
     let mut output = Vec::with_capacity(dataset.data.len());
 
@@ -4203,7 +4230,7 @@ fn is_dark_outlier(
     value + threshold < local_max && value + threshold < median
 }
 
-fn outlier_sample_scale(pixel_type: PixelType) -> f32 {
+fn pixel_type_max(pixel_type: PixelType) -> f32 {
     match pixel_type {
         PixelType::U8 => 255.0,
         PixelType::U16 => 65_535.0,
@@ -4584,7 +4611,7 @@ fn fft_power_spectrum_xy(dataset: &DatasetF32) -> Result<DatasetF32> {
                 coord[x_axis] = centered_x;
                 coord[y_axis] = centered_y;
                 let offset = linear_offset(&shape, &coord);
-                output[offset] = byte / 255.0;
+                output[offset] = byte;
             }
         }
     });
@@ -4792,8 +4819,11 @@ fn top_hat_xy(
         return Ok(background);
     }
 
-    let offset = if light_background && dataset.metadata.pixel_type != PixelType::F32 {
-        1.0
+    let offset = if light_background {
+        match dataset.metadata.pixel_type {
+            PixelType::U8 | PixelType::U16 => pixel_type_max(dataset.metadata.pixel_type),
+            PixelType::F32 => 0.0,
+        }
     } else {
         0.0
     };
@@ -5062,6 +5092,7 @@ fn filter_xy(dataset: &DatasetF32, kind: FilterKind) -> Result<DatasetF32> {
     let output_len = dataset.data.len();
     let mut output = vec![0.0_f32; output_len];
     let mut write_at = 0usize;
+    let max_sample = pixel_type_max(dataset.metadata.pixel_type);
 
     iterate_indices(&shape, |coord| {
         let x = coord[x_axis];
@@ -5076,7 +5107,7 @@ fn filter_xy(dataset: &DatasetF32, kind: FilterKind) -> Result<DatasetF32> {
                 let up = sample_clamped(dataset, coord, x_axis, y_axis, x as isize, y as isize - 1);
                 let down =
                     sample_clamped(dataset, coord, x_axis, y_axis, x as isize, y as isize + 1);
-                (5.0 * center - left - right - up - down).clamp(0.0, 1.0)
+                (5.0 * center - left - right - up - down).clamp(0.0, max_sample)
             }
             FilterKind::Sobel => {
                 let gx = -sample_clamped(
@@ -5162,7 +5193,7 @@ fn filter_xy(dataset: &DatasetF32, kind: FilterKind) -> Result<DatasetF32> {
                         x as isize + 1,
                         y as isize + 1,
                     );
-                (gx.mul_add(gx, gy * gy)).sqrt().clamp(0.0, 1.0)
+                (gx.mul_add(gx, gy * gy)).sqrt().clamp(0.0, max_sample)
             }
         };
         write_at += 1;
@@ -5231,7 +5262,7 @@ fn find_maxima_mask_xy(
 
         if is_maximum && (max_neighbor == f32::NEG_INFINITY || center - max_neighbor >= prominence)
         {
-            output[write_at] = 1.0;
+            output[write_at] = 255.0;
         }
         write_at += 1;
     });

@@ -132,7 +132,7 @@ impl Operation for ThresholdMakeBinaryOp {
         let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
         values.par_iter_mut().for_each(|value| {
             *value = if value.is_finite() && *value >= lower && *value <= upper {
-                1.0
+                255.0
             } else {
                 0.0
             };

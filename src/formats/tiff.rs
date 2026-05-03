@@ -91,10 +91,7 @@ fn decode_tiff_page<R: Read + Seek>(
                     "TIFF RGB/alpha pages are not yet supported".into(),
                 ));
             }
-            buffer
-                .into_iter()
-                .map(|value| f32::from(value) / 255.0)
-                .collect::<Vec<_>>()
+            buffer.into_iter().map(f32::from).collect::<Vec<_>>()
         }
         DecodingResult::U16(buffer) => {
             *pixel_type = PixelType::U16;
@@ -103,10 +100,7 @@ fn decode_tiff_page<R: Read + Seek>(
                     "TIFF RGB/alpha pages are not yet supported".into(),
                 ));
             }
-            buffer
-                .into_iter()
-                .map(|value| f32::from(value) / 65_535.0)
-                .collect::<Vec<_>>()
+            buffer.into_iter().map(f32::from).collect::<Vec<_>>()
         }
         DecodingResult::F32(buffer) => {
             *pixel_type = PixelType::F32;

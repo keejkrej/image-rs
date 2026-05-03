@@ -5,7 +5,7 @@ use super::state::{
 };
 use super::{command_registry, interaction};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,9 @@ const LAUNCHER_LABEL: &str = "main";
 const VIEWER_PREFIX: &str = "viewer-";
 const SOURCE_COMMITTED: &str = "committed";
 const SOURCE_PREVIEW_PREFIX: &str = "preview:";
+#[cfg(test)]
 const VIEWER_MIN_WINDOW_SIZE: [f32; 2] = [220.0, 160.0];
+#[cfg(test)]
 const VIEWER_WINDOW_EXTRA_SIZE: [f32; 2] = [24.0, 120.0];
 const LAUNCHER_MIN_WINDOW_SIZE: [f32; 2] = [600.0, 200.0];
 const BINARY_MAX_ITERATIONS: usize = 100;
@@ -121,6 +123,7 @@ struct ViewerSession {
     base_source: ViewerImageSource,
     committed_source: ViewerImageSource,
     committed_summary: ImageSummary,
+    display_range: Option<(f32, f32)>,
     undo_stack: Vec<Arc<DatasetF32>>,
     redo_stack: Vec<Arc<DatasetF32>>,
     active_preview: Option<String>,
@@ -138,6 +141,7 @@ impl ViewerSession {
             base_source: source.clone(),
             committed_source: source,
             committed_summary,
+            display_range: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_preview: None,
@@ -174,6 +178,12 @@ impl ViewerSession {
 
     fn set_active_preview(&mut self, key: Option<String>) {
         self.active_preview = key;
+        self.frame_cache.clear();
+    }
+
+    fn set_display_range(&mut self, range: Option<(f32, f32)>) {
+        self.display_range = range;
+        self.generation = self.generation.saturating_add(1);
         self.frame_cache.clear();
     }
 
@@ -372,6 +382,7 @@ enum OpenOutcome {
 struct SliceImage {
     width: usize,
     height: usize,
+    pixel_type: PixelType,
     values: Vec<f32>,
 }
 
@@ -717,7 +728,6 @@ struct RoiManagerState {
 }
 
 struct ViewerUiState {
-    viewport_id: egui::ViewportId,
     title: String,
     z: usize,
     t: usize,
@@ -736,7 +746,6 @@ struct ViewerUiState {
     last_request: Option<ViewerFrameRequest>,
     last_generation: u64,
     initial_magnification: f32,
-    initial_viewport_sized: bool,
     fit_requested: bool,
     pending_zoom: Option<ZoomCommand>,
     active_drag_started: Option<egui::Pos2>,
@@ -745,9 +754,8 @@ struct ViewerUiState {
 }
 
 impl ViewerUiState {
-    fn new(label: &str, title: String) -> Self {
+    fn new(_label: &str, title: String) -> Self {
         Self {
-            viewport_id: viewport_id_for_label(label),
             title,
             z: 0,
             t: 0,
@@ -766,7 +774,6 @@ impl ViewerUiState {
             last_request: None,
             last_generation: 0,
             initial_magnification: 1.0,
-            initial_viewport_sized: false,
             fit_requested: true,
             pending_zoom: None,
             active_drag_started: None,
@@ -2514,7 +2521,6 @@ struct ImageUiApp {
     toolbar_icons: HashMap<ToolbarIcon, egui::TextureHandle>,
     viewers_ui: HashMap<String, ViewerUiState>,
     viewer_telemetry: HashMap<String, ViewerTelemetry>,
-    viewport_positions: HashMap<String, egui::Pos2>,
     results_table: ResultsTableState,
     clipboard: ClipboardState,
     profile_plot: PlotProfileState,
@@ -2543,7 +2549,6 @@ struct ImageUiApp {
     worker_rx: Receiver<WorkerEvent>,
     focus_launcher: bool,
     focus_viewer_label: Option<String>,
-    show_all_windows_requested: bool,
     should_quit: bool,
 }
 
@@ -2595,7 +2600,6 @@ impl ImageUiApp {
             toolbar_icons: HashMap::new(),
             viewers_ui: HashMap::new(),
             viewer_telemetry: HashMap::new(),
-            viewport_positions: HashMap::new(),
             results_table: ResultsTableState::default(),
             clipboard: ClipboardState::default(),
             profile_plot: PlotProfileState::default(),
@@ -2624,7 +2628,6 @@ impl ImageUiApp {
             worker_rx,
             focus_launcher: false,
             focus_viewer_label: None,
-            show_all_windows_requested: false,
             should_quit: false,
         };
 
@@ -4898,31 +4901,17 @@ impl ImageUiApp {
         if labels.is_empty() {
             return Err("no viewers are open".to_string());
         }
-        for (index, label) in labels.iter().enumerate() {
-            if let Some(viewer) = self.viewers_ui.get(label) {
-                let position = match mode {
-                    LayoutMode::Tile => {
-                        let columns = (labels.len() as f32).sqrt().ceil() as usize;
-                        let row = index / columns;
-                        let col = index % columns;
-                        egui::pos2(40.0 + col as f32 * 420.0, 60.0 + row as f32 * 360.0)
-                    }
-                    LayoutMode::Cascade => {
-                        egui::pos2(40.0 + index as f32 * 32.0, 60.0 + index as f32 * 28.0)
-                    }
-                };
-                self.focus_viewer_label = Some(label.clone());
-                self.launcher_ui.fallback_text = match mode {
-                    LayoutMode::Tile => "Tiled viewer windows".to_string(),
-                    LayoutMode::Cascade => "Cascaded viewer windows".to_string(),
-                };
-                let _ = viewer.viewport_id;
-                self.viewport_positions.insert(label.clone(), position);
-            }
-        }
+        self.focus_viewer_label = self
+            .active_viewer_label
+            .clone()
+            .or_else(|| labels.first().cloned());
+        self.launcher_ui.fallback_text = match mode {
+            LayoutMode::Tile => "Tabbed viewer layout is active".to_string(),
+            LayoutMode::Cascade => "Tabbed viewer layout is active".to_string(),
+        };
         Ok(match mode {
-            LayoutMode::Tile => "viewer windows tiled".to_string(),
-            LayoutMode::Cascade => "viewer windows cascaded".to_string(),
+            LayoutMode::Tile => "image tabs remain in the main window".to_string(),
+            LayoutMode::Cascade => "image tabs remain in the main window".to_string(),
         })
     }
 
@@ -5051,9 +5040,8 @@ impl ImageUiApp {
             return Err("no viewers are open".to_string());
         }
 
-        self.show_all_windows_requested = true;
         self.focus_launcher = true;
-        Ok("all windows shown".to_string())
+        Ok("all image tabs are shown in the main window".to_string())
     }
 
     fn dispatch_command(
@@ -5062,7 +5050,19 @@ impl ImageUiApp {
         command_id: &str,
         params: Option<Value>,
     ) -> command_registry::CommandExecuteResult {
-        if let Some(result) = self.handle_local_command(window_label, command_id, params.as_ref()) {
+        let metadata = command_registry::metadata(command_id);
+        let target_label = if window_label == LAUNCHER_LABEL
+            && matches!(metadata.scope, command_registry::CommandScope::Viewer)
+        {
+            self.active_viewer_label
+                .clone()
+                .unwrap_or_else(|| window_label.to_string())
+        } else {
+            window_label.to_string()
+        };
+
+        if let Some(result) = self.handle_local_command(&target_label, command_id, params.as_ref())
+        {
             return result;
         }
 
@@ -5070,7 +5070,7 @@ impl ImageUiApp {
             command_id: command_id.to_string(),
             params,
         };
-        self.execute_command(window_label, request)
+        self.execute_command(&target_label, request)
     }
 
     fn open_adjust_dialog(
@@ -5088,6 +5088,11 @@ impl ImageUiApp {
         self.adjust_dialog.line_width = self.tool_options.line_width_px;
 
         if let Some(session) = self.state.label_to_session.get(&target) {
+            let (display_min, display_max) = session
+                .display_range
+                .unwrap_or((session.committed_summary.min, session.committed_summary.max));
+            self.adjust_dialog.min = display_min;
+            self.adjust_dialog.max = display_max;
             let width = session.committed_summary.shape.get(1).copied().unwrap_or(1) as f32;
             let height = session
                 .committed_summary
@@ -5101,6 +5106,50 @@ impl ImageUiApp {
         }
 
         command_registry::CommandExecuteResult::ok(format!("{} dialog opened", kind.title()))
+    }
+
+    fn apply_display_range(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+        low_key: &str,
+        high_key: &str,
+    ) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+
+        let low = params
+            .get(low_key)
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(session.committed_summary.min);
+        let high = params
+            .get(high_key)
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(session.committed_summary.max);
+
+        if !low.is_finite() || !high.is_finite() || high <= low {
+            return Err(format!(
+                "`{high_key}` must be a finite value greater than `{low_key}`"
+            ));
+        }
+
+        session.set_display_range(Some((low, high)));
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.last_generation = 0;
+            viewer.last_request = None;
+            viewer.status_message = format!("Display range {low:.4}..{high:.4}");
+        }
+
+        Ok(format!("display range set to {low:.4}..{high:.4}"))
     }
 
     fn remember_repeatable_command(
@@ -5939,12 +5988,17 @@ impl ImageUiApp {
             }
             "file.close" => {
                 if window_label == LAUNCHER_LABEL {
-                    command_registry::CommandExecuteResult::blocked(
-                        "the launcher window is always visible",
-                    )
+                    if let Some(label) = self.active_viewer_label.clone() {
+                        self.remove_viewer_by_label(&label);
+                        command_registry::CommandExecuteResult::ok("tab closed")
+                    } else {
+                        command_registry::CommandExecuteResult::blocked(
+                            "the launcher window is always visible",
+                        )
+                    }
                 } else {
                     self.remove_viewer_by_label(window_label);
-                    command_registry::CommandExecuteResult::ok("window closed")
+                    command_registry::CommandExecuteResult::ok("tab closed")
                 }
             }
             "file.quit" => {
@@ -6893,18 +6947,8 @@ impl ImageUiApp {
                         .open_adjust_dialog(window_label, AdjustDialogKind::BrightnessContrast);
                 }
                 let params = command_registry::merge_params(&request.command_id, request.params);
-                match self.viewer_start_op(
-                    window_label,
-                    ViewerOpRequest {
-                        op: "intensity.normalize".to_string(),
-                        params,
-                        mode: OpRunMode::Apply,
-                    },
-                ) {
-                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
-                        "brightness/contrast started",
-                        json!({ "job_id": ticket.job_id, "op": "intensity.normalize" }),
-                    ),
+                match self.apply_display_range(window_label, &params, "min", "max") {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
@@ -6947,18 +6991,8 @@ impl ImageUiApp {
                     return self.open_adjust_dialog(window_label, AdjustDialogKind::WindowLevel);
                 }
                 let params = command_registry::merge_params(&request.command_id, request.params);
-                match self.viewer_start_op(
-                    window_label,
-                    ViewerOpRequest {
-                        op: "intensity.window".to_string(),
-                        params,
-                        mode: OpRunMode::Apply,
-                    },
-                ) {
-                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
-                        "window/level started",
-                        json!({ "job_id": ticket.job_id, "op": "intensity.window" }),
-                    ),
+                match self.apply_display_range(window_label, &params, "low", "high") {
+                    Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
             }
@@ -7832,13 +7866,23 @@ impl ImageUiApp {
             return self.last_repeatable_command.is_some();
         }
         let metadata = command_registry::metadata(command_id);
-        if !metadata.implemented || !metadata.scope.contains(window_label) {
+        let effective_label = if window_label == LAUNCHER_LABEL
+            && matches!(metadata.scope, command_registry::CommandScope::Viewer)
+        {
+            match self.active_viewer_label.as_deref() {
+                Some(label) => label,
+                None => return false,
+            }
+        } else {
+            window_label
+        };
+        if !metadata.implemented || !metadata.scope.contains(effective_label) {
             return false;
         }
-        if metadata.requires_image && !self.state.label_to_session.contains_key(window_label) {
+        if metadata.requires_image && !self.state.label_to_session.contains_key(effective_label) {
             return false;
         }
-        if let Some(session) = self.state.label_to_session.get(window_label) {
+        if let Some(session) = self.state.label_to_session.get(effective_label) {
             match command_id {
                 "edit.undo" => return session.can_undo(),
                 "edit.redo" => return session.can_redo(),
@@ -8496,7 +8540,11 @@ impl ImageUiApp {
     }
 
     fn draw_launcher(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
-        self.handle_shortcuts(ctx, LAUNCHER_LABEL, actions);
+        let shortcut_label = self
+            .active_viewer_label
+            .as_deref()
+            .unwrap_or(LAUNCHER_LABEL);
+        self.handle_shortcuts(ctx, shortcut_label, actions);
         self.refresh_launcher_status();
 
         egui::TopBottomPanel::top("launcher-header").show(ctx, |ui| {
@@ -8506,8 +8554,6 @@ impl ImageUiApp {
                 self.draw_launcher_toolbar(ui, actions);
             });
         });
-
-        egui::CentralPanel::default().show(ctx, |_ui| {});
 
         egui::TopBottomPanel::bottom("launcher-status").show(ctx, |ui| {
             ui.label(&self.launcher_ui.status.text);
@@ -9117,7 +9163,7 @@ impl ImageUiApp {
                             });
                             close = true;
                         }
-                        if ui.button("Apply").clicked() {
+                        if ui.button("Set").clicked() {
                             actions.push(UiAction::Command {
                                 window_label: self.adjust_dialog.window_label.clone(),
                                 command_id: "image.adjust.brightness".to_string(),
@@ -9133,7 +9179,7 @@ impl ImageUiApp {
                 AdjustDialogKind::WindowLevel => {
                     ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Low "));
                     ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("High "));
-                    if ui.button("Apply").clicked() {
+                    if ui.button("Set").clicked() {
                         actions.push(UiAction::Command {
                             window_label: self.adjust_dialog.window_label.clone(),
                             command_id: "image.adjust.window_level".to_string(),
@@ -9950,26 +9996,57 @@ impl ImageUiApp {
         self.desktop_state.utility_windows.command_finder_open = open;
     }
 
-    fn draw_viewer_viewport(
-        &mut self,
-        ctx: &egui::Context,
-        label: &str,
-        actions: &mut Vec<UiAction>,
-    ) {
-        self.handle_shortcuts(ctx, label, actions);
+    fn draw_viewer_tabs(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        let mut labels = self.state.label_to_path.keys().cloned().collect::<Vec<_>>();
+        labels.sort_by_key(|label| viewer_sort_key(label));
 
-        if ctx.input(|i| i.viewport().close_requested()) {
-            actions.push(UiAction::CloseViewer {
-                label: label.to_string(),
+        let mut selected: Option<String> = None;
+        let mut close_requested: Option<String> = None;
+
+        egui::ScrollArea::horizontal()
+            .id_salt("viewer-tabs-scroll")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for label in &labels {
+                        let title = self
+                            .state
+                            .label_to_path
+                            .get(label)
+                            .and_then(|path| path.file_name())
+                            .and_then(|name| name.to_str())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                self.viewers_ui
+                                    .get(label)
+                                    .map(|viewer| viewer.title.clone())
+                            })
+                            .unwrap_or_else(|| label.clone());
+                        let is_active = self.active_viewer_label.as_deref() == Some(label);
+
+                        if ui.selectable_label(is_active, title).clicked() {
+                            selected = Some(label.clone());
+                        }
+                        if ui.small_button("x").on_hover_text("Close tab").clicked() {
+                            close_requested = Some(label.clone());
+                        }
+                    }
+                });
             });
-            return;
-        }
 
+        if let Some(label) = selected {
+            self.set_active_viewer(Some(label));
+        }
+        if let Some(label) = close_requested {
+            actions.push(UiAction::CloseViewer { label });
+        }
+    }
+
+    fn draw_viewer_area(&mut self, ctx: &egui::Context, label: &str, actions: &mut Vec<UiAction>) {
         self.ensure_frame_for_viewer(ctx, label);
 
         egui::TopBottomPanel::top(format!("viewer-header-{label}")).show(ctx, |ui| {
-            self.draw_menu_bar(ui, label, actions);
-            ui.add_space(4.0);
+            self.draw_viewer_tabs(ui, actions);
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 self.draw_viewer_toolbar(ui, label, actions);
             });
@@ -9979,7 +10056,6 @@ impl ImageUiApp {
             .ok()
             .map(|(_, summary)| summary);
 
-        let mut close_requested = false;
         let mut hovered_viewer = false;
         let mut telemetry: Option<ViewerTelemetry> = None;
         let selected_tool = self.tool_state.selected;
@@ -10338,10 +10414,6 @@ impl ImageUiApp {
                 ui.label(viewer.status_text(selected_tool));
             });
 
-            if ui_close_requested(ctx) {
-                close_requested = true;
-            }
-
             let active_job = self
                 .state
                 .label_to_session
@@ -10357,12 +10429,6 @@ impl ImageUiApp {
 
         if hovered_viewer {
             self.set_active_viewer(Some(label.to_string()));
-        }
-
-        if close_requested {
-            actions.push(UiAction::CloseViewer {
-                label: label.to_string(),
-            });
         }
     }
 
@@ -10419,30 +10485,16 @@ impl ImageUiApp {
     }
 
     fn maybe_focus_windows(&mut self, ctx: &egui::Context) {
-        if self.show_all_windows_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            let viewer_ids = self
-                .viewers_ui
-                .values()
-                .map(|viewer| viewer.viewport_id)
-                .collect::<Vec<_>>();
-            for viewport_id in viewer_ids {
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Minimized(false));
-            }
-            self.show_all_windows_requested = false;
-        }
-
         if self.focus_launcher {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             self.focus_launcher = false;
         }
 
         if let Some(label) = self.focus_viewer_label.take()
-            && let Some(viewer) = self.viewers_ui.get(&label)
+            && self.viewers_ui.contains_key(&label)
         {
-            ctx.send_viewport_cmd_to(viewer.viewport_id, egui::ViewportCommand::Focus);
+            self.set_active_viewer(Some(label));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 }
@@ -10454,53 +10506,27 @@ impl eframe::App for ImageUiApp {
         let mut actions = Vec::new();
         self.draw_launcher(ctx, &mut actions);
 
-        let labels = self.state.label_to_path.keys().cloned().collect::<Vec<_>>();
-        let mut existing_labels = HashSet::new();
-        for label in labels {
-            if !self.viewers_ui.contains_key(&label) {
-                continue;
-            }
-            existing_labels.insert(label.clone());
-            let viewport_id = viewport_id_for_label(&label);
-            let summary = summary_for_window(&self.state, &label)
-                .ok()
-                .map(|(_, summary)| summary);
-            let (title, initial_size) = if let Some(viewer) = self.viewers_ui.get_mut(&label) {
-                let initial_size = if !viewer.initial_viewport_sized {
-                    let size = summary.as_ref().map(|summary| {
-                        compute_initial_viewport_size(
-                            summary,
-                            ctx.input(|i| i.viewport().monitor_size),
-                        )
-                    });
-                    viewer.initial_viewport_sized = true;
-                    size
-                } else {
-                    None
-                };
-                (viewer.title.clone(), initial_size)
-            } else {
-                ("image-rs Viewer".to_string(), None)
-            };
+        let mut existing_labels = self
+            .state
+            .label_to_path
+            .keys()
+            .filter(|label| self.viewers_ui.contains_key(*label))
+            .cloned()
+            .collect::<Vec<_>>();
+        existing_labels.sort_by_key(|label| viewer_sort_key(label));
 
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_min_inner_size(VIEWER_MIN_WINDOW_SIZE)
-                .with_clamp_size_to_monitor_size(true);
-            if let Some(size) = initial_size {
-                builder = builder.with_inner_size(size);
-            }
+        if self
+            .active_viewer_label
+            .as_ref()
+            .is_none_or(|label| !self.viewers_ui.contains_key(label))
+        {
+            self.set_active_viewer(existing_labels.first().cloned());
+        }
 
-            ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-                self.draw_viewer_viewport(ctx, &label, &mut actions);
-            });
-
-            if let Some(position) = self.viewport_positions.get(&label).copied() {
-                ctx.send_viewport_cmd_to(
-                    viewport_id,
-                    egui::ViewportCommand::OuterPosition(position),
-                );
-            }
+        if let Some(label) = self.active_viewer_label.clone() {
+            self.draw_viewer_area(ctx, &label, &mut actions);
+        } else {
+            egui::CentralPanel::default().show(ctx, |_ui| {});
         }
 
         let stale_viewers = self
@@ -11002,6 +11028,7 @@ fn image_draw_rect(
     )
 }
 
+#[cfg(test)]
 fn compute_initial_viewport_size(
     summary: &ImageSummary,
     monitor_size: Option<egui::Vec2>,
@@ -11459,7 +11486,11 @@ fn compute_viewer_frame(
         return Ok(frame);
     }
 
-    let frame = Arc::new(build_frame(&source, request)?);
+    let display_range = state
+        .label_to_session
+        .get(window_label)
+        .and_then(|session| session.display_range);
+    let frame = Arc::new(build_frame(&source, request, display_range)?);
 
     if let Some(session) = state.label_to_session.get_mut(window_label) {
         let can_store = preview_override.is_some() || session.current_source_kind() == source_kind;
@@ -13365,19 +13396,25 @@ fn canonical_json(value: &Value) -> Value {
 fn build_frame(
     source: &ViewerImageSource,
     request: &ViewerFrameRequest,
+    display_range: Option<(f32, f32)>,
 ) -> Result<ViewerFrameBuffer, String> {
     match source {
-        ViewerImageSource::Native(image) => build_native_frame(image.as_ref(), request),
-        ViewerImageSource::Dataset(dataset) => build_dataset_frame(dataset.as_ref(), request),
+        ViewerImageSource::Native(image) => {
+            build_native_frame(image.as_ref(), request, display_range)
+        }
+        ViewerImageSource::Dataset(dataset) => {
+            build_dataset_frame(dataset.as_ref(), request, display_range)
+        }
     }
 }
 
 fn build_dataset_frame(
     dataset: &DatasetF32,
     request: &ViewerFrameRequest,
+    display_range: Option<(f32, f32)>,
 ) -> Result<ViewerFrameBuffer, String> {
     let slice = extract_slice(dataset, request.z, request.t, request.channel)?;
-    let pixels_u8 = to_u8_samples(&slice.values);
+    let pixels_u8 = to_u8_samples(&slice.values, dataset.metadata.pixel_type, display_range);
     let (min, max) = min_max(&slice.values);
 
     Ok(ViewerFrameBuffer {
@@ -13393,6 +13430,7 @@ fn build_dataset_frame(
 fn build_native_frame(
     image: &NativeRasterImage,
     request: &ViewerFrameRequest,
+    display_range: Option<(f32, f32)>,
 ) -> Result<ViewerFrameBuffer, String> {
     if request.z > 0 || request.t > 0 {
         return Err("native rasters expose only a single Z/T plane".to_string());
@@ -13409,11 +13447,15 @@ fn build_native_frame(
             Ok(ViewerFrameBuffer {
                 width: *width,
                 height: *height,
-                values: pixels
-                    .iter()
-                    .map(|value| f32::from(*value) / 255.0)
-                    .collect(),
-                pixels_u8: pixels.clone(),
+                values: pixels.iter().map(|value| f32::from(*value)).collect(),
+                pixels_u8: to_u8_samples(
+                    &pixels
+                        .iter()
+                        .map(|value| f32::from(*value))
+                        .collect::<Vec<_>>(),
+                    PixelType::U8,
+                    display_range,
+                ),
                 min,
                 max,
             })
@@ -13428,11 +13470,15 @@ fn build_native_frame(
             Ok(ViewerFrameBuffer {
                 width: *width,
                 height: *height,
-                values: pixels
-                    .iter()
-                    .map(|value| f32::from(*value) / 65_535.0)
-                    .collect(),
-                pixels_u8: pixels.iter().map(|value| (value / 257) as u8).collect(),
+                values: pixels.iter().map(|value| f32::from(*value)).collect(),
+                pixels_u8: to_u8_samples(
+                    &pixels
+                        .iter()
+                        .map(|value| f32::from(*value))
+                        .collect::<Vec<_>>(),
+                    PixelType::U16,
+                    display_range,
+                ),
                 min,
                 max,
             })
@@ -13453,16 +13499,17 @@ fn build_native_frame(
                 max_sample = max_sample.max(sample);
                 pixels_u8.push(sample);
             }
+            let values = pixels_u8
+                .iter()
+                .map(|value| f32::from(*value))
+                .collect::<Vec<_>>();
             Ok(ViewerFrameBuffer {
                 width: *width,
                 height: *height,
-                values: pixels_u8
-                    .iter()
-                    .map(|value| f32::from(*value) / 255.0)
-                    .collect(),
-                pixels_u8,
-                min: f32::from(min_sample) / 255.0,
-                max: f32::from(max_sample) / 255.0,
+                pixels_u8: to_u8_samples(&values, PixelType::U8, display_range),
+                values,
+                min: f32::from(min_sample),
+                max: f32::from(max_sample),
             })
         }
     }
@@ -13569,6 +13616,7 @@ fn extract_slice(
     Ok(SliceImage {
         width,
         height,
+        pixel_type: dataset.metadata.pixel_type,
         values,
     })
 }
@@ -13606,10 +13654,8 @@ fn extract_slice_from_native(
         } => Ok(SliceImage {
             width: *width,
             height: *height,
-            values: pixels
-                .iter()
-                .map(|value| f32::from(*value) / 255.0)
-                .collect(),
+            pixel_type: PixelType::U8,
+            values: pixels.iter().map(|value| f32::from(*value)).collect(),
         }),
         NativeRasterImage::Gray16 {
             width,
@@ -13619,10 +13665,8 @@ fn extract_slice_from_native(
         } => Ok(SliceImage {
             width: *width,
             height: *height,
-            values: pixels
-                .iter()
-                .map(|value| f32::from(*value) / 65_535.0)
-                .collect(),
+            pixel_type: PixelType::U16,
+            values: pixels.iter().map(|value| f32::from(*value)).collect(),
         }),
         NativeRasterImage::Rgb8 {
             width,
@@ -13634,20 +13678,44 @@ fn extract_slice_from_native(
             Ok(SliceImage {
                 width: *width,
                 height: *height,
+                pixel_type: PixelType::U8,
                 values: pixels
                     .chunks_exact(3)
-                    .map(|chunk| f32::from(chunk[selected]) / 255.0)
+                    .map(|chunk| f32::from(chunk[selected]))
                     .collect(),
             })
         }
     }
 }
 
-fn to_u8_samples(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
-        .collect()
+fn to_u8_samples(
+    values: &[f32],
+    pixel_type: PixelType,
+    display_range: Option<(f32, f32)>,
+) -> Vec<u8> {
+    if let Some((low, high)) = display_range
+        && high > low
+    {
+        return values
+            .iter()
+            .map(|value| (((*value - low) / (high - low)).clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+    }
+
+    match pixel_type {
+        PixelType::U8 => values
+            .iter()
+            .map(|value| value.clamp(0.0, 255.0).round() as u8)
+            .collect(),
+        PixelType::U16 => values
+            .iter()
+            .map(|value| (value.clamp(0.0, 65_535.0) / 257.0).round() as u8)
+            .collect(),
+        PixelType::F32 => values
+            .iter()
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect(),
+    }
 }
 
 fn min_max(values: &[f32]) -> (f32, f32) {
@@ -13755,7 +13823,7 @@ fn lookup_table_color(lut: LookupTable, gray: u8) -> egui::Color32 {
 
 fn lookup_table_slice_to_rgb(slice: &SliceImage, lut: LookupTable) -> Result<DatasetF32, String> {
     let mut values = Vec::with_capacity(slice.width * slice.height * 3);
-    for gray in to_u8_samples(&slice.values) {
+    for gray in to_u8_samples(&slice.values, slice.pixel_type, None) {
         let color = lookup_table_color(lut, gray);
         values.push(f32::from(color.r()) / 255.0);
         values.push(f32::from(color.g()) / 255.0);
@@ -13810,10 +13878,6 @@ fn initialize_view_to_open_state(
         fit_to_rect(viewer, rect, width, height);
         viewer.initial_magnification = viewer.transform.magnification;
     }
-}
-
-fn ui_close_requested(ctx: &egui::Context) -> bool {
-    ctx.input(|i| i.viewport().close_requested())
 }
 
 fn is_supported_image_path(path: &Path) -> bool {
@@ -13956,10 +14020,6 @@ fn new_image_dataset(params: &Value) -> Result<DatasetF32, String> {
     Dataset::new(data, metadata).map_err(|error| error.to_string())
 }
 
-fn viewport_id_for_label(label: &str) -> egui::ViewportId {
-    egui::ViewportId::from_hash_of(format!("viewport-{label}"))
-}
-
 fn source_ptr_eq(left: &ViewerImageSource, right: &ViewerImageSource) -> bool {
     match (left, right) {
         (ViewerImageSource::Native(left), ViewerImageSource::Native(right)) => {
@@ -14038,12 +14098,15 @@ mod tests {
     use tempfile::tempdir;
 
     fn dataset_2x2(values: [f32; 4]) -> Arc<DatasetF32> {
+        dataset_2x2_with_pixel_type(values, PixelType::F32)
+    }
+
+    fn dataset_2x2_with_pixel_type(values: [f32; 4], pixel_type: PixelType) -> Arc<DatasetF32> {
         let data = Array::from_shape_vec((2, 2), values.to_vec())
             .expect("shape")
             .into_dyn();
         Arc::new(DatasetF32::from_data_with_default_metadata(
-            data,
-            PixelType::F32,
+            data, pixel_type,
         ))
     }
 
@@ -14843,6 +14906,7 @@ mod tests {
         let slice = SliceImage {
             width: 2,
             height: 1,
+            pixel_type: PixelType::F32,
             values: vec![0.0, 1.0],
         };
 
@@ -15012,6 +15076,7 @@ mod tests {
         let slice = SliceImage {
             width: 4,
             height: 3,
+            pixel_type: PixelType::F32,
             values: vec![0.0; 12],
         };
         let rois = vec![RoiModel {
@@ -15044,6 +15109,7 @@ mod tests {
         let slice = SliceImage {
             width: 1,
             height: 1,
+            pixel_type: PixelType::F32,
             values: vec![0.0],
         };
 
@@ -15161,6 +15227,7 @@ mod tests {
         let slice = SliceImage {
             width: 3,
             height: 2,
+            pixel_type: PixelType::F32,
             values: vec![
                 1.0, 2.0, 3.0, //
                 4.0, 5.0, 6.0,
@@ -15184,6 +15251,7 @@ mod tests {
         let slice = SliceImage {
             width: 3,
             height: 2,
+            pixel_type: PixelType::F32,
             values: vec![
                 0.0, 2.0, 0.0, //
                 4.0, 0.0, 6.0,
@@ -15206,6 +15274,7 @@ mod tests {
         let slice = SliceImage {
             width: 3,
             height: 2,
+            pixel_type: PixelType::F32,
             values: vec![
                 0.0, 2.0, 0.0, //
                 4.0, 0.0, 6.0,
@@ -16495,23 +16564,78 @@ mod tests {
         );
         let request = ViewerFrameRequest::default();
 
-        let native_frame = build_frame(&native, &request).expect("native frame");
-        let dataset_frame = build_frame(&dataset, &request).expect("dataset frame");
+        let native_frame = build_frame(&native, &request, None).expect("native frame");
+        let dataset_frame = build_frame(&dataset, &request, None).expect("dataset frame");
 
         assert_eq!(native_frame.width, dataset_frame.width);
         assert_eq!(native_frame.height, dataset_frame.height);
         assert_eq!(native_frame.pixels_u8, dataset_frame.pixels_u8);
         assert_eq!(native_frame.min, dataset_frame.min);
         assert_eq!(native_frame.max, dataset_frame.max);
+        assert_eq!(dataset_frame.values, vec![0.0, 64.0, 128.0, 255.0]);
     }
 
     #[test]
     fn dataset_frame_does_not_auto_stretch_display_range() {
         let dataset = ViewerImageSource::Dataset(dataset_2x2([0.25, 0.5, 0.75, 1.0]));
-        let frame = build_frame(&dataset, &ViewerFrameRequest::default()).expect("frame");
+        let frame = build_frame(&dataset, &ViewerFrameRequest::default(), None).expect("frame");
 
         assert_eq!(frame.pixels_u8, vec![64, 128, 191, 255]);
         assert_eq!(frame.values, vec![0.25, 0.5, 0.75, 1.0]);
+    }
+
+    #[test]
+    fn dataset_frame_maps_raw_integer_samples_for_display() {
+        let dataset = ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+            [0.0, 64.0, 128.0, 255.0],
+            PixelType::U8,
+        ));
+        let frame = build_frame(&dataset, &ViewerFrameRequest::default(), None).expect("frame");
+
+        assert_eq!(frame.pixels_u8, vec![0, 64, 128, 255]);
+        assert_eq!(frame.values, vec![0.0, 64.0, 128.0, 255.0]);
+        assert_eq!(frame.min, 0.0);
+        assert_eq!(frame.max, 255.0);
+    }
+
+    #[test]
+    fn dataset_frame_applies_display_range_without_changing_values() {
+        let dataset = ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+            [0.0, 5.0, 10.0, 20.0],
+            PixelType::U8,
+        ));
+        let frame = build_frame(&dataset, &ViewerFrameRequest::default(), Some((0.0, 10.0)))
+            .expect("frame");
+
+        assert_eq!(frame.pixels_u8, vec![0, 128, 255, 255]);
+        assert_eq!(frame.values, vec![0.0, 5.0, 10.0, 20.0]);
+        assert_eq!(frame.min, 0.0);
+        assert_eq!(frame.max, 20.0);
+    }
+
+    #[test]
+    fn compute_viewer_frame_uses_session_display_range_without_committing_pixels() {
+        let mut state = UiState::new(None);
+        let label = "viewer-1".to_string();
+        let original = dataset_2x2_with_pixel_type([0.0, 5.0, 10.0, 20.0], PixelType::U8);
+        let mut session = ViewerSession::new(
+            PathBuf::from("/tmp/display-range.tif"),
+            ViewerImageSource::Dataset(original.clone()),
+        );
+        session.set_display_range(Some((0.0, 10.0)));
+        state.label_to_session.insert(label.clone(), session);
+
+        let frame = compute_viewer_frame(&mut state, &label, &ViewerFrameRequest::default(), None)
+            .expect("frame");
+
+        assert_eq!(frame.pixels_u8, vec![0, 128, 255, 255]);
+        assert_eq!(frame.values, vec![0.0, 5.0, 10.0, 20.0]);
+        let session = state.label_to_session.get(&label).expect("session");
+        let committed = session.committed_dataset().expect("committed dataset");
+        assert!(Arc::ptr_eq(&committed, &original));
+        assert!(!session.can_undo());
+        assert_eq!(session.committed_summary.min, 0.0);
+        assert_eq!(session.committed_summary.max, 20.0);
     }
 
     #[test]
