@@ -3607,13 +3607,14 @@ impl ImageUiApp {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
+        let mut propagation = None;
         let channel_count = {
             let session = self
                 .state
                 .label_to_session
                 .get_mut(&target)
                 .ok_or_else(|| format!("no viewer session for `{target}`"))?;
-            if all_channels {
+            let affected_channel_count = if all_channels {
                 let channel_count = session.committed_summary.channels.max(1);
                 for channel in 0..channel_count {
                     session.set_channel_display_range(channel, Some((low, high)));
@@ -3625,10 +3626,14 @@ impl ImageUiApp {
             } else {
                 session.set_display_range(Some((low, high)));
                 session.committed_summary.channels.max(1)
+            };
+            if propagate {
+                propagation = Some(display_range_propagation_from_session(session));
             }
+            affected_channel_count
         };
 
-        if propagate {
+        if let Some(propagation) = propagation {
             let labels = self
                 .state
                 .label_to_session
@@ -3638,7 +3643,16 @@ impl ImageUiApp {
                 .collect::<Vec<_>>();
             for label in labels {
                 if let Some(session) = self.state.label_to_session.get_mut(&label) {
-                    session.set_display_range(Some((low, high)));
+                    if !display_range_propagation_matches(&propagation, session) {
+                        continue;
+                    }
+                    if let Some(channel_ranges) = &propagation.channel_ranges {
+                        for (channel, range) in channel_ranges.iter().copied().enumerate() {
+                            session.set_channel_display_range(channel, Some(range));
+                        }
+                    } else {
+                        session.set_display_range(Some((low, high)));
+                    }
                 }
                 if let Some(viewer) = self.viewers_ui.get_mut(&label) {
                     viewer.last_generation = 0;
@@ -12399,6 +12413,56 @@ fn summary_for_window(
     Ok((session.path.clone(), summary))
 }
 
+#[derive(Debug, Clone)]
+struct DisplayRangePropagation {
+    channels: usize,
+    pixel_type: Option<PixelType>,
+    channel_ranges: Option<Vec<(f32, f32)>>,
+}
+
+fn display_range_propagation_from_session(session: &ViewerSession) -> DisplayRangePropagation {
+    let channels = session.committed_summary.channels.max(1);
+    let pixel_type = session_pixel_type(session);
+    let channel_ranges = (channels > 1).then(|| {
+        (0..channels)
+            .map(|channel| {
+                session
+                    .channel_display_ranges
+                    .get(&channel)
+                    .copied()
+                    .or(session.display_range)
+                    .unwrap_or((session.committed_summary.min, session.committed_summary.max))
+            })
+            .collect()
+    });
+    DisplayRangePropagation {
+        channels,
+        pixel_type,
+        channel_ranges,
+    }
+}
+
+fn display_range_propagation_matches(
+    propagation: &DisplayRangePropagation,
+    session: &ViewerSession,
+) -> bool {
+    if session.committed_summary.channels.max(1) != propagation.channels {
+        return false;
+    }
+    match (propagation.pixel_type, session_pixel_type(session)) {
+        (Some(source), Some(target)) => source == target,
+        (Some(_), None) => false,
+        _ => true,
+    }
+}
+
+fn session_pixel_type(session: &ViewerSession) -> Option<PixelType> {
+    match &session.committed_source {
+        ViewerImageSource::Native(image) => Some(image.pixel_type()),
+        ViewerImageSource::Dataset(dataset) => Some(dataset.metadata.pixel_type),
+    }
+}
+
 fn preview_cache_key(op: &str, params: &Value) -> Result<String, String> {
     let normalized = canonical_json(params);
     let encoded = serde_json::to_string(&normalized)
@@ -19211,6 +19275,87 @@ mod tests {
     }
 
     #[test]
+    fn adjust_set_display_range_propagation_filters_like_imagej() {
+        let first = "viewer-1".to_string();
+        let matching = "viewer-2".to_string();
+        let different_type = "viewer-3".to_string();
+        let different_channels = "viewer-4".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            first.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/propagate-source.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 1.0, 2.0, 3.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+        app.state.label_to_session.insert(
+            matching.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/propagate-matching.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [4.0, 5.0, 6.0, 7.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+        app.state.label_to_session.insert(
+            different_type.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/propagate-f32.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 0.25, 0.5, 1.0],
+                    PixelType::F32,
+                )),
+            ),
+        );
+        let rgb = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![1.0, 2.0, 3.0]).expect("shape");
+        let rgb_metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        app.state.label_to_session.insert(
+            different_channels.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/propagate-rgb.tif"),
+                ViewerImageSource::Dataset(Arc::new(
+                    DatasetF32::new(rgb, rgb_metadata).expect("dataset"),
+                )),
+            ),
+        );
+
+        let result = app.dispatch_command(
+            &first,
+            "image.adjust.brightness",
+            Some(json!({"min": 0.5, "max": 2.5, "propagate": true})),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(
+            app.state.label_to_session[&matching].display_range,
+            Some((0.5, 2.5))
+        );
+        assert_eq!(
+            app.state.label_to_session[&different_type].display_range,
+            None
+        );
+        assert_eq!(
+            app.state.label_to_session[&different_channels].display_range,
+            None
+        );
+    }
+
+    #[test]
     fn adjust_set_display_range_accepts_equal_bounds_like_imagej() {
         let label = "viewer-1".to_string();
         let mut app = ImageUiApp::new_for_test();
@@ -19326,6 +19471,86 @@ mod tests {
         assert_eq!(session.channel_display_ranges.get(&0), Some(&(5.0, 25.0)));
         assert_eq!(session.channel_display_ranges.get(&1), Some(&(5.0, 25.0)));
         assert_eq!(session.channel_display_ranges.get(&2), Some(&(5.0, 25.0)));
+    }
+
+    #[test]
+    fn adjust_color_balance_propagation_copies_channel_ranges_like_imagej() {
+        let source = "viewer-1".to_string();
+        let matching = "viewer-2".to_string();
+        let different_channels = "viewer-3".to_string();
+        let rgb_dataset = || {
+            let data =
+                Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![10.0, 20.0, 30.0]).expect("shape");
+            let metadata = Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 1),
+                    Dim::new(AxisKind::X, 1),
+                    Dim::new(AxisKind::Channel, 3),
+                ],
+                pixel_type: PixelType::U8,
+                ..Metadata::default()
+            };
+            Arc::new(DatasetF32::new(data, metadata).expect("dataset"))
+        };
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            source.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/source-composite.tif"),
+                ViewerImageSource::Dataset(rgb_dataset()),
+            ),
+        );
+        {
+            let session = app
+                .state
+                .label_to_session
+                .get_mut(&source)
+                .expect("source session");
+            session.channel_display_ranges.insert(0, (1.0, 2.0));
+            session.channel_display_ranges.insert(1, (3.0, 4.0));
+        }
+        app.state.label_to_session.insert(
+            matching.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/matching-composite.tif"),
+                ViewerImageSource::Dataset(rgb_dataset()),
+            ),
+        );
+        app.state.label_to_session.insert(
+            different_channels.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/grayscale.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 1.0, 2.0, 3.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+
+        let result = app.dispatch_command(
+            &source,
+            "image.adjust.color_balance",
+            Some(json!({
+                "min": 5.0,
+                "max": 6.0,
+                "channel": "Blue",
+                "propagate": true
+            })),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        let session = &app.state.label_to_session[&matching];
+        assert_eq!(session.channel_display_ranges.get(&0), Some(&(1.0, 2.0)));
+        assert_eq!(session.channel_display_ranges.get(&1), Some(&(3.0, 4.0)));
+        assert_eq!(session.channel_display_ranges.get(&2), Some(&(5.0, 6.0)));
+        assert!(
+            app.state.label_to_session[&different_channels]
+                .channel_display_ranges
+                .is_empty()
+        );
     }
 
     #[test]
