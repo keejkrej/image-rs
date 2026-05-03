@@ -3880,6 +3880,90 @@ impl ImageUiApp {
         }
     }
 
+    fn resize_current_slice_new_window_if_requested(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Option<command_registry::CommandExecuteResult> {
+        if params
+            .get("process_stack")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        if !params
+            .get("create_new_window")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            return Some(command_registry::CommandExecuteResult::blocked(
+                "Scale current-slice in-place mode is not yet supported",
+            ));
+        }
+
+        Some(
+            match self.resize_current_slice_new_window(window_label, params) {
+                Ok(payload) => command_registry::CommandExecuteResult::with_payload(
+                    "resize current slice created",
+                    payload,
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+        )
+    }
+
+    fn resize_current_slice_new_window(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get(&target)
+            .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+        let (z, t) = (viewer.z, viewer.t);
+        let dataset = self
+            .state
+            .label_to_session
+            .get(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?
+            .committed_source
+            .to_dataset()?;
+        let plane = current_zt_plane_dataset(dataset.as_ref(), z, t)?;
+        let mut resize_params = params.clone();
+        if let Some(map) = resize_params.as_object_mut() {
+            map.remove("depth");
+            map.remove("frames");
+            map.remove("process_stack");
+            map.remove("create_new_window");
+            map.remove("title");
+        }
+        let output = self
+            .state
+            .app
+            .ops_service()
+            .execute("image.resize", &plane, &resize_params)
+            .map_err(|error| error.to_string())?;
+        let title = params
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .map(sanitize_image_title)
+            .unwrap_or_else(|| format!("Untitled-{}", self.state.next_window_id + 1));
+        let path = normalize_path(&PathBuf::from(format!(
+            "{}-{}.tif",
+            title,
+            self.state.next_window_id + 1
+        )));
+        let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(output.dataset)));
+        Ok(json!({ "window": label, "op": "image.resize", "slice": z }))
+    }
+
     fn handle_color_threshold_command(
         &mut self,
         window_label: &str,
@@ -4535,6 +4619,12 @@ impl ImageUiApp {
             } else {
                 OpRunMode::Apply
             };
+            if command_id == "__dialog.resize"
+                && let Some(result) =
+                    self.resize_current_slice_new_window_if_requested(&viewer_label, &params)
+            {
+                return Some(result);
+            }
             return Some(
                 match self.viewer_start_op(
                     &viewer_label,
@@ -6020,6 +6110,11 @@ impl ImageUiApp {
             }
             "image.adjust.size" => {
                 if let Some(params) = request.params {
+                    if let Some(result) =
+                        self.resize_current_slice_new_window_if_requested(window_label, &params)
+                    {
+                        return result;
+                    }
                     let mode = resize_op_mode_from_params(&params);
                     return match self.viewer_start_op(
                         window_label,
@@ -6045,10 +6140,14 @@ impl ImageUiApp {
                     self.resize_dialog.y_scale = 1.0;
                     self.resize_dialog.z_scale = 1.0;
                     self.resize_dialog.depth = session.committed_summary.z_slices.max(1);
+                    self.resize_dialog.original_depth = session.committed_summary.z_slices.max(1);
                     self.resize_dialog.frames = session.committed_summary.times.max(1);
                     self.resize_dialog.fill_with_background_available =
                         scale_fill_with_background_available(session);
                     self.resize_dialog.fill_with_background = false;
+                    self.resize_dialog.process_stack = true;
+                    self.resize_dialog.process_stack_available =
+                        scale_process_stack_available(session);
                     self.resize_dialog.create_new_window = true;
                     self.resize_dialog.title = session
                         .path
@@ -6096,6 +6195,7 @@ impl ImageUiApp {
                     self.canvas_dialog.y_scale = 1.0;
                     self.canvas_dialog.z_scale = 1.0;
                     self.canvas_dialog.depth = session.committed_summary.z_slices.max(1);
+                    self.canvas_dialog.original_depth = session.committed_summary.z_slices.max(1);
                     self.canvas_dialog.frames = session.committed_summary.times.max(1);
                 }
                 self.canvas_dialog.open = true;
@@ -10018,6 +10118,11 @@ impl ImageUiApp {
                     &mut dialog.average_when_downsizing,
                     "Average when downsizing",
                 );
+                if dialog.process_stack_available {
+                    ui.checkbox(&mut dialog.process_stack, "Process entire stack");
+                } else {
+                    dialog.process_stack = true;
+                }
                 ui.checkbox(&mut dialog.create_new_window, "Create new window");
                 ui.horizontal(|ui| {
                     ui.label("Title:");
@@ -10047,6 +10152,10 @@ impl ImageUiApp {
                             "zero": dialog.zero_fill,
                         })
                     } else {
+                        let z_scaling = dialog.depth != dialog.original_depth;
+                        let process_stack =
+                            z_scaling || !dialog.process_stack_available || dialog.process_stack;
+                        let create_new_window = dialog.create_new_window || z_scaling;
                         let fill = if dialog.fill_with_background {
                             background_fill
                         } else {
@@ -10062,7 +10171,8 @@ impl ImageUiApp {
                             "interpolation": dialog.interpolation,
                             "fill": fill,
                             "fill_with_background": dialog.fill_with_background,
-                            "create_new_window": dialog.create_new_window,
+                            "process_stack": process_stack,
+                            "create_new_window": create_new_window,
                             "title": dialog.title,
                         })
                     };
@@ -12215,6 +12325,92 @@ fn scale_fill_with_background_available(session: &ViewerSession) -> bool {
             .to_dataset()
             .ok()
             .is_some_and(|dataset| dataset.metadata.pixel_type == PixelType::U8)
+}
+
+fn scale_process_stack_available(session: &ViewerSession) -> bool {
+    session.committed_summary.z_slices > 1 && session.committed_summary.times <= 1
+}
+
+fn current_zt_plane_dataset(
+    dataset: &DatasetF32,
+    z: usize,
+    t: usize,
+) -> Result<DatasetF32, String> {
+    if dataset.ndim() < 2 {
+        return Err("dataset must have at least two dimensions".to_string());
+    }
+    let y_axis = dataset
+        .axis_index(AxisKind::Y)
+        .unwrap_or(0)
+        .min(dataset.ndim() - 1);
+    let x_axis = dataset
+        .axis_index(AxisKind::X)
+        .unwrap_or(1.min(dataset.ndim() - 1));
+    if x_axis == y_axis {
+        return Err("could not infer distinct X/Y axes".to_string());
+    }
+    let z_axis = dataset.axis_index(AxisKind::Z);
+    let t_axis = dataset.axis_index(AxisKind::Time);
+    let channel_axis = dataset.axis_index(AxisKind::Channel);
+    let height = dataset.shape()[y_axis];
+    let width = dataset.shape()[x_axis];
+    let channels = channel_axis.map(|axis| dataset.shape()[axis]).unwrap_or(1);
+
+    let mut index = vec![0usize; dataset.ndim()];
+    if let Some(axis) = z_axis {
+        index[axis] = z.min(dataset.shape()[axis].saturating_sub(1));
+    }
+    if let Some(axis) = t_axis {
+        index[axis] = t.min(dataset.shape()[axis].saturating_sub(1));
+    }
+
+    let mut values = Vec::with_capacity(height * width * channels);
+    for y in 0..height {
+        index[y_axis] = y;
+        for x in 0..width {
+            index[x_axis] = x;
+            if let Some(axis) = channel_axis {
+                for channel in 0..channels {
+                    index[axis] = channel;
+                    values.push(dataset.data[IxDyn(&index)]);
+                }
+            } else {
+                values.push(dataset.data[IxDyn(&index)]);
+            }
+        }
+    }
+
+    let mut dims = vec![
+        plane_dim(&dataset.metadata.dims[y_axis], AxisKind::Y, height),
+        plane_dim(&dataset.metadata.dims[x_axis], AxisKind::X, width),
+    ];
+    let shape = if let Some(axis) = channel_axis {
+        dims.push(plane_dim(
+            &dataset.metadata.dims[axis],
+            AxisKind::Channel,
+            channels,
+        ));
+        vec![height, width, channels]
+    } else {
+        vec![height, width]
+    };
+    let metadata = Metadata {
+        dims,
+        pixel_type: dataset.metadata.pixel_type,
+        channel_names: dataset.metadata.channel_names.clone(),
+        source: dataset.metadata.source.clone(),
+        extras: dataset.metadata.extras.clone(),
+    };
+    let data = ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|error| format!("current slice shape error: {error}"))?;
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
+fn plane_dim(source: &Dim, axis: AxisKind, size: usize) -> Dim {
+    let mut dim = source.clone();
+    dim.axis = axis;
+    dim.size = size;
+    dim
 }
 
 fn roi_stroke_width(line_width_px: f32, selected: bool) -> f32 {
@@ -18745,12 +18941,160 @@ mod tests {
         assert_eq!(app.resize_dialog.z_scale, 1.0);
         assert!(!app.resize_dialog.fill_with_background_available);
         assert!(!app.resize_dialog.fill_with_background);
+        assert!(!app.resize_dialog.process_stack_available);
+        assert!(app.resize_dialog.process_stack);
         assert!(app.resize_dialog.create_new_window);
         assert_eq!(app.resize_dialog.title, "scale-dialog");
         assert_eq!(
             resize_op_mode_from_params(&json!({"create_new_window": true})),
             OpRunMode::NewWindow
         );
+    }
+
+    #[test]
+    fn adjust_size_dialog_exposes_process_stack_for_stacks_like_imagej() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(IxDyn(&[1, 1, 2]), vec![10.0, 20.0]).expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Z, 2),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/scale-stack-dialog.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+
+        let result = app.dispatch_command(&label, "image.adjust.size", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(app.resize_dialog.depth, 2);
+        assert_eq!(app.resize_dialog.original_depth, 2);
+        assert!(app.resize_dialog.process_stack_available);
+        assert!(app.resize_dialog.process_stack);
+    }
+
+    #[test]
+    fn adjust_size_process_current_slice_new_window_like_imagej() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(
+            IxDyn(&[1, 1, 2, 3]),
+            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        )
+        .expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Z, 2),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.next_window_id = 1;
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/scale-current-slice.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        let mut viewer = ViewerUiState::new(&label, "scale-current-slice".to_string());
+        viewer.z = 1;
+        app.viewers_ui.insert(label.clone(), viewer);
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.size",
+            Some(json!({
+                "width": 2,
+                "height": 2,
+                "depth": 2,
+                "interpolation": "None",
+                "process_stack": false,
+                "create_new_window": true,
+                "title": "slice-copy"
+            })),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        let new_label = app
+            .state
+            .label_to_session
+            .keys()
+            .find(|candidate| *candidate != &label)
+            .cloned()
+            .expect("new current-slice viewer");
+        let new_session = &app.state.label_to_session[&new_label];
+        assert_eq!(new_session.committed_summary.shape, vec![2, 2, 3]);
+        assert_eq!(new_session.committed_summary.z_slices, 1);
+        assert_eq!(new_session.committed_summary.channels, 3);
+        let output = new_session.committed_dataset().expect("dataset");
+        assert_eq!(
+            output.data.iter().copied().collect::<Vec<_>>(),
+            vec![
+                40.0, 50.0, 60.0, 40.0, 50.0, 60.0, 40.0, 50.0, 60.0, 40.0, 50.0, 60.0,
+            ]
+        );
+    }
+
+    #[test]
+    fn adjust_size_current_slice_in_place_is_blocked_until_supported() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(IxDyn(&[1, 1, 2]), vec![10.0, 20.0]).expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Z, 2),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/scale-current-slice-in-place.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.size",
+            Some(json!({
+                "width": 2,
+                "height": 2,
+                "process_stack": false,
+                "create_new_window": false,
+            })),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Blocked
+        ));
+        assert!(result.message.contains("current-slice in-place"));
     }
 
     #[test]
