@@ -6035,6 +6035,9 @@ impl ImageUiApp {
                     self.resize_dialog.z_scale = 1.0;
                     self.resize_dialog.depth = session.committed_summary.z_slices.max(1);
                     self.resize_dialog.frames = session.committed_summary.times.max(1);
+                    self.resize_dialog.fill_with_background_available =
+                        scale_fill_with_background_available(session);
+                    self.resize_dialog.fill_with_background = false;
                     self.resize_dialog.create_new_window = true;
                     self.resize_dialog.title = session
                         .path
@@ -9983,10 +9986,6 @@ impl ImageUiApp {
                         dialog.z_scale = dialog.depth as f32 / original_depth;
                     }
                 }
-                ui.checkbox(
-                    &mut dialog.average_when_downsizing,
-                    "Average when downsizing",
-                );
                 egui::ComboBox::from_label("Interpolation:")
                     .selected_text(&dialog.interpolation)
                     .show_ui(ui, |ui| {
@@ -9998,6 +9997,18 @@ impl ImageUiApp {
                             );
                         }
                     });
+                if dialog.fill_with_background_available {
+                    ui.checkbox(
+                        &mut dialog.fill_with_background,
+                        "Fill with background color",
+                    );
+                } else {
+                    dialog.fill_with_background = false;
+                }
+                ui.checkbox(
+                    &mut dialog.average_when_downsizing,
+                    "Average when downsizing",
+                );
                 ui.checkbox(&mut dialog.create_new_window, "Create new window");
                 ui.horizontal(|ui| {
                     ui.label("Title:");
@@ -10027,6 +10038,11 @@ impl ImageUiApp {
                             "zero": dialog.zero_fill,
                         })
                     } else {
+                        let fill = if dialog.fill_with_background {
+                            background_fill
+                        } else {
+                            0.0
+                        };
                         json!({
                             "width": dialog.width,
                             "height": dialog.height,
@@ -10035,6 +10051,8 @@ impl ImageUiApp {
                             "constrain": dialog.constrain_aspect,
                             "average_when_downsizing": dialog.average_when_downsizing,
                             "interpolation": dialog.interpolation,
+                            "fill": fill,
+                            "fill_with_background": dialog.fill_with_background,
                             "create_new_window": dialog.create_new_window,
                             "title": dialog.title,
                         })
@@ -12179,6 +12197,15 @@ fn resize_op_mode_from_params(params: &Value) -> OpRunMode {
     } else {
         OpRunMode::Apply
     }
+}
+
+fn scale_fill_with_background_available(session: &ViewerSession) -> bool {
+    session.committed_summary.channels >= 3
+        || session
+            .committed_source
+            .to_dataset()
+            .ok()
+            .is_some_and(|dataset| dataset.metadata.pixel_type == PixelType::U8)
 }
 
 fn roi_stroke_width(line_width_px: f32, selected: bool) -> f32 {
@@ -15543,7 +15570,8 @@ mod tests {
         reset_color_threshold_bands_for_space, resize_op_mode_from_params, results_distribution,
         results_rows_to_dataset, results_summary_rows, roi_kind_bbox, roi_label_anchor,
         roi_stroke_width, sample_color_threshold_ranges, sanitize_image_title,
-        selection_properties_row, set_selected_roi_spline_fit, set_stack_slice_label_dataset,
+        scale_fill_with_background_available, selection_properties_row,
+        set_selected_roi_spline_fit, set_stack_slice_label_dataset,
         set_threshold_sixteen_bit_histogram, should_request_periodic_repaint,
         should_request_repaint_now, source_ptr_eq, spline_fit_roi_points, stack_measurement_rows,
         stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
@@ -18535,12 +18563,62 @@ mod tests {
         assert_eq!(app.resize_dialog.x_scale, 1.0);
         assert_eq!(app.resize_dialog.y_scale, 1.0);
         assert_eq!(app.resize_dialog.z_scale, 1.0);
+        assert!(!app.resize_dialog.fill_with_background_available);
+        assert!(!app.resize_dialog.fill_with_background);
         assert!(app.resize_dialog.create_new_window);
         assert_eq!(app.resize_dialog.title, "scale-dialog");
         assert_eq!(
             resize_op_mode_from_params(&json!({"create_new_window": true})),
             OpRunMode::NewWindow
         );
+    }
+
+    #[test]
+    fn adjust_size_dialog_exposes_background_fill_for_u8_or_rgb_like_imagej() {
+        let label = "viewer-1".to_string();
+        let u8_session = ViewerSession::new(
+            PathBuf::from("/tmp/u8-scale-dialog.tif"),
+            ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                [0.0, 1.0, 2.0, 3.0],
+                PixelType::U8,
+            )),
+        );
+        assert!(scale_fill_with_background_available(&u8_session));
+
+        let rgb_data =
+            Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![0.0, 1.0, 2.0]).expect("shape");
+        let rgb_dataset = Arc::new(
+            DatasetF32::new(
+                rgb_data,
+                Metadata {
+                    dims: vec![
+                        Dim::new(AxisKind::Y, 1),
+                        Dim::new(AxisKind::X, 1),
+                        Dim::new(AxisKind::Channel, 3),
+                    ],
+                    pixel_type: PixelType::F32,
+                    ..Metadata::default()
+                },
+            )
+            .expect("dataset"),
+        );
+        let rgb_session = ViewerSession::new(
+            PathBuf::from("/tmp/rgb-scale-dialog.tif"),
+            ViewerImageSource::Dataset(rgb_dataset),
+        );
+        assert!(scale_fill_with_background_available(&rgb_session));
+
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(label.clone(), u8_session);
+
+        let result = app.dispatch_command(&label, "image.adjust.size", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert!(app.resize_dialog.fill_with_background_available);
+        assert!(!app.resize_dialog.fill_with_background);
     }
 
     #[test]

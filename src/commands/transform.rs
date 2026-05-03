@@ -286,6 +286,13 @@ impl Operation for ImageResizeOp {
                     required: false,
                     kind: "string".to_string(),
                 },
+                ParamSpec {
+                    name: "fill".to_string(),
+                    description: "Background fill value requested by ImageJ's Scale dialog."
+                        .to_string(),
+                    required: false,
+                    kind: "float".to_string(),
+                },
             ],
         }
     }
@@ -327,6 +334,11 @@ impl Operation for ImageResizeOp {
             .map(ResizeInterpolation::parse)
             .transpose()?
             .unwrap_or(ResizeInterpolation::Bilinear);
+        if let Some(fill) = params.get("fill").and_then(Value::as_f64)
+            && !fill.is_finite()
+        {
+            return Err(OpsError::InvalidParams("`fill` must be finite".to_string()));
+        }
         let mut output = resize_xy(
             dataset,
             width,
