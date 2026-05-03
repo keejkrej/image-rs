@@ -4265,16 +4265,18 @@ impl ImageUiApp {
                 session.committed_source.to_dataset()?,
             )
         };
-        let ranges = sample_color_threshold_ranges(dataset.as_ref(), bbox, z, t, &color_space)?;
+        let sample =
+            sample_color_threshold_ranges_with_passes(dataset.as_ref(), bbox, z, t, &color_space)?;
+        let ranges = sample.ranges;
         self.adjust_dialog.hue_min = ranges[0].0;
         self.adjust_dialog.hue_max = ranges[0].1;
         self.adjust_dialog.saturation_min = ranges[1].0;
         self.adjust_dialog.saturation_max = ranges[1].1;
         self.adjust_dialog.brightness_min = ranges[2].0;
         self.adjust_dialog.brightness_max = ranges[2].1;
-        self.adjust_dialog.hue_pass = true;
-        self.adjust_dialog.saturation_pass = true;
-        self.adjust_dialog.brightness_pass = true;
+        self.adjust_dialog.hue_pass = sample.passes[0];
+        self.adjust_dialog.saturation_pass = sample.passes[1];
+        self.adjust_dialog.brightness_pass = sample.passes[2];
         if let Some(viewer) = self.viewers_ui.get_mut(&target) {
             viewer.status_message = "Color threshold ranges sampled".to_string();
         }
@@ -15090,13 +15092,19 @@ fn mask_foreground_outline_points(slice: &SliceImage) -> Option<Vec<egui::Pos2>>
     )
 }
 
-fn sample_color_threshold_ranges(
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ColorThresholdSampleRanges {
+    ranges: [(f32, f32); 3],
+    passes: [bool; 3],
+}
+
+fn sample_color_threshold_ranges_with_passes(
     dataset: &DatasetF32,
     bbox: (usize, usize, usize, usize),
     z: usize,
     t: usize,
     color_space: &str,
-) -> Result<[(f32, f32); 3], String> {
+) -> Result<ColorThresholdSampleRanges, String> {
     let channel_axis = dataset
         .axis_index(AxisKind::Channel)
         .ok_or_else(|| "Color Threshold Sample requires an RGB channel image".to_string())?;
@@ -15129,6 +15137,7 @@ fn sample_color_threshold_ranges(
 
     let mut mins = [f32::INFINITY; 3];
     let mut maxes = [f32::NEG_INFINITY; 3];
+    let mut hue_bin = [false; 256];
     let mut index = vec![0usize; dataset.ndim()];
     if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
         index[z_axis] = z.min(dataset.shape()[z_axis].saturating_sub(1));
@@ -15143,6 +15152,10 @@ fn sample_color_threshold_ranges(
             index[x_axis] = x;
             let components =
                 sampled_color_components(dataset, &mut index, channel_axis, &color_space)?;
+            if color_space == "hsb" {
+                let hue = components[0].round().clamp(0.0, 255.0) as usize;
+                hue_bin[hue] = true;
+            }
             for band in 0..3 {
                 mins[band] = mins[band].min(components[band]);
                 maxes[band] = maxes[band].max(components[band]);
@@ -15154,20 +15167,70 @@ fn sample_color_threshold_ranges(
         return Err("Color Threshold Sample found no finite RGB pixels".to_string());
     }
 
-    Ok([
-        (
-            mins[0].floor().clamp(0.0, 255.0),
-            maxes[0].ceil().clamp(0.0, 255.0),
-        ),
-        (
-            mins[1].floor().clamp(0.0, 255.0),
-            maxes[1].ceil().clamp(0.0, 255.0),
-        ),
-        (
-            mins[2].floor().clamp(0.0, 255.0),
-            maxes[2].ceil().clamp(0.0, 255.0),
-        ),
-    ])
+    let mut sample = ColorThresholdSampleRanges {
+        ranges: [
+            (
+                mins[0].floor().clamp(0.0, 255.0),
+                maxes[0].ceil().clamp(0.0, 255.0),
+            ),
+            (
+                mins[1].floor().clamp(0.0, 255.0),
+                maxes[1].ceil().clamp(0.0, 255.0),
+            ),
+            (
+                mins[2].floor().clamp(0.0, 255.0),
+                maxes[2].ceil().clamp(0.0, 255.0),
+            ),
+        ],
+        passes: [true, true, true],
+    };
+    if color_space == "hsb" {
+        apply_imagej_hsb_sample_hue_gap_rule(&mut sample, &hue_bin);
+    }
+    Ok(sample)
+}
+
+fn apply_imagej_hsb_sample_hue_gap_rule(
+    sample: &mut ColorThresholdSampleRanges,
+    hue_bin: &[bool; 256],
+) {
+    let mut gap = 0usize;
+    let mut max_gap = 0usize;
+    let mut max_gap_start = 0usize;
+    let mut max_gap_end = 0usize;
+    let mut gap_start = 0usize;
+    if !hue_bin[0] {
+        gap_start = 0;
+        gap = 1;
+    }
+    for hue in 1..256 {
+        if !hue_bin[hue] {
+            if hue_bin[hue - 1] {
+                gap = 1;
+                gap_start = hue;
+            } else {
+                gap += 1;
+            }
+            if gap > max_gap {
+                max_gap = gap;
+                max_gap_start = gap_start;
+                max_gap_end = hue;
+            }
+        }
+    }
+    let Some(range_pass_low) = hue_bin.iter().position(|occupied| *occupied) else {
+        return;
+    };
+    let Some(range_pass_high) = hue_bin.iter().rposition(|occupied| *occupied) else {
+        return;
+    };
+    if range_pass_high.saturating_sub(range_pass_low) < max_gap {
+        sample.passes[0] = true;
+        sample.ranges[0] = (range_pass_low as f32, range_pass_high as f32);
+    } else {
+        sample.passes[0] = false;
+        sample.ranges[0] = (max_gap_start as f32, max_gap_end as f32);
+    }
 }
 
 fn color_threshold_auto_ranges(
@@ -15986,7 +16049,7 @@ mod tests {
         remove_stack_slice_labels_dataset, renamed_image_path,
         reset_color_threshold_bands_for_space, resize_op_mode_from_params, results_distribution,
         results_rows_to_dataset, results_summary_rows, roi_kind_bbox, roi_label_anchor,
-        roi_stroke_width, sample_color_threshold_ranges, sanitize_image_title,
+        roi_stroke_width, sample_color_threshold_ranges_with_passes, sanitize_image_title,
         scale_fill_with_background_available, selection_properties_row,
         set_selected_roi_spline_fit, set_stack_slice_label_dataset,
         set_threshold_sixteen_bit_histogram, should_request_periodic_repaint,
@@ -19661,10 +19724,36 @@ mod tests {
         )
         .expect("dataset");
 
-        let ranges = sample_color_threshold_ranges(&dataset, (1, 0, 1, 1), 0, 0, "RGB")
+        let sample = sample_color_threshold_ranges_with_passes(&dataset, (1, 0, 1, 1), 0, 0, "RGB")
             .expect("sample ranges");
 
-        assert_eq!(ranges, [(40.0, 100.0), (50.0, 110.0), (60.0, 120.0)]);
+        assert_eq!(sample.ranges, [(40.0, 100.0), (50.0, 110.0), (60.0, 120.0)]);
+        assert_eq!(sample.passes, [true, true, true]);
+    }
+
+    #[test]
+    fn color_threshold_sample_hsb_hue_wrap_uses_stop_band_like_imagej() {
+        let data = Array::from_shape_vec(IxDyn(&[1, 2, 3]), vec![255.0, 0.0, 0.0, 255.0, 0.0, 1.0])
+            .expect("shape");
+        let dataset = DatasetF32::new(
+            data,
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 1),
+                    Dim::new(AxisKind::X, 2),
+                    Dim::new(AxisKind::Channel, 3),
+                ],
+                pixel_type: PixelType::U8,
+                ..Metadata::default()
+            },
+        )
+        .expect("dataset");
+
+        let sample = sample_color_threshold_ranges_with_passes(&dataset, (0, 0, 1, 0), 0, 0, "HSB")
+            .expect("sample ranges");
+
+        assert_eq!(sample.ranges[0], (1.0, 254.0));
+        assert_eq!(sample.passes, [false, true, true]);
     }
 
     #[test]
