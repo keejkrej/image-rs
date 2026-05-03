@@ -677,6 +677,7 @@ struct ImageUiApp {
     threshold_set_dialog: ThresholdSetDialogState,
     apply_lut_dialog: ApplyLutDialogState,
     set_display_range_dialog: SetDisplayRangeDialogState,
+    set_window_level_dialog: SetWindowLevelDialogState,
     resize_dialog: ResizeDialogState,
     canvas_dialog: ResizeDialogState,
     stack_position_dialog: StackPositionDialogState,
@@ -733,6 +734,7 @@ impl ImageUiApp {
             threshold_set_dialog: ThresholdSetDialogState::default(),
             apply_lut_dialog: ApplyLutDialogState::default(),
             set_display_range_dialog: SetDisplayRangeDialogState::default(),
+            set_window_level_dialog: SetWindowLevelDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
@@ -790,6 +792,7 @@ impl ImageUiApp {
             threshold_set_dialog: ThresholdSetDialogState::default(),
             apply_lut_dialog: ApplyLutDialogState::default(),
             set_display_range_dialog: SetDisplayRangeDialogState::default(),
+            set_window_level_dialog: SetWindowLevelDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
@@ -3438,6 +3441,18 @@ impl ImageUiApp {
             max: self.adjust_dialog.max,
             mode: self.adjust_dialog.threshold_mode.clone(),
             dark_background: self.adjust_dialog.dark_background,
+        };
+    }
+
+    fn open_set_window_level_dialog_from_adjust(&mut self) {
+        let window = self.adjust_dialog.max - self.adjust_dialog.min;
+        let level = self.adjust_dialog.min + window * 0.5;
+        self.set_window_level_dialog = SetWindowLevelDialogState {
+            open: true,
+            window_label: self.adjust_dialog.window_label.clone(),
+            level,
+            window,
+            propagate: false,
         };
     }
 
@@ -7792,6 +7807,7 @@ impl ImageUiApp {
         self.draw_threshold_set_dialog(ctx, actions);
         self.draw_apply_lut_dialog(ctx, actions);
         self.draw_set_display_range_dialog(ctx, actions);
+        self.draw_set_window_level_dialog(ctx, actions);
         self.draw_resize_dialog(ctx, actions, false);
         self.draw_resize_dialog(ctx, actions, true);
         self.draw_stack_position_dialog(ctx, actions);
@@ -8615,11 +8631,7 @@ impl ImageUiApp {
                             }
                             ui.end_row();
                             if ui.button("Set").clicked() {
-                                self.open_set_display_range_dialog_from_adjust(
-                                    "image.adjust.window_level",
-                                    "low",
-                                    "high",
-                                );
+                                self.open_set_window_level_dialog_from_adjust();
                             }
                             if ui.button("Apply").clicked() {
                                 let window_label = self.adjust_dialog.window_label.clone();
@@ -9621,6 +9633,70 @@ impl ImageUiApp {
             self.set_display_range_dialog.open = false;
         } else {
             self.set_display_range_dialog.open = open;
+        }
+    }
+
+    fn draw_set_window_level_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.set_window_level_dialog.open {
+            return;
+        }
+
+        let mut open = self.set_window_level_dialog.open;
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("Set W&L")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("set_window_level_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label("Window Center (Level):");
+                        ui.add(
+                            egui::DragValue::new(&mut self.set_window_level_dialog.level)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+
+                        ui.label("Window Width:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.set_window_level_dialog.window)
+                                .range(0.0..=f32::INFINITY)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+                    });
+                ui.checkbox(
+                    &mut self.set_window_level_dialog.propagate,
+                    "Propagate to all open images",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        ok = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ok {
+            let half_window = self.set_window_level_dialog.window.max(0.0) * 0.5;
+            actions.push(UiAction::Command {
+                window_label: self.set_window_level_dialog.window_label.clone(),
+                command_id: "image.adjust.window_level".to_string(),
+                params: Some(json!({
+                    "low": self.set_window_level_dialog.level - half_window,
+                    "high": self.set_window_level_dialog.level + half_window,
+                    "propagate": self.set_window_level_dialog.propagate,
+                })),
+            });
+            self.set_window_level_dialog.open = false;
+        } else if cancel {
+            self.set_window_level_dialog.open = false;
+        } else {
+            self.set_window_level_dialog.open = open;
         }
     }
 
@@ -18046,6 +18122,33 @@ mod tests {
             app.set_display_range_dialog.unsigned_16bit_range,
             "Automatic"
         );
+    }
+
+    #[test]
+    fn window_level_set_opens_imagej_set_wl_dialog_state() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/set-window-level.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+
+        app.open_adjust_dialog(&label, super::AdjustDialogKind::WindowLevel);
+        app.adjust_dialog.min = 50.0;
+        app.adjust_dialog.max = 150.0;
+        app.open_set_window_level_dialog_from_adjust();
+
+        assert!(app.set_window_level_dialog.open);
+        assert_eq!(app.set_window_level_dialog.window_label, label);
+        assert_eq!(app.set_window_level_dialog.level, 100.0);
+        assert_eq!(app.set_window_level_dialog.window, 100.0);
+        assert!(!app.set_window_level_dialog.propagate);
     }
 
     #[test]

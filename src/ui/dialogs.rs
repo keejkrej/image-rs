@@ -325,6 +325,27 @@ impl Default for SetDisplayRangeDialogState {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct SetWindowLevelDialogState {
+    pub(super) open: bool,
+    pub(super) window_label: String,
+    pub(super) level: f32,
+    pub(super) window: f32,
+    pub(super) propagate: bool,
+}
+
+impl Default for SetWindowLevelDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            level: 0.5,
+            window: 1.0,
+            propagate: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct StackPositionDialogState {
     pub(super) open: bool,
     pub(super) window_label: String,
