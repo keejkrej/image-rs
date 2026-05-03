@@ -3588,9 +3588,9 @@ impl ImageUiApp {
             high = range_high;
         }
 
-        if !low.is_finite() || !high.is_finite() || high <= low {
+        if !low.is_finite() || !high.is_finite() || high < low {
             return Err(format!(
-                "`{high_key}` must be a finite value greater than `{low_key}`"
+                "`{high_key}` must be a finite value greater than or equal to `{low_key}`"
             ));
         }
 
@@ -19207,6 +19207,50 @@ mod tests {
         assert_eq!(
             app.state.label_to_session[&second].display_range,
             Some((0.5, 2.5))
+        );
+    }
+
+    #[test]
+    fn adjust_set_display_range_accepts_equal_bounds_like_imagej() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/equal-display-range.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+
+        let brightness = app.dispatch_command(
+            &label,
+            "image.adjust.brightness",
+            Some(json!({"min": 42.0, "max": 42.0})),
+        );
+        assert!(matches!(
+            brightness.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(
+            app.state.label_to_session[&label].display_range,
+            Some((42.0, 42.0))
+        );
+
+        let window_level = app.dispatch_command(
+            &label,
+            "image.adjust.window_level",
+            Some(json!({"low": 100.0, "high": 100.0})),
+        );
+        assert!(matches!(
+            window_level.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(
+            app.state.label_to_session[&label].display_range,
+            Some((100.0, 100.0))
         );
     }
 
