@@ -9098,19 +9098,6 @@ impl ImageUiApp {
                     });
                 }
                 AdjustDialogKind::ColorThreshold => {
-                    let color_space_changed = egui::ComboBox::from_label("Color space")
-                        .selected_text(&self.adjust_dialog.color_threshold_space)
-                        .show_ui(ui, |ui| {
-                            for space in ["HSB", "RGB", "Lab", "YUV"] {
-                                ui.selectable_value(
-                                    &mut self.adjust_dialog.color_threshold_space,
-                                    space.to_string(),
-                                    space,
-                                );
-                            }
-                        })
-                        .response
-                        .changed();
                     let band_labels = match self.adjust_dialog.color_threshold_space.as_str() {
                         "RGB" => ["Red", "Green", "Blue"],
                         "Lab" => ["L*", "a*", "b*"],
@@ -9144,7 +9131,8 @@ impl ImageUiApp {
                         &mut self.adjust_dialog.brightness_pass,
                         self.adjust_dialog.histogram.as_ref(),
                     );
-                    let method_changed = egui::ComboBox::from_label("Thresholding method")
+                    let [method_label, mode_label, space_label] = color_threshold_choice_labels();
+                    let method_changed = egui::ComboBox::from_label(method_label)
                         .selected_text(&self.adjust_dialog.color_threshold_method)
                         .show_ui(ui, |ui| {
                             for method in threshold_method_labels() {
@@ -9157,7 +9145,7 @@ impl ImageUiApp {
                         })
                         .response
                         .changed();
-                    egui::ComboBox::from_label("Threshold color")
+                    let mode_changed = egui::ComboBox::from_label(mode_label)
                         .selected_text(&self.adjust_dialog.color_threshold_mode)
                         .show_ui(ui, |ui| {
                             for mode in ["Red", "White", "Black", "B&W"] {
@@ -9167,7 +9155,22 @@ impl ImageUiApp {
                                     mode,
                                 );
                             }
-                        });
+                        })
+                        .response
+                        .changed();
+                    let color_space_changed = egui::ComboBox::from_label(space_label)
+                        .selected_text(&self.adjust_dialog.color_threshold_space)
+                        .show_ui(ui, |ui| {
+                            for space in ["HSB", "RGB", "Lab", "YUV"] {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.color_threshold_space,
+                                    space.to_string(),
+                                    space,
+                                );
+                            }
+                        })
+                        .response
+                        .changed();
                     let dark_background_changed = ui
                         .checkbox(&mut self.adjust_dialog.dark_background, "Dark background")
                         .changed();
@@ -9178,6 +9181,16 @@ impl ImageUiApp {
                         let mut params = color_threshold_params(&self.adjust_dialog);
                         if let Value::Object(map) = &mut params {
                             map.insert("action".to_string(), json!("auto"));
+                        }
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.color_threshold".to_string(),
+                            params: Some(params),
+                        });
+                    } else if mode_changed {
+                        let mut params = color_threshold_params(&self.adjust_dialog);
+                        if let Value::Object(map) = &mut params {
+                            map.insert("action".to_string(), json!("filtered"));
                         }
                         actions.push(UiAction::Command {
                             window_label: self.adjust_dialog.window_label.clone(),
@@ -14491,6 +14504,10 @@ fn color_threshold_params(dialog: &AdjustDialogState) -> Value {
     })
 }
 
+fn color_threshold_choice_labels() -> [&'static str; 3] {
+    ["Thresholding method:", "Threshold color:", "Color space:"]
+}
+
 fn reset_color_threshold_bands_for_space(dialog: &mut AdjustDialogState) {
     dialog.hue_min = 0.0;
     dialog.hue_max = 255.0;
@@ -15505,11 +15522,11 @@ mod tests {
         ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState, ZoomCommand,
         add_selection_to_overlay, adjust_histogram, apply_overlay_visibility, apply_zoom_command,
         auto_contrast_range, binary_morphology_params, build_frame, canonical_json,
-        centered_circular_roi, color_threshold_auto_ranges, color_threshold_macro_text,
-        combine_stack_datasets, compute_initial_viewport_size, compute_viewer_frame,
-        concatenate_stack_datasets, coordinates_dialog_is_stack, create_circular_masks_dataset,
-        dominant_scroll_component, effective_scroll_delta, first_report_line,
-        flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
+        centered_circular_roi, color_threshold_auto_ranges, color_threshold_choice_labels,
+        color_threshold_macro_text, combine_stack_datasets, compute_initial_viewport_size,
+        compute_viewer_frame, concatenate_stack_datasets, coordinates_dialog_is_stack,
+        create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
+        first_report_line, flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
         function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
         imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
         init_coordinates_dialog, initialize_view_to_open_state, insert_stack_dataset,
@@ -18959,6 +18976,14 @@ mod tests {
         assert!(dialog.hue_pass);
         assert!(dialog.saturation_pass);
         assert!(dialog.brightness_pass);
+    }
+
+    #[test]
+    fn color_threshold_choice_labels_follow_imagej_order() {
+        assert_eq!(
+            color_threshold_choice_labels(),
+            ["Thresholding method:", "Threshold color:", "Color space:"]
+        );
     }
 
     #[test]
