@@ -32,7 +32,7 @@ use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
 use crate::runtime::AppContext;
 use eframe::egui;
 use image::load_from_memory;
-use ndarray::{ArrayD, Axis, IxDyn, stack};
+use ndarray::{ArrayD, Axis, Dimension, IxDyn, stack};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -3897,9 +3897,15 @@ impl ImageUiApp {
             .and_then(Value::as_bool)
             .unwrap_or(true)
         {
-            return Some(command_registry::CommandExecuteResult::blocked(
-                "Scale current-slice in-place mode is not yet supported",
-            ));
+            return Some(
+                match self.resize_current_slice_in_place(window_label, params) {
+                    Ok(payload) => command_registry::CommandExecuteResult::with_payload(
+                        "resize current slice applied",
+                        payload,
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                },
+            );
         }
 
         Some(
@@ -3962,6 +3968,42 @@ impl ImageUiApp {
         )));
         let label = self.create_viewer(path, ViewerImageSource::Dataset(Arc::new(output.dataset)));
         Ok(json!({ "window": label, "op": "image.resize", "slice": z }))
+    }
+
+    fn resize_current_slice_in_place(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let viewer = self
+            .viewers_ui
+            .get(&target)
+            .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+        let (z, t) = (viewer.z, viewer.t);
+        let dataset = self
+            .state
+            .label_to_session
+            .get(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?
+            .committed_source
+            .to_dataset()?;
+        let scaled = scale_current_zt_slice_in_place(dataset.as_ref(), z, t, params)?;
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        session.commit_dataset(Arc::new(scaled));
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.last_generation = 0;
+            viewer.last_request = None;
+            viewer.status_message = format!("Current slice {} scaled", z + 1);
+        }
+        Ok(json!({ "window": target, "op": "image.resize", "slice": z }))
     }
 
     fn handle_color_threshold_command(
@@ -12413,6 +12455,135 @@ fn plane_dim(source: &Dim, axis: AxisKind, size: usize) -> Dim {
     dim
 }
 
+fn scale_current_zt_slice_in_place(
+    dataset: &DatasetF32,
+    z: usize,
+    t: usize,
+    params: &Value,
+) -> Result<DatasetF32, String> {
+    if dataset.ndim() < 2 {
+        return Err("dataset must have at least two dimensions".to_string());
+    }
+    let y_axis = dataset
+        .axis_index(AxisKind::Y)
+        .unwrap_or(0)
+        .min(dataset.ndim() - 1);
+    let x_axis = dataset
+        .axis_index(AxisKind::X)
+        .unwrap_or(1.min(dataset.ndim() - 1));
+    if x_axis == y_axis {
+        return Err("could not infer distinct X/Y axes".to_string());
+    }
+    let z_axis = dataset.axis_index(AxisKind::Z);
+    let t_axis = dataset.axis_index(AxisKind::Time);
+    let width = dataset.shape()[x_axis];
+    let height = dataset.shape()[y_axis];
+    let scaled_width = params
+        .get("width")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(width)
+        .max(1);
+    let scaled_height = params
+        .get("height")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(height)
+        .max(1);
+    let x_scale = scaled_width as f32 / width as f32;
+    let y_scale = scaled_height as f32 / height as f32;
+    let fill = params
+        .get("fill")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32)
+        .unwrap_or(0.0);
+    let nearest = params
+        .get("interpolation")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method.eq_ignore_ascii_case("none"));
+    let original = dataset.data.clone();
+    let mut values = original.iter().copied().collect::<Vec<_>>();
+    for (flat_index, (index, _)) in original.indexed_iter().enumerate() {
+        let z_matches = z_axis
+            .map(|axis| index[axis] == z.min(dataset.shape()[axis].saturating_sub(1)))
+            .unwrap_or(true);
+        let t_matches = t_axis
+            .map(|axis| index[axis] == t.min(dataset.shape()[axis].saturating_sub(1)))
+            .unwrap_or(true);
+        if !z_matches || !t_matches {
+            continue;
+        }
+        let src_x = index[x_axis] as f32 / x_scale;
+        let src_y = index[y_axis] as f32 / y_scale;
+        values[flat_index] = sample_scaled_dataset_value(
+            &original,
+            index.slice(),
+            x_axis,
+            y_axis,
+            width,
+            height,
+            src_x,
+            src_y,
+            fill,
+            nearest,
+        );
+    }
+    let data = ArrayD::from_shape_vec(IxDyn(dataset.shape()), values)
+        .map_err(|error| format!("scaled slice shape error: {error}"))?;
+    Dataset::new(data, dataset.metadata.clone()).map_err(|error| error.to_string())
+}
+
+fn sample_scaled_dataset_value(
+    data: &ArrayD<f32>,
+    base_index: &[usize],
+    x_axis: usize,
+    y_axis: usize,
+    width: usize,
+    height: usize,
+    src_x: f32,
+    src_y: f32,
+    fill: f32,
+    nearest: bool,
+) -> f32 {
+    if src_x < 0.0 || src_y < 0.0 || src_x >= width as f32 || src_y >= height as f32 {
+        return fill;
+    }
+    if nearest {
+        let x = src_x.round() as usize;
+        let y = src_y.round() as usize;
+        if x >= width || y >= height {
+            return fill;
+        }
+        return dataset_value_at_xy(data, base_index, x_axis, y_axis, x, y);
+    }
+
+    let x0 = src_x.floor() as usize;
+    let y0 = src_y.floor() as usize;
+    let x1 = (x0 + 1).min(width.saturating_sub(1));
+    let y1 = (y0 + 1).min(height.saturating_sub(1));
+    let wx = src_x - x0 as f32;
+    let wy = src_y - y0 as f32;
+    let top = dataset_value_at_xy(data, base_index, x_axis, y_axis, x0, y0) * (1.0 - wx)
+        + dataset_value_at_xy(data, base_index, x_axis, y_axis, x1, y0) * wx;
+    let bottom = dataset_value_at_xy(data, base_index, x_axis, y_axis, x0, y1) * (1.0 - wx)
+        + dataset_value_at_xy(data, base_index, x_axis, y_axis, x1, y1) * wx;
+    top * (1.0 - wy) + bottom * wy
+}
+
+fn dataset_value_at_xy(
+    data: &ArrayD<f32>,
+    base_index: &[usize],
+    x_axis: usize,
+    y_axis: usize,
+    x: usize,
+    y: usize,
+) -> f32 {
+    let mut index = base_index.to_vec();
+    index[x_axis] = x;
+    index[y_axis] = y;
+    data[IxDyn(&index)]
+}
+
 fn roi_stroke_width(line_width_px: f32, selected: bool) -> f32 {
     let width = if line_width_px.is_finite() {
         line_width_px
@@ -19057,13 +19228,14 @@ mod tests {
     }
 
     #[test]
-    fn adjust_size_current_slice_in_place_is_blocked_until_supported() {
+    fn adjust_size_process_current_slice_in_place_like_imagej() {
         let label = "viewer-1".to_string();
-        let data = Array::from_shape_vec(IxDyn(&[1, 1, 2]), vec![10.0, 20.0]).expect("shape");
+        let data =
+            Array::from_shape_vec(IxDyn(&[1, 2, 2]), vec![10.0, 30.0, 20.0, 40.0]).expect("shape");
         let metadata = Metadata {
             dims: vec![
                 Dim::new(AxisKind::Y, 1),
-                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::X, 2),
                 Dim::new(AxisKind::Z, 2),
             ],
             pixel_type: PixelType::U8,
@@ -19078,13 +19250,18 @@ mod tests {
                 ViewerImageSource::Dataset(dataset),
             ),
         );
+        let mut viewer = ViewerUiState::new(&label, "scale-current-slice-in-place".to_string());
+        viewer.z = 1;
+        app.viewers_ui.insert(label.clone(), viewer);
 
         let result = app.dispatch_command(
             &label,
             "image.adjust.size",
             Some(json!({
-                "width": 2,
-                "height": 2,
+                "width": 1,
+                "height": 1,
+                "interpolation": "None",
+                "fill": 0.0,
                 "process_stack": false,
                 "create_new_window": false,
             })),
@@ -19092,9 +19269,17 @@ mod tests {
 
         assert!(matches!(
             result.status,
-            crate::ui::command_registry::CommandExecuteStatus::Blocked
+            crate::ui::command_registry::CommandExecuteStatus::Ok
         ));
-        assert!(result.message.contains("current-slice in-place"));
+        assert_eq!(app.state.label_to_session.len(), 1);
+        let output = app.state.label_to_session[&label]
+            .committed_dataset()
+            .expect("dataset");
+        assert_eq!(output.shape(), &[1, 2, 2]);
+        assert_eq!(
+            output.data.iter().copied().collect::<Vec<_>>(),
+            vec![10.0, 30.0, 20.0, 0.0]
+        );
     }
 
     #[test]
