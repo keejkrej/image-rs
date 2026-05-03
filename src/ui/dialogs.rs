@@ -265,18 +265,24 @@ impl Default for ThresholdSetDialogState {
 #[derive(Debug, Clone)]
 pub(super) struct ApplyLutDialogState {
     pub(super) open: bool,
+    pub(super) stack_prompt: bool,
     pub(super) window_label: String,
     pub(super) command_id: String,
     pub(super) params: serde_json::Value,
+    pub(super) slice_params: serde_json::Value,
+    pub(super) stack_slices: usize,
 }
 
 impl Default for ApplyLutDialogState {
     fn default() -> Self {
         Self {
             open: false,
+            stack_prompt: false,
             window_label: String::new(),
             command_id: String::new(),
             params: serde_json::Value::Null,
+            slice_params: serde_json::Value::Null,
+            stack_slices: 0,
         }
     }
 }

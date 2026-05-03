@@ -561,6 +561,18 @@ impl Operation for IntensityWindowOp {
                     required: false,
                     kind: "integer".to_string(),
                 },
+                ParamSpec {
+                    name: "slice".to_string(),
+                    description: "Optional zero-based Z slice index to window.".to_string(),
+                    required: false,
+                    kind: "integer".to_string(),
+                },
+                ParamSpec {
+                    name: "time".to_string(),
+                    description: "Optional zero-based time frame index to window.".to_string(),
+                    required: false,
+                    kind: "integer".to_string(),
+                },
             ],
         }
     }
@@ -599,11 +611,22 @@ impl Operation for IntensityWindowOp {
         } else {
             None
         };
+        let z_slice = optional_axis_position(dataset, params, "slice", AxisKind::Z)?;
+        let time_frame = optional_axis_position(dataset, params, "time", AxisKind::Time)?;
         let output_max = pixel_type_max(dataset.metadata.pixel_type);
         let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
-        if let Some((axis, channel)) = channel_axis {
+        if channel_axis.is_some() || z_slice.is_some() || time_frame.is_some() {
             for (flat_index, (index, value)) in dataset.data.indexed_iter().enumerate() {
-                if index[axis] == channel {
+                let channel_matches = channel_axis
+                    .map(|(axis, channel)| index[axis] == channel)
+                    .unwrap_or(true);
+                let slice_matches = z_slice
+                    .map(|(axis, slice)| index[axis] == slice)
+                    .unwrap_or(true);
+                let time_matches = time_frame
+                    .map(|(axis, time)| index[axis] == time)
+                    .unwrap_or(true);
+                if channel_matches && slice_matches && time_matches {
                     values[flat_index] = window_sample(*value, low, high, output_max);
                 }
             }
@@ -617,6 +640,31 @@ impl Operation for IntensityWindowOp {
         let output_dataset = Dataset::new(windowed, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
     }
+}
+
+fn optional_axis_position(
+    dataset: &DatasetF32,
+    params: &Value,
+    key: &str,
+    axis_kind: AxisKind,
+) -> Result<Option<(usize, usize)>> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    let position = value.as_u64().map(|value| value as usize).ok_or_else(|| {
+        OpsError::InvalidParams(format!("`{key}` must be a non-negative integer"))
+    })?;
+    let axis = dataset.axis_index(axis_kind).ok_or_else(|| {
+        OpsError::UnsupportedLayout(format!("`{key}` requires a {axis_kind:?} axis"))
+    })?;
+    let axis_size = dataset.shape()[axis];
+    if position >= axis_size {
+        return Err(OpsError::InvalidParams(format!(
+            "`{key}` {position} is outside 0..{}",
+            axis_size.saturating_sub(1)
+        )));
+    }
+    Ok(Some((axis, position)))
 }
 
 fn window_sample(value: f32, low: f32, high: f32, output_max: f32) -> f32 {

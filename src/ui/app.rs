@@ -3786,6 +3786,42 @@ impl ImageUiApp {
             })
     }
 
+    fn apply_lut_dialog_state(
+        &self,
+        window_label: String,
+        command_id: String,
+        params: Value,
+    ) -> ApplyLutDialogState {
+        let target = self
+            .current_viewer_label(&window_label)
+            .unwrap_or(&window_label)
+            .to_string();
+        let stack_slices = self
+            .state
+            .label_to_session
+            .get(&target)
+            .filter(|session| session.committed_summary.channels <= 1)
+            .map(|session| session.committed_summary.z_slices.max(1))
+            .unwrap_or(1);
+        let mut slice_params = params.clone();
+        if stack_slices > 1 {
+            if let Some(viewer) = self.viewers_ui.get(&target)
+                && let Some(map) = slice_params.as_object_mut()
+            {
+                map.insert("slice".to_string(), json!(viewer.z));
+            }
+        }
+        ApplyLutDialogState {
+            open: true,
+            stack_prompt: false,
+            window_label,
+            command_id,
+            params,
+            slice_params,
+            stack_slices,
+        }
+    }
+
     fn handle_color_threshold_command(
         &mut self,
         window_label: &str,
@@ -8473,12 +8509,11 @@ impl ImageUiApp {
                                     "apply": true,
                                 });
                                 if self.apply_lut_needs_confirmation(&window_label) {
-                                    self.apply_lut_dialog = ApplyLutDialogState {
-                                        open: true,
+                                    self.apply_lut_dialog = self.apply_lut_dialog_state(
                                         window_label,
                                         command_id,
                                         params,
-                                    };
+                                    );
                                 } else {
                                     actions.push(UiAction::Command {
                                         window_label,
@@ -8595,12 +8630,11 @@ impl ImageUiApp {
                                     "apply": true,
                                 });
                                 if self.apply_lut_needs_confirmation(&window_label) {
-                                    self.apply_lut_dialog = ApplyLutDialogState {
-                                        open: true,
+                                    self.apply_lut_dialog = self.apply_lut_dialog_state(
                                         window_label,
                                         command_id,
                                         params,
-                                    };
+                                    );
                                 } else {
                                     actions.push(UiAction::Command {
                                         window_label,
@@ -8702,12 +8736,11 @@ impl ImageUiApp {
                                 let window_label = self.adjust_dialog.window_label.clone();
                                 let command_id = "image.adjust.color_balance".to_string();
                                 if self.apply_lut_needs_confirmation(&window_label) {
-                                    self.apply_lut_dialog = ApplyLutDialogState {
-                                        open: true,
+                                    self.apply_lut_dialog = self.apply_lut_dialog_state(
                                         window_label,
                                         command_id,
                                         params,
-                                    };
+                                    );
                                 } else {
                                     actions.push(UiAction::Command {
                                         window_label,
@@ -9399,28 +9432,63 @@ impl ImageUiApp {
         }
         let mut open = self.apply_lut_dialog.open;
         let mut ok = false;
+        let mut yes = false;
+        let mut no = false;
         let mut cancel = false;
-        egui::Window::new("Apply Lookup Table?")
+        let title = if self.apply_lut_dialog.stack_prompt {
+            "Entire Stack?"
+        } else {
+            "Apply Lookup Table?"
+        };
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label("WARNING: the pixel values will");
-                ui.label("change if you click \"OK\".");
-                ui.horizontal(|ui| {
-                    if ui.button("OK").clicked() {
-                        ok = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
+                if self.apply_lut_dialog.stack_prompt {
+                    ui.label(format!(
+                        "Apply LUT to all {} stack slices?",
+                        self.apply_lut_dialog.stack_slices
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            yes = true;
+                        }
+                        if ui.button("No").clicked() {
+                            no = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                } else {
+                    ui.label("WARNING: the pixel values will");
+                    ui.label("change if you click \"OK\".");
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            ok = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
             });
 
-        if ok {
+        if ok && self.apply_lut_dialog.stack_slices > 1 {
+            self.apply_lut_dialog.stack_prompt = true;
+            self.apply_lut_dialog.open = open;
+        } else if ok || yes {
             actions.push(UiAction::Command {
                 window_label: self.apply_lut_dialog.window_label.clone(),
                 command_id: self.apply_lut_dialog.command_id.clone(),
                 params: Some(self.apply_lut_dialog.params.clone()),
+            });
+            self.apply_lut_dialog.open = false;
+        } else if no {
+            actions.push(UiAction::Command {
+                window_label: self.apply_lut_dialog.window_label.clone(),
+                command_id: self.apply_lut_dialog.command_id.clone(),
+                params: Some(self.apply_lut_dialog.slice_params.clone()),
             });
             self.apply_lut_dialog.open = false;
         } else if cancel {
@@ -17906,6 +17974,44 @@ mod tests {
 
         assert!(app.apply_lut_needs_confirmation(&byte_label));
         assert!(!app.apply_lut_needs_confirmation(&float_label));
+    }
+
+    #[test]
+    fn adjust_apply_lut_stack_prompt_can_target_current_slice_like_imagej() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(IxDyn(&[1, 1, 2]), vec![10.0, 20.0]).expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Z, 2),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/apply-lut-stack.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        let mut viewer = ViewerUiState::new(&label, "apply-lut-stack".to_string());
+        viewer.z = 1;
+        app.viewers_ui.insert(label.clone(), viewer);
+
+        let state = app.apply_lut_dialog_state(
+            label.clone(),
+            "image.adjust.brightness".to_string(),
+            json!({"min": 10.0, "max": 20.0, "apply": true}),
+        );
+
+        assert!(state.open);
+        assert_eq!(state.stack_slices, 2);
+        assert_eq!(state.params.get("slice"), None);
+        assert_eq!(state.slice_params.get("slice"), Some(&json!(1)));
     }
 
     #[test]

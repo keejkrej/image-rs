@@ -4971,6 +4971,51 @@ fn window_operation_can_target_one_channel() {
 }
 
 #[test]
+fn window_operation_can_target_one_stack_slice() {
+    let data = Array::from_shape_vec((1, 2, 2), vec![0.0, 10.0, 20.0, 30.0])
+        .expect("shape")
+        .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Z, 2),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "intensity.window",
+        &dataset,
+        &json!({
+            "low": 10.0,
+            "high": 30.0,
+            "slice": 1
+        }),
+    )
+    .expect("window slice");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 0.0, 20.0, 255.0]
+    );
+
+    let error = execute_operation(
+        "intensity.window",
+        &dataset,
+        &json!({
+            "low": 10.0,
+            "high": 30.0,
+            "slice": 2
+        }),
+    )
+    .expect_err("out of range slice");
+    assert!(error.to_string().contains("slice"));
+}
+
+#[test]
 fn otsu_threshold_returns_measurement() {
     let dataset = test_dataset(vec![0.05, 0.1, 0.2, 0.8, 0.9, 0.95], (2, 3));
     let output = execute_operation("threshold.otsu", &dataset, &json!({})).expect("otsu");
