@@ -12,6 +12,9 @@ use super::{
 pub struct ImageConvertOp;
 
 #[derive(Debug, Clone, Copy)]
+pub struct ImageColorThresholdOp;
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImageResizeOp;
 
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +178,64 @@ impl Operation for ImageConvertOp {
     }
 }
 
+impl Operation for ImageColorThresholdOp {
+    fn name(&self) -> &'static str {
+        "image.color_threshold"
+    }
+
+    fn schema(&self) -> OpSchema {
+        OpSchema {
+            name: self.name().to_string(),
+            description: "Apply ImageJ-style Color Threshold ranges to an RGB channel image."
+                .to_string(),
+            params: vec![
+                ParamSpec {
+                    name: "color_space".to_string(),
+                    description: "HSB or RGB.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "hue".to_string(),
+                    description: "Hue/Red range object with min, max, and pass fields.".to_string(),
+                    required: false,
+                    kind: "object".to_string(),
+                },
+                ParamSpec {
+                    name: "saturation".to_string(),
+                    description: "Saturation/Green range object with min, max, and pass fields."
+                        .to_string(),
+                    required: false,
+                    kind: "object".to_string(),
+                },
+                ParamSpec {
+                    name: "brightness".to_string(),
+                    description: "Brightness/Blue range object with min, max, and pass fields."
+                        .to_string(),
+                    required: false,
+                    kind: "object".to_string(),
+                },
+                ParamSpec {
+                    name: "output".to_string(),
+                    description: "Output style: mask or filtered.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+                ParamSpec {
+                    name: "mode".to_string(),
+                    description: "Filtered threshold color: Red, White, Black, or B&W.".to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        Ok(OpOutput::dataset_only(color_threshold(dataset, params)?))
+    }
+}
+
 impl Operation for ImageResizeOp {
     fn name(&self) -> &'static str {
         "image.resize"
@@ -187,29 +248,113 @@ impl Operation for ImageResizeOp {
             params: vec![
                 ParamSpec {
                     name: "width".to_string(),
-                    description: "Target width.".to_string(),
-                    required: true,
+                    description: "Target width; derived from height when constrain is true."
+                        .to_string(),
+                    required: false,
                     kind: "int".to_string(),
                 },
                 ParamSpec {
                     name: "height".to_string(),
-                    description: "Target height.".to_string(),
-                    required: true,
+                    description: "Target height; derived from width when constrain is true."
+                        .to_string(),
+                    required: false,
                     kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "depth".to_string(),
+                    description: "Target Z depth for stacks or hyperstacks.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "frames".to_string(),
+                    description: "Target time frame count for hyperstacks.".to_string(),
+                    required: false,
+                    kind: "int".to_string(),
+                },
+                ParamSpec {
+                    name: "average_when_downsizing".to_string(),
+                    description: "Use ImageJ-style area averaging when reducing X/Y size."
+                        .to_string(),
+                    required: false,
+                    kind: "bool".to_string(),
+                },
+                ParamSpec {
+                    name: "interpolation".to_string(),
+                    description: "ImageJ interpolation method: None, Bilinear, or Bicubic."
+                        .to_string(),
+                    required: false,
+                    kind: "string".to_string(),
                 },
             ],
         }
     }
 
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
-        let width = get_optional_usize(params, "width", 0);
-        let height = get_optional_usize(params, "height", 0);
+        let x_axis = axis_index(dataset, AxisKind::X)?;
+        let y_axis = axis_index(dataset, AxisKind::Y)?;
+        let source_width = dataset.shape()[x_axis];
+        let source_height = dataset.shape()[y_axis];
+        let mut width = get_optional_usize(params, "width", 0);
+        let mut height = get_optional_usize(params, "height", 0);
+        let constrain = params
+            .get("constrain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if constrain && width == 0 && height > 0 {
+            width = ((height as f32) * (source_width as f32 / source_height as f32))
+                .round()
+                .max(1.0) as usize;
+        } else if constrain && height == 0 && width > 0 {
+            height = ((width as f32) * (source_height as f32 / source_width as f32))
+                .round()
+                .max(1.0) as usize;
+        }
         if width == 0 || height == 0 {
             return Err(OpsError::InvalidParams(
-                "`width` and `height` must be > 0".to_string(),
+                "`width` and `height` must be > 0 unless one is derived with `constrain`"
+                    .to_string(),
             ));
         }
-        Ok(OpOutput::dataset_only(resize_xy(dataset, width, height)?))
+        let average_when_downsizing = params
+            .get("average_when_downsizing")
+            .or_else(|| params.get("average"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let interpolation = params
+            .get("interpolation")
+            .and_then(Value::as_str)
+            .map(ResizeInterpolation::parse)
+            .transpose()?
+            .unwrap_or(ResizeInterpolation::Bilinear);
+        let mut output = resize_xy(
+            dataset,
+            width,
+            height,
+            interpolation,
+            average_when_downsizing,
+        )?;
+        if let Some(depth) = params.get("depth").and_then(Value::as_u64) {
+            output = resize_optional_axis(
+                &output,
+                AxisKind::Z,
+                depth as usize,
+                interpolation,
+                average_when_downsizing,
+                "depth",
+            )?;
+        }
+        if let Some(frames) = params.get("frames").and_then(Value::as_u64) {
+            output = resize_optional_axis(
+                &output,
+                AxisKind::Time,
+                frames as usize,
+                interpolation,
+                average_when_downsizing,
+                "frames",
+            )?;
+        }
+        Ok(OpOutput::dataset_only(output))
     }
 }
 
@@ -255,7 +400,7 @@ impl Operation for ImageScaleOp {
         let height = ((dataset.shape()[y_axis] as f32) * y_scale)
             .round()
             .max(1.0) as usize;
-        let mut output = resize_xy(dataset, width, height)?;
+        let mut output = resize_xy(dataset, width, height, ResizeInterpolation::Bilinear, false)?;
         if let Some(spacing) = &mut output.metadata.dims[x_axis].spacing {
             *spacing /= x_scale;
         }
@@ -294,6 +439,14 @@ impl Operation for ImageCanvasResizeOp {
                     required: false,
                     kind: "float".to_string(),
                 },
+                ParamSpec {
+                    name: "position".to_string(),
+                    description:
+                        "ImageJ canvas anchor: Top-Left, Top-Center, Top-Right, Center-Left, Center, Center-Right, Bottom-Left, Bottom-Center, or Bottom-Right."
+                            .to_string(),
+                    required: false,
+                    kind: "string".to_string(),
+                },
             ],
         }
     }
@@ -307,8 +460,14 @@ impl Operation for ImageCanvasResizeOp {
             ));
         }
         let fill = get_optional_f32(params, "fill", 0.0);
+        let position = CanvasPosition::parse(
+            params
+                .get("position")
+                .and_then(Value::as_str)
+                .unwrap_or("Center"),
+        )?;
         Ok(OpOutput::dataset_only(canvas_resize_xy(
-            dataset, width, height, fill,
+            dataset, width, height, fill, position,
         )?))
     }
 }
@@ -441,10 +600,75 @@ impl Operation for ImageCoordinatesOp {
         let mut metadata = dataset.metadata.clone();
         let x_axis = axis_index(dataset, AxisKind::X)?;
         let y_axis = axis_index(dataset, AxisKind::Y)?;
-        apply_coordinate_bounds(&mut metadata, x_axis, params, "left", "right", "x")?;
-        apply_coordinate_bounds(&mut metadata, y_axis, params, "top", "bottom", "y")?;
-        if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
-            apply_coordinate_bounds(&mut metadata, z_axis, params, "front", "back", "z")?;
+        let mode = params
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("bounds")
+            .trim()
+            .to_ascii_lowercase();
+        if mode == "point" {
+            apply_coordinate_point(
+                &mut metadata,
+                x_axis,
+                params,
+                "point_x_coordinate",
+                "point_x_pixel",
+                "x",
+            )?;
+            apply_coordinate_point(
+                &mut metadata,
+                y_axis,
+                params,
+                "point_y_coordinate",
+                "point_y_pixel",
+                "y",
+            )?;
+            if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
+                apply_coordinate_point(
+                    &mut metadata,
+                    z_axis,
+                    params,
+                    "point_z_coordinate",
+                    "point_z_pixel",
+                    "z",
+                )?;
+            }
+        } else {
+            apply_coordinate_bounds(
+                &mut metadata,
+                x_axis,
+                params,
+                "left",
+                "right",
+                "x_pixel_start",
+                "x_pixel_size",
+                "x",
+                false,
+            )?;
+            apply_coordinate_bounds(
+                &mut metadata,
+                y_axis,
+                params,
+                "top",
+                "bottom",
+                "y_pixel_start",
+                "y_pixel_size",
+                "y",
+                true,
+            )?;
+            if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
+                apply_coordinate_bounds(
+                    &mut metadata,
+                    z_axis,
+                    params,
+                    "front",
+                    "back",
+                    "z_pixel_start",
+                    "z_pixel_size",
+                    "z",
+                    false,
+                )?;
+            }
         }
 
         apply_coordinate_units(
@@ -2190,7 +2414,366 @@ fn convert_to_grayscale(dataset: &DatasetF32) -> Result<DatasetF32> {
     Ok(Dataset::new(data, metadata)?)
 }
 
-fn resize_xy(dataset: &DatasetF32, width: usize, height: usize) -> Result<DatasetF32> {
+#[derive(Debug, Clone, Copy)]
+struct ColorBand {
+    min: f32,
+    max: f32,
+    pass: bool,
+}
+
+impl ColorBand {
+    fn from_params(params: &Value, key: &str) -> Self {
+        let source = params.get(key).unwrap_or(&Value::Null);
+        let min = source
+            .get("min")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(0.0)
+            .clamp(0.0, 255.0);
+        let max = source
+            .get("max")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(255.0)
+            .clamp(0.0, 255.0);
+        let pass = source.get("pass").and_then(Value::as_bool).unwrap_or(true);
+        Self {
+            min: min.min(max),
+            max: min.max(max),
+            pass,
+        }
+    }
+
+    fn accepts(self, value: f32) -> bool {
+        let in_range = value >= self.min && value <= self.max;
+        if self.pass { in_range } else { !in_range }
+    }
+}
+
+fn color_threshold(dataset: &DatasetF32, params: &Value) -> Result<DatasetF32> {
+    let channel_axis = axis_index(dataset, AxisKind::Channel)?;
+    let channel_count = dataset.shape()[channel_axis];
+    if channel_count < 3 {
+        return Err(OpsError::UnsupportedLayout(format!(
+            "Color Threshold expects at least 3 channels, found {channel_count}"
+        )));
+    }
+
+    let output_mode = params
+        .get("output")
+        .or_else(|| params.get("target"))
+        .and_then(Value::as_str)
+        .unwrap_or("mask")
+        .to_ascii_lowercase();
+    let color_space = params
+        .get("color_space")
+        .or_else(|| params.get("space"))
+        .and_then(Value::as_str)
+        .unwrap_or("HSB")
+        .to_string();
+    let color_space = color_threshold_space_key(&color_space);
+    let bands = [
+        ColorBand::from_params(params, "hue"),
+        ColorBand::from_params(params, "saturation"),
+        ColorBand::from_params(params, "brightness"),
+    ];
+    let mut output_shape = dataset.shape().to_vec();
+    output_shape.remove(channel_axis);
+    let output_len: usize = output_shape.iter().product();
+    let mut selected = vec![false; output_len];
+    let mut write_at = 0usize;
+
+    iterate_indices(&output_shape, |coord| {
+        let mut source = vec![0usize; dataset.ndim()];
+        let mut out_axis = 0usize;
+        for (axis, value) in source.iter_mut().enumerate() {
+            if axis == channel_axis {
+                continue;
+            }
+            *value = coord[out_axis];
+            out_axis += 1;
+        }
+        let (r, g, b) = rgb_components_255(dataset, &source, channel_axis);
+        let components = match color_space.as_str() {
+            "hsb" => rgb_to_hsb_255(r, g, b),
+            "rgb" => [r, g, b],
+            "lab" => rgb_to_lab_255(r, g, b),
+            "yuv" => rgb_to_yuv_255(r, g, b),
+            _ => {
+                selected[write_at] = false;
+                write_at += 1;
+                return;
+            }
+        };
+        selected[write_at] = bands
+            .iter()
+            .zip(components)
+            .all(|(band, component)| band.accepts(component));
+        write_at += 1;
+    });
+
+    if !matches!(color_space.as_str(), "hsb" | "rgb" | "lab" | "yuv") {
+        return Err(OpsError::InvalidParams(format!(
+            "unsupported color threshold space `{color_space}`"
+        )));
+    }
+    if matches!(output_mode.as_str(), "filtered" | "filter" | "rgb") {
+        return color_threshold_filtered_dataset(dataset, params, channel_axis, &selected);
+    }
+    if !matches!(output_mode.as_str(), "mask" | "threshold") {
+        return Err(OpsError::InvalidParams(format!(
+            "unsupported color threshold output `{output_mode}`"
+        )));
+    }
+
+    let output = selected
+        .into_iter()
+        .map(|selected| if selected { 255.0 } else { 0.0 })
+        .collect::<Vec<_>>();
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build color threshold mask".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims.remove(channel_axis);
+    metadata.pixel_type = PixelType::U8;
+    metadata.channel_names.clear();
+    metadata
+        .extras
+        .insert("color_threshold_space".to_string(), json!(color_space));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn color_threshold_space_key(space: &str) -> String {
+    match space
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cielab" | "lab" => "lab".to_string(),
+        "hsb" => "hsb".to_string(),
+        "rgb" => "rgb".to_string(),
+        "yuv" => "yuv".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn color_threshold_filtered_dataset(
+    dataset: &DatasetF32,
+    params: &Value,
+    channel_axis: usize,
+    selected: &[bool],
+) -> Result<DatasetF32> {
+    let mut values = dataset
+        .data
+        .iter()
+        .copied()
+        .map(|value| convert_sample_value(value, dataset.metadata.pixel_type, PixelType::U8))
+        .collect::<Vec<_>>();
+    let output_shape = dataset.shape().to_vec();
+    let mut color = color_threshold_mode_rgb(params);
+    let mut background = None;
+    if color_threshold_mode_key(params) == "b&w" {
+        let black_background = params
+            .get("black_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        color = if black_background {
+            [255.0, 255.0, 255.0]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        background = Some(if black_background {
+            [0.0, 0.0, 0.0]
+        } else {
+            [255.0, 255.0, 255.0]
+        });
+    }
+
+    let mut spatial_shape = output_shape.clone();
+    spatial_shape.remove(channel_axis);
+    let mut pixel_at = 0usize;
+    iterate_indices(&spatial_shape, |coord| {
+        let paint = if selected[pixel_at] {
+            Some(color)
+        } else {
+            background
+        };
+        if let Some(rgb) = paint {
+            let mut source = vec![0usize; output_shape.len()];
+            let mut out_axis = 0usize;
+            for (axis, value) in source.iter_mut().enumerate() {
+                if axis == channel_axis {
+                    continue;
+                }
+                *value = coord[out_axis];
+                out_axis += 1;
+            }
+            for (channel, component) in rgb.into_iter().enumerate() {
+                source[channel_axis] = channel;
+                let flat = linear_index(&source, &output_shape);
+                values[flat] = component;
+            }
+        }
+        pixel_at += 1;
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), values).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build filtered color threshold image".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.pixel_type = PixelType::U8;
+    metadata
+        .extras
+        .insert("color_threshold_output".to_string(), json!("filtered"));
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn color_threshold_mode_key(params: &Value) -> String {
+    params
+        .get("mode")
+        .or_else(|| params.get("threshold_color"))
+        .and_then(Value::as_str)
+        .unwrap_or("Red")
+        .to_ascii_lowercase()
+}
+
+fn color_threshold_mode_rgb(params: &Value) -> [f32; 3] {
+    match color_threshold_mode_key(params).as_str() {
+        "white" => [255.0, 255.0, 255.0],
+        "black" | "b&w" | "black & white" | "black_and_white" => [0.0, 0.0, 0.0],
+        _ => [255.0, 0.0, 0.0],
+    }
+}
+
+fn linear_index(index: &[usize], shape: &[usize]) -> usize {
+    let mut flat = 0usize;
+    let mut stride = 1usize;
+    for (value, size) in index.iter().zip(shape).rev() {
+        flat += value * stride;
+        stride *= size;
+    }
+    flat
+}
+
+fn rgb_components_255(
+    dataset: &DatasetF32,
+    source: &[usize],
+    channel_axis: usize,
+) -> (f32, f32, f32) {
+    let mut index = source.to_vec();
+    index[channel_axis] = 0;
+    let r = component_to_u8_range(dataset.data[IxDyn(&index)], dataset.metadata.pixel_type);
+    index[channel_axis] = 1;
+    let g = component_to_u8_range(dataset.data[IxDyn(&index)], dataset.metadata.pixel_type);
+    index[channel_axis] = 2;
+    let b = component_to_u8_range(dataset.data[IxDyn(&index)], dataset.metadata.pixel_type);
+    (r, g, b)
+}
+
+fn component_to_u8_range(value: f32, pixel_type: PixelType) -> f32 {
+    match pixel_type {
+        PixelType::U8 => value.clamp(0.0, 255.0),
+        PixelType::U16 => (value.clamp(0.0, 65_535.0) / 257.0).round(),
+        PixelType::F32 if value <= 1.0 => (value.clamp(0.0, 1.0) * 255.0).round(),
+        PixelType::F32 => value.clamp(0.0, 255.0),
+    }
+}
+
+fn rgb_to_hsb_255(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let r = r / 255.0;
+    let g = g / 255.0;
+    let b = b / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - r).abs() <= f32::EPSILON {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if (max - g).abs() <= f32::EPSILON {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let hue = if hue < 0.0 { hue + 360.0 } else { hue };
+    let saturation = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
+    [hue / 360.0 * 255.0, saturation * 255.0, max * 255.0]
+}
+
+fn rgb_to_yuv_255(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let y = 0.299 * r + 0.587 * g + 0.114 * b;
+    let u = (0.492 * (b - y) + 128.0).clamp(0.0, 255.0);
+    let v = (0.877 * (r - y) + 128.0).clamp(0.0, 255.0);
+    [y.clamp(0.0, 255.0), u, v]
+}
+
+fn rgb_to_lab_255(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let r = srgb_to_linear(r / 255.0);
+    let g = srgb_to_linear(g / 255.0);
+    let b = srgb_to_linear(b / 255.0);
+
+    let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
+    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175 * b;
+    let z = (0.019_333_9 * r + 0.119_192 * g + 0.950_304_1 * b) / 1.088_83;
+
+    let fx = lab_pivot(x);
+    let fy = lab_pivot(y);
+    let fz = lab_pivot(z);
+    let l = (116.0 * fy - 16.0).clamp(0.0, 100.0) * 2.55;
+    let a = (500.0 * (fx - fy) + 128.0).clamp(0.0, 255.0);
+    let b = (200.0 * (fy - fz) + 128.0).clamp(0.0, 255.0);
+    [l, a, b]
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn lab_pivot(value: f32) -> f32 {
+    if value > 0.008_856 {
+        value.powf(1.0 / 3.0)
+    } else {
+        7.787 * value + 16.0 / 116.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResizeInterpolation {
+    Nearest,
+    Bilinear,
+    Bicubic,
+}
+
+impl ResizeInterpolation {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "nearest" | "nearest-neighbor" | "nearest_neighbor" => Ok(Self::Nearest),
+            "bilinear" => Ok(Self::Bilinear),
+            "bicubic" => Ok(Self::Bicubic),
+            other => Err(OpsError::InvalidParams(format!(
+                "unsupported resize interpolation `{other}`"
+            ))),
+        }
+    }
+}
+
+fn resize_xy(
+    dataset: &DatasetF32,
+    width: usize,
+    height: usize,
+    interpolation: ResizeInterpolation,
+    average_when_downsizing: bool,
+) -> Result<DatasetF32> {
     let x_axis = axis_index(dataset, AxisKind::X)?;
     let y_axis = axis_index(dataset, AxisKind::Y)?;
     let mut output_shape = dataset.shape().to_vec();
@@ -2200,6 +2783,8 @@ fn resize_xy(dataset: &DatasetF32, width: usize, height: usize) -> Result<Datase
     let input_w = input_shape[x_axis].max(1);
     let input_h = input_shape[y_axis].max(1);
 
+    let use_area_average =
+        average_when_downsizing && (width < input_w || height < input_h) && width > 0 && height > 0;
     let output_len: usize = output_shape.iter().product();
     let mut output = vec![0.0_f32; output_len];
     let mut write_at = 0usize;
@@ -2216,7 +2801,28 @@ fn resize_xy(dataset: &DatasetF32, width: usize, height: usize) -> Result<Datase
             coord[y_axis] as f32 * (input_h.saturating_sub(1)) as f32
                 / (height.saturating_sub(1)) as f32
         };
-        output[write_at] = bilinear_sample(dataset, coord, x_axis, y_axis, src_x, src_y);
+        output[write_at] = if use_area_average {
+            area_average_sample(
+                dataset, coord, x_axis, y_axis, input_w, input_h, width, height,
+            )
+        } else {
+            match interpolation {
+                ResizeInterpolation::Nearest => sample_clamped(
+                    dataset,
+                    coord,
+                    x_axis,
+                    y_axis,
+                    src_x.round() as isize,
+                    src_y.round() as isize,
+                ),
+                ResizeInterpolation::Bilinear => {
+                    bilinear_sample(dataset, coord, x_axis, y_axis, src_x, src_y)
+                }
+                ResizeInterpolation::Bicubic => {
+                    bicubic_sample(dataset, coord, x_axis, y_axis, src_x, src_y)
+                }
+            }
+        };
         write_at += 1;
     });
 
@@ -2228,11 +2834,206 @@ fn resize_xy(dataset: &DatasetF32, width: usize, height: usize) -> Result<Datase
     Ok(Dataset::new(data, metadata)?)
 }
 
+fn resize_optional_axis(
+    dataset: &DatasetF32,
+    axis_kind: AxisKind,
+    target_size: usize,
+    interpolation: ResizeInterpolation,
+    average_when_downsizing: bool,
+    param_name: &str,
+) -> Result<DatasetF32> {
+    if target_size == 0 {
+        return Err(OpsError::InvalidParams(format!(
+            "`{param_name}` must be > 0"
+        )));
+    }
+    let Some(axis) = dataset.axis_index(axis_kind) else {
+        if target_size == 1 {
+            return Ok(dataset.clone());
+        }
+        return Err(OpsError::UnsupportedLayout(format!(
+            "`{param_name}` requires a {axis_kind:?} axis"
+        )));
+    };
+    if dataset.shape()[axis] == target_size {
+        return Ok(dataset.clone());
+    }
+    resize_axis(
+        dataset,
+        axis,
+        target_size,
+        interpolation,
+        average_when_downsizing,
+    )
+}
+
+fn resize_axis(
+    dataset: &DatasetF32,
+    axis: usize,
+    target_size: usize,
+    interpolation: ResizeInterpolation,
+    average_when_downsizing: bool,
+) -> Result<DatasetF32> {
+    let input_shape = dataset.shape().to_vec();
+    let input_size = input_shape[axis];
+    let mut output_shape = input_shape.clone();
+    output_shape[axis] = target_size;
+    let output_len: usize = output_shape.iter().product();
+    let mut output = vec![0.0_f32; output_len];
+    let use_area_average = average_when_downsizing && target_size < input_size;
+
+    let mut write_at = 0usize;
+    iterate_indices(&output_shape, |coord| {
+        output[write_at] = if use_area_average {
+            axis_area_average_sample(dataset, coord, axis, input_size, target_size)
+        } else {
+            let src = if target_size == 1 {
+                0.0
+            } else {
+                coord[axis] as f32 * (input_size.saturating_sub(1)) as f32
+                    / (target_size.saturating_sub(1)) as f32
+            };
+            match interpolation {
+                ResizeInterpolation::Nearest => {
+                    axis_sample_clamped(dataset, coord, axis, src.round() as isize)
+                }
+                ResizeInterpolation::Bilinear => axis_linear_sample(dataset, coord, axis, src),
+                ResizeInterpolation::Bicubic => axis_cubic_sample(dataset, coord, axis, src),
+            }
+        };
+        write_at += 1;
+    });
+
+    let data = ArrayD::from_shape_vec(IxDyn(&output_shape), output).map_err(|_| {
+        OpsError::UnsupportedLayout("failed to build axis-resized dataset".to_string())
+    })?;
+    let mut metadata = dataset.metadata.clone();
+    metadata.dims[axis].size = target_size;
+    if let Some(spacing) = &mut metadata.dims[axis].spacing {
+        *spacing *= input_size as f32 / target_size as f32;
+    }
+    Ok(Dataset::new(data, metadata)?)
+}
+
+fn axis_sample_clamped(dataset: &DatasetF32, coord: &[usize], axis: usize, index: isize) -> f32 {
+    let mut source = coord.to_vec();
+    source[axis] = index.clamp(0, dataset.shape()[axis] as isize - 1) as usize;
+    dataset.data[IxDyn(&source)]
+}
+
+fn axis_linear_sample(dataset: &DatasetF32, coord: &[usize], axis: usize, src: f32) -> f32 {
+    let lower = src.floor() as isize;
+    let upper = src.ceil() as isize;
+    let fraction = src - lower as f32;
+    let low_value = axis_sample_clamped(dataset, coord, axis, lower);
+    let high_value = axis_sample_clamped(dataset, coord, axis, upper);
+    low_value * (1.0 - fraction) + high_value * fraction
+}
+
+fn axis_cubic_sample(dataset: &DatasetF32, coord: &[usize], axis: usize, src: f32) -> f32 {
+    let base = src.floor() as isize;
+    let fraction = src - base as f32;
+    cubic_interpolate(
+        axis_sample_clamped(dataset, coord, axis, base - 1),
+        axis_sample_clamped(dataset, coord, axis, base),
+        axis_sample_clamped(dataset, coord, axis, base + 1),
+        axis_sample_clamped(dataset, coord, axis, base + 2),
+        fraction,
+    )
+}
+
+fn axis_area_average_sample(
+    dataset: &DatasetF32,
+    coord: &[usize],
+    axis: usize,
+    input_size: usize,
+    output_size: usize,
+) -> f32 {
+    let out_index = coord[axis];
+    let start = out_index as f32 * input_size as f32 / output_size as f32;
+    let end = (out_index + 1) as f32 * input_size as f32 / output_size as f32;
+    let first = start.floor().max(0.0) as usize;
+    let last = end.ceil().min(input_size as f32) as usize;
+    let mut weighted_sum = 0.0_f32;
+    let mut total_weight = 0.0_f32;
+    for index in first..last {
+        let weight = (end.min((index + 1) as f32) - start.max(index as f32)).max(0.0);
+        if weight <= 0.0 {
+            continue;
+        }
+        weighted_sum += axis_sample_clamped(dataset, coord, axis, index as isize) * weight;
+        total_weight += weight;
+    }
+    if total_weight > 0.0 {
+        weighted_sum / total_weight
+    } else {
+        axis_sample_clamped(dataset, coord, axis, out_index as isize)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CanvasPosition {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl CanvasPosition {
+    fn parse(value: &str) -> Result<Self> {
+        let normalized = value.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+        match normalized.as_str() {
+            "top-left" => Ok(Self::TopLeft),
+            "top-center" => Ok(Self::TopCenter),
+            "top-right" => Ok(Self::TopRight),
+            "center-left" => Ok(Self::CenterLeft),
+            "center" => Ok(Self::Center),
+            "center-right" => Ok(Self::CenterRight),
+            "bottom-left" => Ok(Self::BottomLeft),
+            "bottom-center" => Ok(Self::BottomCenter),
+            "bottom-right" => Ok(Self::BottomRight),
+            other => Err(OpsError::InvalidParams(format!(
+                "unsupported canvas position `{other}`"
+            ))),
+        }
+    }
+
+    fn offsets(
+        self,
+        output_w: usize,
+        output_h: usize,
+        source_w: usize,
+        source_h: usize,
+    ) -> (isize, isize) {
+        let x_center = output_w as isize / 2 - source_w as isize / 2;
+        let x_right = output_w as isize - source_w as isize;
+        let y_center = output_h as isize / 2 - source_h as isize / 2;
+        let y_bottom = output_h as isize - source_h as isize;
+        match self {
+            Self::TopLeft => (0, 0),
+            Self::TopCenter => (x_center, 0),
+            Self::TopRight => (x_right, 0),
+            Self::CenterLeft => (0, y_center),
+            Self::Center => (x_center, y_center),
+            Self::CenterRight => (x_right, y_center),
+            Self::BottomLeft => (0, y_bottom),
+            Self::BottomCenter => (x_center, y_bottom),
+            Self::BottomRight => (x_right, y_bottom),
+        }
+    }
+}
+
 fn canvas_resize_xy(
     dataset: &DatasetF32,
     width: usize,
     height: usize,
     fill: f32,
+    position: CanvasPosition,
 ) -> Result<DatasetF32> {
     let x_axis = axis_index(dataset, AxisKind::X)?;
     let y_axis = axis_index(dataset, AxisKind::Y)?;
@@ -2244,8 +3045,7 @@ fn canvas_resize_xy(
     let input_shape = dataset.shape().to_vec();
     let src_w = input_shape[x_axis];
     let src_h = input_shape[y_axis];
-    let x_offset = width as isize / 2 - src_w as isize / 2;
-    let y_offset = height as isize / 2 - src_h as isize / 2;
+    let (x_offset, y_offset) = position.offsets(width, height, src_w, src_h);
     let mut write_at = 0usize;
     iterate_indices(&output_shape, |coord| {
         let src_x = coord[x_axis] as isize - x_offset;
@@ -3537,7 +4337,10 @@ fn apply_coordinate_bounds(
     params: &Value,
     start_key: &str,
     end_key: &str,
+    pixel_start_key: &str,
+    pixel_size_key: &str,
     label: &str,
+    allow_inverted: bool,
 ) -> Result<()> {
     let start = optional_f32_param(params, start_key)?;
     let end = optional_f32_param(params, end_key)?;
@@ -3550,17 +4353,71 @@ fn apply_coordinate_bounds(
                     "`{end_key}` must differ from `{start_key}`"
                 )));
             }
-            metadata.dims[axis].spacing = Some((span / metadata.dims[axis].size as f32).abs());
+            if !allow_inverted && span < 0.0 {
+                return Err(OpsError::InvalidParams(format!(
+                    "`{end_key}` must be greater than `{start_key}`"
+                )));
+            }
+            let pixel_start = optional_f32_param(params, pixel_start_key)?.unwrap_or(0.0);
+            let pixel_size = optional_f32_param(params, pixel_size_key)?
+                .unwrap_or(metadata.dims[axis].size as f32);
+            if !pixel_start.is_finite() || !pixel_size.is_finite() || pixel_size <= 0.0 {
+                return Err(OpsError::InvalidParams(format!(
+                    "`{pixel_size_key}` must be a finite positive number"
+                )));
+            }
+            let spacing = (span / pixel_size).abs();
+            let inverted = span < 0.0;
+            let direction = if inverted { -1.0 } else { 1.0 };
+            let image_origin = start - direction * spacing * pixel_start;
+            metadata.dims[axis].spacing = Some(spacing);
             metadata
                 .extras
-                .insert(format!("{label}_origin_coordinate"), json!(start));
+                .insert(format!("{label}_origin_coordinate"), json!(image_origin));
             metadata
                 .extras
-                .insert(format!("{label}_coordinate_inverted"), json!(span < 0.0));
+                .insert(format!("{label}_coordinate_inverted"), json!(inverted));
             Ok(())
         }
         _ => Err(OpsError::InvalidParams(format!(
             "`{start_key}` and `{end_key}` must be provided together"
+        ))),
+    }
+}
+
+fn apply_coordinate_point(
+    metadata: &mut Metadata,
+    axis: usize,
+    params: &Value,
+    coordinate_key: &str,
+    pixel_key: &str,
+    label: &str,
+) -> Result<()> {
+    let coordinate = optional_f32_param(params, coordinate_key)?;
+    let pixel = optional_f32_param(params, pixel_key)?;
+    match (coordinate, pixel) {
+        (None, None) => Ok(()),
+        (Some(coordinate), Some(pixel)) => {
+            let spacing = metadata.dims[axis].spacing.unwrap_or(1.0);
+            if !spacing.is_finite() || spacing == 0.0 || !pixel.is_finite() {
+                return Err(OpsError::InvalidParams(format!(
+                    "`{pixel_key}` must be finite and axis spacing must be non-zero"
+                )));
+            }
+            let inverted = metadata
+                .extras
+                .get(&format!("{label}_coordinate_inverted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let direction = if inverted { -1.0 } else { 1.0 };
+            metadata.extras.insert(
+                format!("{label}_origin_coordinate"),
+                json!(coordinate - direction * spacing * pixel),
+            );
+            Ok(())
+        }
+        _ => Err(OpsError::InvalidParams(format!(
+            "`{coordinate_key}` and `{pixel_key}` must be provided together"
         ))),
     }
 }
@@ -5279,6 +6136,62 @@ fn maxima_sample(value: f32, light_background: bool) -> f32 {
     if light_background { -value } else { value }
 }
 
+fn area_average_sample(
+    dataset: &DatasetF32,
+    coord: &[usize],
+    x_axis: usize,
+    y_axis: usize,
+    input_w: usize,
+    input_h: usize,
+    output_w: usize,
+    output_h: usize,
+) -> f32 {
+    let out_x = coord[x_axis];
+    let out_y = coord[y_axis];
+    let x_start = out_x as f32 * input_w as f32 / output_w as f32;
+    let x_end = (out_x + 1) as f32 * input_w as f32 / output_w as f32;
+    let y_start = out_y as f32 * input_h as f32 / output_h as f32;
+    let y_end = (out_y + 1) as f32 * input_h as f32 / output_h as f32;
+    let first_x = x_start.floor().max(0.0) as usize;
+    let last_x = x_end.ceil().min(input_w as f32) as usize;
+    let first_y = y_start.floor().max(0.0) as usize;
+    let last_y = y_end.ceil().min(input_h as f32) as usize;
+
+    let mut weighted_sum = 0.0_f32;
+    let mut total_weight = 0.0_f32;
+    for y in first_y..last_y {
+        let y_overlap = (y_end.min((y + 1) as f32) - y_start.max(y as f32)).max(0.0);
+        if y_overlap <= 0.0 {
+            continue;
+        }
+        for x in first_x..last_x {
+            let x_overlap = (x_end.min((x + 1) as f32) - x_start.max(x as f32)).max(0.0);
+            let weight = x_overlap * y_overlap;
+            if weight <= 0.0 {
+                continue;
+            }
+            let mut index = coord.to_vec();
+            index[x_axis] = x;
+            index[y_axis] = y;
+            weighted_sum += dataset.data[IxDyn(&index)] * weight;
+            total_weight += weight;
+        }
+    }
+
+    if total_weight > 0.0 {
+        weighted_sum / total_weight
+    } else {
+        sample_clamped(
+            dataset,
+            coord,
+            x_axis,
+            y_axis,
+            out_x as isize,
+            out_y as isize,
+        )
+    }
+}
+
 fn bilinear_sample(
     dataset: &DatasetF32,
     coord: &[usize],
@@ -5301,6 +6214,38 @@ fn bilinear_sample(
     let top = p00 * (1.0 - fx) + p10 * fx;
     let bottom = p01 * (1.0 - fx) + p11 * fx;
     top * (1.0 - fy) + bottom * fy
+}
+
+fn bicubic_sample(
+    dataset: &DatasetF32,
+    coord: &[usize],
+    x_axis: usize,
+    y_axis: usize,
+    src_x: f32,
+    src_y: f32,
+) -> f32 {
+    let x_base = src_x.floor() as isize;
+    let y_base = src_y.floor() as isize;
+    let fx = src_x - x_base as f32;
+    let fy = src_y - y_base as f32;
+
+    let mut rows = [0.0_f32; 4];
+    for row in -1..=2 {
+        let p0 = sample_clamped(dataset, coord, x_axis, y_axis, x_base - 1, y_base + row);
+        let p1 = sample_clamped(dataset, coord, x_axis, y_axis, x_base, y_base + row);
+        let p2 = sample_clamped(dataset, coord, x_axis, y_axis, x_base + 1, y_base + row);
+        let p3 = sample_clamped(dataset, coord, x_axis, y_axis, x_base + 2, y_base + row);
+        rows[(row + 1) as usize] = cubic_interpolate(p0, p1, p2, p3, fx);
+    }
+
+    cubic_interpolate(rows[0], rows[1], rows[2], rows[3], fy)
+}
+
+fn cubic_interpolate(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let a0 = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+    let a1 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+    let a2 = -0.5 * p0 + 0.5 * p2;
+    ((a0 * t + a1) * t + a2) * t + p1
 }
 
 fn bilinear_sample_or_fill(

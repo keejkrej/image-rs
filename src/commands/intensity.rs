@@ -1,4 +1,4 @@
-use crate::model::{Dataset, DatasetF32, PixelType};
+use crate::model::{AxisKind, Dataset, DatasetF32, PixelType};
 use ndarray::{Array, IxDyn};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -555,6 +555,12 @@ impl Operation for IntensityWindowOp {
                     required: true,
                     kind: "float".to_string(),
                 },
+                ParamSpec {
+                    name: "channel".to_string(),
+                    description: "Optional zero-based channel index to window.".to_string(),
+                    required: false,
+                    kind: "integer".to_string(),
+                },
             ],
         }
     }
@@ -567,19 +573,54 @@ impl Operation for IntensityWindowOp {
                 "`high` must be greater than `low`".to_string(),
             ));
         }
+        let channel = params
+            .get("channel")
+            .map(|value| {
+                value.as_u64().map(|value| value as usize).ok_or_else(|| {
+                    OpsError::InvalidParams("`channel` must be a non-negative integer".to_string())
+                })
+            })
+            .transpose()?;
+        let channel_axis = if channel.is_some() {
+            let axis = dataset.axis_index(AxisKind::Channel).ok_or_else(|| {
+                OpsError::UnsupportedLayout(
+                    "`channel` requires a dataset with a channel axis".to_string(),
+                )
+            })?;
+            let channel_count = dataset.shape()[axis];
+            let channel = channel.expect("checked above");
+            if channel >= channel_count {
+                return Err(OpsError::InvalidParams(format!(
+                    "`channel` {channel} is outside 0..{}",
+                    channel_count.saturating_sub(1)
+                )));
+            }
+            Some((axis, channel))
+        } else {
+            None
+        };
         let output_max = pixel_type_max(dataset.metadata.pixel_type);
         let mut values = dataset.data.iter().copied().collect::<Vec<_>>();
-        values.par_iter_mut().for_each(|value| {
-            *value = scale_unit_to_pixel_type(
-                ((*value - low) / (high - low)).clamp(0.0, 1.0),
-                output_max,
-            );
-        });
+        if let Some((axis, channel)) = channel_axis {
+            for (flat_index, (index, value)) in dataset.data.indexed_iter().enumerate() {
+                if index[axis] == channel {
+                    values[flat_index] = window_sample(*value, low, high, output_max);
+                }
+            }
+        } else {
+            values
+                .par_iter_mut()
+                .for_each(|value| *value = window_sample(*value, low, high, output_max));
+        }
         let windowed = Array::from_shape_vec(IxDyn(dataset.shape()), values)
             .expect("shape is unchanged and valid");
         let output_dataset = Dataset::new(windowed, dataset.metadata.clone())?;
         Ok(OpOutput::dataset_only(output_dataset))
     }
+}
+
+fn window_sample(value: f32, low: f32, high: f32, output_max: f32) -> f32 {
+    scale_unit_to_pixel_type(((value - low) / (high - low)).clamp(0.0, 1.0), output_max)
 }
 
 fn pixel_type_max(pixel_type: PixelType) -> f32 {

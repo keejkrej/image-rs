@@ -32,6 +32,7 @@ fn contains_required_operations() {
     assert!(names.contains(&"intensity.math".to_string()));
     assert!(names.contains(&"intensity.nan_background".to_string()));
     assert!(names.contains(&"image.convert".to_string()));
+    assert!(names.contains(&"image.color_threshold".to_string()));
     assert!(names.contains(&"image.resize".to_string()));
     assert!(names.contains(&"image.canvas_resize".to_string()));
     assert!(names.contains(&"image.crop".to_string()));
@@ -422,6 +423,203 @@ fn image_resize_changes_xy_shape() {
 }
 
 #[test]
+fn image_resize_honors_imagej_interpolation_choice() {
+    let dataset = test_dataset(vec![0.0, 10.0, 20.0, 30.0], (2, 2));
+
+    let nearest = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({
+            "width": 3,
+            "height": 3,
+            "interpolation": "None",
+            "average_when_downsizing": false
+        }),
+    )
+    .expect("nearest resize");
+    assert_eq!(
+        nearest.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            0.0, 10.0, 10.0, //
+            20.0, 30.0, 30.0, //
+            20.0, 30.0, 30.0,
+        ]
+    );
+
+    let bilinear = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({
+            "width": 3,
+            "height": 3,
+            "interpolation": "Bilinear",
+            "average_when_downsizing": false
+        }),
+    )
+    .expect("bilinear resize");
+    let values = bilinear.dataset.data.iter().copied().collect::<Vec<_>>();
+    assert!((values[4] - 15.0).abs() < 1.0e-6);
+}
+
+#[test]
+fn image_resize_averages_when_downsizing() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, //
+            12.0, 13.0, 14.0, 15.0,
+        ],
+        (4, 4),
+    );
+
+    let output = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({
+            "width": 2,
+            "height": 2,
+            "average_when_downsizing": true
+        }),
+    )
+    .expect("average downsize");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![2.5, 4.5, 10.5, 12.5]
+    );
+}
+
+#[test]
+fn image_resize_derives_missing_constrained_dimension() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, 7.0,
+        ],
+        (2, 4),
+    );
+
+    let output = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({
+            "height": 4,
+            "constrain": true
+        }),
+    )
+    .expect("constrained resize");
+
+    assert_eq!(output.dataset.shape(), &[4, 8]);
+}
+
+#[test]
+fn image_resize_scales_stack_depth_and_spacing() {
+    let data = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![0.0, 10.0, 20.0]).expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim {
+                axis: AxisKind::Z,
+                size: 3,
+                spacing: Some(2.0),
+                unit: Some("um".to_string()),
+            },
+        ],
+        pixel_type: PixelType::F32,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({
+            "width": 1,
+            "height": 1,
+            "depth": 5,
+            "interpolation": "None"
+        }),
+    )
+    .expect("resize depth");
+
+    assert_eq!(output.dataset.shape(), &[1, 1, 5]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 10.0, 10.0, 20.0, 20.0]
+    );
+    assert_eq!(output.dataset.metadata.dims[2].spacing, Some(1.2));
+    assert_eq!(output.dataset.metadata.dims[2].unit.as_deref(), Some("um"));
+}
+
+#[test]
+fn image_resize_rejects_depth_without_stack_axis() {
+    let dataset = test_dataset(vec![0.0, 1.0, 2.0, 3.0], (2, 2));
+    let error = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({"width": 2, "height": 2, "depth": 2}),
+    )
+    .expect_err("missing z axis");
+
+    assert!(error.to_string().contains("depth"));
+}
+
+#[test]
+fn image_resize_rejects_unknown_interpolation() {
+    let dataset = test_dataset(vec![0.0, 1.0, 2.0, 3.0], (2, 2));
+    let error = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({"width": 3, "height": 3, "interpolation": "Lanczos"}),
+    )
+    .expect_err("invalid interpolation");
+
+    assert!(error.to_string().contains("resize interpolation"));
+}
+
+#[test]
+fn image_canvas_resize_uses_imagej_position_anchor() {
+    let dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+
+    let output = execute_operation(
+        "image.canvas_resize",
+        &dataset,
+        &json!({
+            "width": 4,
+            "height": 3,
+            "fill": -1.0,
+            "position": "Bottom-Right"
+        }),
+    )
+    .expect("canvas resize");
+
+    assert_eq!(output.dataset.shape(), &[3, 4]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            -1.0, -1.0, -1.0, -1.0, //
+            -1.0, -1.0, 1.0, 2.0, //
+            -1.0, -1.0, 3.0, 4.0,
+        ]
+    );
+}
+
+#[test]
+fn image_canvas_resize_rejects_unknown_position() {
+    let dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    let error = execute_operation(
+        "image.canvas_resize",
+        &dataset,
+        &json!({"width": 4, "height": 4, "position": "Middle"}),
+    )
+    .expect_err("invalid position");
+
+    assert!(error.to_string().contains("canvas position"));
+}
+
+#[test]
 fn image_crop_extracts_xy_bounds_and_preserves_other_axes() {
     let data = Array::from_shape_vec(
         IxDyn(&[2, 3, 2]),
@@ -599,6 +797,88 @@ fn image_coordinates_rejects_incomplete_or_degenerate_bounds() {
     )
     .expect_err("degenerate bounds");
     assert!(degenerate.to_string().contains("right"));
+
+    let inverted_x = execute_operation(
+        "image.coordinates",
+        &dataset,
+        &json!({"left": 2.0, "right": 1.0}),
+    )
+    .expect_err("inverted x");
+    assert!(inverted_x.to_string().contains("greater"));
+}
+
+#[test]
+fn image_coordinates_selection_bounds_update_origin_like_imagej() {
+    let dataset = test_dataset(
+        vec![
+            1.0, 2.0, 3.0, 4.0, //
+            5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ],
+        (4, 4),
+    );
+
+    let output = execute_operation(
+        "image.coordinates",
+        &dataset,
+        &json!({
+            "mode": "selection",
+            "left": 100.0,
+            "right": 120.0,
+            "top": 50.0,
+            "bottom": 30.0,
+            "x_pixel_start": 1.0,
+            "x_pixel_size": 2.0,
+            "y_pixel_start": 1.0,
+            "y_pixel_size": 2.0
+        }),
+    )
+    .expect("selection coordinates");
+
+    assert_eq!(output.dataset.metadata.dims[1].spacing, Some(10.0));
+    assert_eq!(output.dataset.metadata.dims[0].spacing, Some(10.0));
+    assert_eq!(
+        output.dataset.metadata.extras.get("x_origin_coordinate"),
+        Some(&json!(90.0))
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("y_origin_coordinate"),
+        Some(&json!(60.0))
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("y_coordinate_inverted"),
+        Some(&json!(true))
+    );
+}
+
+#[test]
+fn image_coordinates_point_mode_updates_origin_without_rescaling() {
+    let mut dataset = test_dataset(vec![1.0, 2.0, 3.0, 4.0], (2, 2));
+    dataset.metadata.dims[1].spacing = Some(2.0);
+    dataset.metadata.dims[0].spacing = Some(5.0);
+
+    let output = execute_operation(
+        "image.coordinates",
+        &dataset,
+        &json!({
+            "mode": "point",
+            "point_x_coordinate": 20.0,
+            "point_y_coordinate": 30.0,
+            "point_x_pixel": 3.0,
+            "point_y_pixel": 4.0
+        }),
+    )
+    .expect("point coordinates");
+
+    assert_eq!(output.dataset.metadata.dims[1].spacing, Some(2.0));
+    assert_eq!(output.dataset.metadata.dims[0].spacing, Some(5.0));
+    assert_eq!(
+        output.dataset.metadata.extras.get("x_origin_coordinate"),
+        Some(&json!(14.0))
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("y_origin_coordinate"),
+        Some(&json!(10.0))
+    );
 }
 
 #[test]
@@ -801,6 +1081,204 @@ fn image_convert_rgb_adds_channel_axis() {
             128.0, 128.0, 128.0, //
             64.0, 64.0, 64.0,
         ]
+    );
+}
+
+#[test]
+fn image_color_threshold_applies_rgb_component_ranges() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 3]),
+        vec![
+            255.0, 0.0, 0.0, //
+            0.0, 0.0, 255.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.color_threshold",
+        &dataset,
+        &json!({
+            "color_space": "RGB",
+            "hue": {"min": 200.0, "max": 255.0, "pass": true},
+            "saturation": {"min": 0.0, "max": 30.0, "pass": true},
+            "brightness": {"min": 0.0, "max": 30.0, "pass": true}
+        }),
+    )
+    .expect("color threshold");
+
+    assert_eq!(output.dataset.shape(), &[1, 2]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![255.0, 0.0]
+    );
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+}
+
+#[test]
+fn image_color_threshold_filtered_output_paints_selected_pixels() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 3]),
+        vec![
+            255.0, 0.0, 0.0, //
+            0.0, 0.0, 255.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let white = execute_operation(
+        "image.color_threshold",
+        &dataset,
+        &json!({
+            "color_space": "RGB",
+            "output": "filtered",
+            "mode": "White",
+            "hue": {"min": 200.0, "max": 255.0, "pass": true},
+            "saturation": {"min": 0.0, "max": 30.0, "pass": true},
+            "brightness": {"min": 0.0, "max": 30.0, "pass": true}
+        }),
+    )
+    .expect("filtered color threshold");
+    assert_eq!(white.dataset.shape(), &[1, 2, 3]);
+    assert_eq!(
+        white.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            255.0, 255.0, 255.0, //
+            0.0, 0.0, 255.0,
+        ]
+    );
+    assert_eq!(white.dataset.metadata.pixel_type, PixelType::U8);
+
+    let black_and_white = execute_operation(
+        "image.color_threshold",
+        &dataset,
+        &json!({
+            "color_space": "RGB",
+            "output": "filtered",
+            "mode": "B&W",
+            "hue": {"min": 200.0, "max": 255.0, "pass": true},
+            "saturation": {"min": 0.0, "max": 30.0, "pass": true},
+            "brightness": {"min": 0.0, "max": 30.0, "pass": true}
+        }),
+    )
+    .expect("black and white filtered color threshold");
+    assert_eq!(
+        black_and_white
+            .dataset
+            .data
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![
+            0.0, 0.0, 0.0, //
+            255.0, 255.0, 255.0,
+        ]
+    );
+}
+
+#[test]
+fn image_color_threshold_applies_hsb_ranges_and_rejects_non_rgb() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 3]),
+        vec![
+            255.0, 0.0, 0.0, //
+            0.0, 0.0, 255.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.color_threshold",
+        &dataset,
+        &json!({
+            "color_space": "HSB",
+            "hue": {"min": 160.0, "max": 180.0, "pass": true},
+            "saturation": {"min": 200.0, "max": 255.0, "pass": true},
+            "brightness": {"min": 200.0, "max": 255.0, "pass": true}
+        }),
+    )
+    .expect("hsb threshold");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 255.0]
+    );
+
+    let gray = test_dataset(vec![0.0, 1.0, 2.0, 3.0], (2, 2));
+    let error = execute_operation("image.color_threshold", &gray, &json!({}))
+        .expect_err("missing channel axis");
+    assert!(error.to_string().contains("Channel"));
+}
+
+#[test]
+fn image_color_threshold_accepts_cie_lab_alias() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 1, 3]),
+        vec![
+            255.0, 0.0, 0.0, //
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 1),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.color_threshold",
+        &dataset,
+        &json!({
+            "color_space": "CIE Lab",
+            "hue": {"min": 0.0, "max": 255.0, "pass": true},
+            "saturation": {"min": 0.0, "max": 255.0, "pass": true},
+            "brightness": {"min": 0.0, "max": 255.0, "pass": true}
+        }),
+    )
+    .expect("cie lab threshold");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![255.0]
+    );
+    assert_eq!(
+        output.dataset.metadata.extras.get("color_threshold_space"),
+        Some(&json!("lab"))
     );
 }
 
@@ -4391,6 +4869,52 @@ fn window_operation_uses_integer_pixel_type_range() {
 }
 
 #[test]
+fn window_operation_can_target_one_channel() {
+    let data = Array::from_shape_vec((1, 2, 3), vec![1.0, 10.0, 100.0, 2.0, 15.0, 200.0])
+        .expect("shape")
+        .into_dyn();
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "intensity.window",
+        &dataset,
+        &json!({
+            "low": 10.0,
+            "high": 20.0,
+            "channel": 1
+        }),
+    )
+    .expect("window");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![1.0, 0.0, 100.0, 2.0, 128.0, 200.0]
+    );
+    assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+
+    let error = execute_operation(
+        "intensity.window",
+        &dataset,
+        &json!({
+            "low": 10.0,
+            "high": 20.0,
+            "channel": 3
+        }),
+    )
+    .expect_err("out of range channel");
+    assert!(error.to_string().contains("channel"));
+}
+
+#[test]
 fn otsu_threshold_returns_measurement() {
     let dataset = test_dataset(vec![0.05, 0.1, 0.2, 0.8, 0.9, 0.95], (2, 3));
     let output = execute_operation("threshold.otsu", &dataset, &json!({})).expect("otsu");
@@ -4474,6 +4998,257 @@ fn make_binary_threshold_defaults_to_imagej_isodata_polarity() {
         .and_then(|value| value.as_f64())
         .expect("threshold");
     assert!((threshold - 0.501960813999176).abs() < 1.0e-12);
+}
+
+#[test]
+fn make_binary_threshold_uses_raw_16bit_histogram_when_requested() {
+    let mut dataset = test_dataset(vec![0.0, 255.0, 256.0, 65_535.0], (2, 2));
+    dataset.metadata.pixel_type = PixelType::U16;
+
+    let regular = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "mean", "background": "dark"}),
+    )
+    .expect("regular threshold");
+    let raw16 = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "mean", "background": "dark", "sixteen_bit": true}),
+    )
+    .expect("16-bit threshold");
+
+    let regular_threshold = regular
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(serde_json::Value::as_f64)
+        .expect("regular threshold");
+    let raw16_threshold = raw16
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(serde_json::Value::as_f64)
+        .expect("raw threshold");
+
+    assert_ne!(regular_threshold, raw16_threshold);
+    assert_eq!(raw16_threshold, 16511.0);
+
+    let raw16_otsu = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "otsu", "background": "dark", "sixteen_bit": true}),
+    )
+    .expect("16-bit otsu threshold");
+    let raw16_otsu_threshold = raw16_otsu
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(serde_json::Value::as_f64)
+        .expect("raw otsu threshold");
+
+    assert_eq!(raw16_otsu_threshold, 256.0);
+    assert_eq!(
+        raw16_otsu.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 0.0, 255.0, 255.0]
+    );
+
+    let raw16_triangle = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "triangle", "background": "dark", "sixteen_bit": true}),
+    )
+    .expect("16-bit triangle threshold");
+    let raw16_triangle_threshold = raw16_triangle
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(serde_json::Value::as_f64)
+        .expect("raw triangle threshold");
+
+    assert_eq!(raw16_triangle_threshold, 65533.0);
+    assert_eq!(
+        raw16_triangle
+            .dataset
+            .data
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![0.0, 0.0, 0.0, 255.0]
+    );
+
+    for (method, expected_threshold, expected_mask) in [
+        ("li", 10981.0, vec![0.0, 0.0, 0.0, 255.0]),
+        ("min_error", 16511.0, vec![0.0, 0.0, 0.0, 255.0]),
+        ("moments", 256.0, vec![0.0, 0.0, 255.0, 255.0]),
+    ] {
+        let raw16_output = execute_operation(
+            "threshold.make_binary",
+            &dataset,
+            &json!({"method": method, "background": "dark", "sixteen_bit": true}),
+        )
+        .expect("16-bit threshold method");
+        let raw16_threshold = raw16_output
+            .measurements
+            .as_ref()
+            .and_then(|table| table.values.get("threshold"))
+            .and_then(serde_json::Value::as_f64)
+            .expect("raw threshold");
+
+        assert_eq!(raw16_threshold, expected_threshold, "{method}");
+        assert_eq!(
+            raw16_output
+                .dataset
+                .data
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            expected_mask,
+            "{method}"
+        );
+    }
+
+    let mut yen_dataset = test_dataset(vec![0.0, 10_000.0, 20_000.0, 40_000.0, 65_535.0], (1, 5));
+    yen_dataset.metadata.pixel_type = PixelType::U16;
+    let raw16_yen = execute_operation(
+        "threshold.make_binary",
+        &yen_dataset,
+        &json!({"method": "yen", "background": "dark", "sixteen_bit": true}),
+    )
+    .expect("16-bit yen threshold");
+    let raw16_yen_threshold = raw16_yen
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(serde_json::Value::as_f64)
+        .expect("raw yen threshold");
+
+    assert_eq!(raw16_yen_threshold, 10000.0);
+    assert_eq!(
+        raw16_yen.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 255.0, 255.0, 255.0, 255.0]
+    );
+}
+
+#[test]
+fn make_binary_threshold_matches_imagej_raw_16bit_bilevel_shortcut() {
+    let mut dataset = test_dataset(vec![1000.0, 4000.0], (1, 2));
+    dataset.metadata.pixel_type = PixelType::U16;
+
+    let output = execute_operation(
+        "threshold.make_binary",
+        &dataset,
+        &json!({"method": "otsu", "background": "dark", "sixteen_bit": true}),
+    )
+    .expect("16-bit bilevel threshold");
+    let threshold = output
+        .measurements
+        .as_ref()
+        .and_then(|table| table.values.get("threshold"))
+        .and_then(serde_json::Value::as_f64)
+        .expect("raw threshold");
+
+    assert_eq!(threshold, 3999.0);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![0.0, 255.0]
+    );
+}
+
+#[test]
+fn make_binary_threshold_supports_all_imagej_raw_16bit_methods_on_cropped_histogram() {
+    let mut values = Vec::new();
+    values.extend(std::iter::repeat(1000.0).take(6));
+    values.extend(std::iter::repeat(1040.0).take(3));
+    values.extend(std::iter::repeat(1160.0).take(1));
+    values.extend(std::iter::repeat(1320.0).take(3));
+    values.extend(std::iter::repeat(1360.0).take(6));
+    let mut dataset = test_dataset(values, (1, 19));
+    dataset.metadata.pixel_type = PixelType::U16;
+
+    for method in [
+        "default",
+        "huang",
+        "intermodes",
+        "isodata",
+        "ij_isodata",
+        "li",
+        "max_entropy",
+        "mean",
+        "min_error",
+        "minimum",
+        "moments",
+        "otsu",
+        "percentile",
+        "renyi_entropy",
+        "shanbhag",
+        "triangle",
+        "yen",
+    ] {
+        let output = execute_operation(
+            "threshold.make_binary",
+            &dataset,
+            &json!({"method": method, "background": "dark", "sixteen_bit": true}),
+        )
+        .expect("16-bit threshold method");
+        let threshold = output
+            .measurements
+            .as_ref()
+            .and_then(|table| table.values.get("threshold"))
+            .and_then(serde_json::Value::as_f64)
+            .expect("raw threshold");
+
+        assert!(threshold.is_finite(), "{method}");
+        assert!(
+            (999.0..=1360.0).contains(&threshold),
+            "{method} threshold {threshold}"
+        );
+    }
+}
+
+#[test]
+fn make_binary_threshold_supports_additional_imagej_methods() {
+    let dataset = test_dataset(
+        vec![
+            0.0, 0.1, 0.2, 0.3, //
+            0.7, 0.8, 0.9, 1.0,
+        ],
+        (2, 4),
+    );
+
+    for method in [
+        "huang",
+        "intermodes",
+        "isodata",
+        "ij_isodata",
+        "li",
+        "max_entropy",
+        "mean",
+        "min_error",
+        "minimum",
+        "moments",
+        "otsu",
+        "percentile",
+        "renyi_entropy",
+        "shanbhag",
+        "triangle",
+        "yen",
+    ] {
+        let output = execute_operation(
+            "threshold.make_binary",
+            &dataset,
+            &json!({"method": method, "background": "dark"}),
+        )
+        .expect("threshold method");
+        let threshold = output
+            .measurements
+            .as_ref()
+            .and_then(|table| table.values.get("threshold"))
+            .and_then(|value| value.as_f64())
+            .expect("threshold measurement");
+        assert!(threshold.is_finite(), "{method} threshold should be finite");
+        assert_eq!(output.dataset.metadata.pixel_type, PixelType::U8);
+    }
 }
 
 #[test]

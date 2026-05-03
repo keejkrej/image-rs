@@ -580,13 +580,21 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             None,
             Some("Apply thresholding to the active image."),
         ),
-        "image.adjust.color_balance" | "image.adjust.color_threshold" => CommandMetadata::with(
+        "image.adjust.color_balance" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             true,
             true,
             None,
-            Some("Acknowledge ImageJ color adjustment panels for menu compatibility."),
+            Some("Open the ImageJ color balance adjustment panel."),
+        ),
+        "image.adjust.color_threshold" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            None,
+            Some("Apply ImageJ-style color thresholding to an RGB channel image."),
         ),
         "image.adjust.window_level" => CommandMetadata::with(
             CommandScope::Viewer,

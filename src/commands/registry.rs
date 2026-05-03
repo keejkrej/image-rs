@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use super::{
     ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCalibrateOp, ImageCanvasResizeOp,
-    ImageConvertOp, ImageConvolveOp, ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp,
-    ImageFftPowerSpectrumOp, ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp,
+    ImageColorThresholdOp, ImageConvertOp, ImageConvolveOp, ImageCoordinatesOp, ImageCropOp,
+    ImageFftBandpassOp, ImageFftPowerSpectrumOp, ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp,
     ImageHyperstackReduceDimensionalityOp, ImageHyperstackSubsetOp, ImageHyperstackToStackOp,
     ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp, ImageRemoveNaNsOp,
     ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp, ImageScaleOp,
@@ -54,6 +54,7 @@ fn registry() -> &'static Registry {
         register(&mut map, IntensityWindowOp);
         register(&mut map, GaussianBlurOp);
         register(&mut map, ImageConvertOp);
+        register(&mut map, ImageColorThresholdOp);
         register(&mut map, ImageResizeOp);
         register(&mut map, ImageScaleOp);
         register(&mut map, ImageCanvasResizeOp);

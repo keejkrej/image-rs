@@ -54,12 +54,12 @@ pub use thunderstorm::{
     ThunderstormPipelineLocalizeOp,
 };
 pub use transform::{
-    ImageBinOp, ImageCalibrateOp, ImageCanvasResizeOp, ImageConvertOp, ImageConvolveOp,
-    ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp, ImageFindEdgesOp,
-    ImageFindMaximaOp, ImageFlipOp, ImageHyperstackReduceDimensionalityOp, ImageHyperstackSubsetOp,
-    ImageHyperstackToStackOp, ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp,
-    ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp,
-    ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp,
+    ImageBinOp, ImageCalibrateOp, ImageCanvasResizeOp, ImageColorThresholdOp, ImageConvertOp,
+    ImageConvolveOp, ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp,
+    ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp, ImageHyperstackReduceDimensionalityOp,
+    ImageHyperstackSubsetOp, ImageHyperstackToStackOp, ImageMedianFilterOp, ImageRankFilter3dOp,
+    ImageRankFilterOp, ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op,
+    ImageRotateOp, ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp,
     ImageStackAddSliceOp, ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp,
     ImageStackMontageOp, ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp,
     ImageStackSubstackOp, ImageStackToHyperstackOp, ImageStackZProjectOp,

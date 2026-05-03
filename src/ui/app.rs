@@ -9,7 +9,7 @@ use super::state::{
 use super::toolbar::*;
 use super::{command_registry, interaction, menu};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -86,6 +86,30 @@ impl UiState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThresholdOverlay {
+    low: f32,
+    high: f32,
+    mode: ThresholdOverlayMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThresholdOverlayMode {
+    Red,
+    BlackAndWhite,
+    OverUnder,
+}
+
+impl ThresholdOverlayMode {
+    fn from_label(label: &str) -> Self {
+        match label {
+            "B&W" | "Black & White" | "black_and_white" => Self::BlackAndWhite,
+            "Over/Under" | "over_under" => Self::OverUnder,
+            _ => Self::Red,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ViewerSession {
     path: PathBuf,
@@ -93,6 +117,8 @@ struct ViewerSession {
     committed_source: ViewerImageSource,
     committed_summary: ImageSummary,
     display_range: Option<(f32, f32)>,
+    channel_display_ranges: HashMap<usize, (f32, f32)>,
+    threshold_overlay: Option<ThresholdOverlay>,
     undo_stack: Vec<Arc<DatasetF32>>,
     redo_stack: Vec<Arc<DatasetF32>>,
     active_preview: Option<String>,
@@ -111,6 +137,8 @@ impl ViewerSession {
             committed_source: source,
             committed_summary,
             display_range: None,
+            channel_display_ranges: HashMap::new(),
+            threshold_overlay: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_preview: None,
@@ -152,8 +180,24 @@ impl ViewerSession {
 
     fn set_display_range(&mut self, range: Option<(f32, f32)>) {
         self.display_range = range;
+        self.channel_display_ranges.clear();
         self.generation = self.generation.saturating_add(1);
         self.frame_cache.clear();
+    }
+
+    fn set_channel_display_range(&mut self, channel: usize, range: Option<(f32, f32)>) {
+        if let Some(range) = range {
+            self.channel_display_ranges.insert(channel, range);
+        } else {
+            self.channel_display_ranges.remove(&channel);
+        }
+        self.generation = self.generation.saturating_add(1);
+        self.frame_cache.clear();
+    }
+
+    fn set_threshold_overlay(&mut self, overlay: Option<ThresholdOverlay>) {
+        self.threshold_overlay = overlay;
+        self.generation = self.generation.saturating_add(1);
     }
 
     fn committed_dataset(&self) -> Option<Arc<DatasetF32>> {
@@ -189,6 +233,8 @@ impl ViewerSession {
         self.active_preview = None;
         self.preview_cache.clear();
         self.frame_cache.clear();
+        self.channel_display_ranges.clear();
+        self.threshold_overlay = None;
     }
 
     fn can_undo(&self) -> bool {
@@ -228,6 +274,8 @@ impl ViewerSession {
             self.active_preview = None;
             self.preview_cache.clear();
             self.frame_cache.clear();
+            self.channel_display_ranges.clear();
+            self.threshold_overlay = None;
             self.undo_stack.clear();
             self.redo_stack.clear();
             return false;
@@ -238,6 +286,8 @@ impl ViewerSession {
         self.active_preview = None;
         self.preview_cache.clear();
         self.frame_cache.clear();
+        self.channel_display_ranges.clear();
+        self.threshold_overlay = None;
         self.redo_stack.clear();
         self.undo_stack.clear();
         true
@@ -623,6 +673,8 @@ struct ImageUiApp {
     profile_plot: PlotProfileState,
     new_image_dialog: NewImageDialogState,
     adjust_dialog: AdjustDialogState,
+    threshold_apply_dialog: ThresholdApplyDialogState,
+    apply_lut_dialog: ApplyLutDialogState,
     resize_dialog: ResizeDialogState,
     canvas_dialog: ResizeDialogState,
     stack_position_dialog: StackPositionDialogState,
@@ -650,6 +702,60 @@ struct ImageUiApp {
 }
 
 impl ImageUiApp {
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        let menus = menu::manifest().clone();
+        let command_catalog = command_registry::command_catalog();
+        let (worker_tx, worker_rx) = mpsc::channel();
+
+        Self {
+            state: UiState::new(None),
+            desktop_state: DesktopState::default(),
+            menus,
+            command_catalog,
+            launcher_ui: LauncherUiState {
+                status: LauncherStatusModel::default(),
+                fallback_text: String::new(),
+            },
+            tool_state: ToolState::default(),
+            tool_options: ToolOptionsState::default(),
+            toolbar_icons: HashMap::new(),
+            viewers_ui: HashMap::new(),
+            viewer_telemetry: HashMap::new(),
+            results_table: ResultsTableState::default(),
+            clipboard: ClipboardState::default(),
+            profile_plot: PlotProfileState::default(),
+            new_image_dialog: NewImageDialogState::default(),
+            adjust_dialog: AdjustDialogState::default(),
+            threshold_apply_dialog: ThresholdApplyDialogState::default(),
+            apply_lut_dialog: ApplyLutDialogState::default(),
+            resize_dialog: ResizeDialogState::default(),
+            canvas_dialog: ResizeDialogState::default(),
+            stack_position_dialog: StackPositionDialogState::default(),
+            stack_label_dialog: StackLabelDialogState::default(),
+            zoom_set_dialog: ZoomSetDialogState::default(),
+            color_dialog: ColorDialogState::default(),
+            raw_import_dialog: RawImportDialogState::default(),
+            url_import_dialog: UrlImportDialogState::default(),
+            command_finder: CommandFinderState::default(),
+            macro_recorder: MacroRecorderState::default(),
+            startup_macro: StartupMacroState::default(),
+            macro_compatibility_open: false,
+            macro_compatibility_command: None,
+            macro_compatibility_path: None,
+            macro_compatibility_preview: String::new(),
+            macro_compatibility_run_log: String::new(),
+            roi_manager: RoiManagerState::default(),
+            last_repeatable_command: None,
+            active_viewer_label: None,
+            worker_tx,
+            worker_rx,
+            focus_launcher: false,
+            focus_viewer_label: None,
+            should_quit: false,
+        }
+    }
+
     fn new(_cc: &eframe::CreationContext<'_>, startup_input: Option<PathBuf>) -> Self {
         let menus = menu::manifest().clone();
         let command_catalog = command_registry::command_catalog();
@@ -676,6 +782,8 @@ impl ImageUiApp {
             profile_plot: PlotProfileState::default(),
             new_image_dialog: NewImageDialogState::default(),
             adjust_dialog: AdjustDialogState::default(),
+            threshold_apply_dialog: ThresholdApplyDialogState::default(),
+            apply_lut_dialog: ApplyLutDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
@@ -1063,20 +1171,51 @@ impl ImageUiApp {
         &self,
         viewer_label: &str,
         bins: usize,
+        stack_histogram: bool,
     ) -> Result<AdjustHistogram, String> {
         let viewer = self
             .viewers_ui
             .get(viewer_label)
             .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let bbox = selected_roi_bbox(viewer);
+        if stack_histogram {
+            let values = self.viewer_stack_values(viewer_label, viewer.channel, viewer.t, bbox)?;
+            return adjust_histogram(&values, bins);
+        }
         let request = ViewerFrameRequest {
             z: viewer.z,
             t: viewer.t,
             channel: viewer.channel,
         };
-        let bbox = selected_roi_bbox(viewer);
         let slice = self.active_dataset_slice(viewer_label, &request)?;
         let values = slice_values_in_bbox(&slice, bbox)?;
         adjust_histogram(&values, bins)
+    }
+
+    fn viewer_stack_values(
+        &self,
+        viewer_label: &str,
+        channel: usize,
+        time: usize,
+        bbox: Option<(usize, usize, usize, usize)>,
+    ) -> Result<Vec<f32>, String> {
+        let session = self
+            .state
+            .label_to_session
+            .get(viewer_label)
+            .ok_or_else(|| format!("no viewer session for `{viewer_label}`"))?;
+        let z_slices = session.committed_summary.z_slices.max(1);
+        let mut values = Vec::new();
+        for z in 0..z_slices {
+            let request = ViewerFrameRequest {
+                z,
+                t: time,
+                channel,
+            };
+            let slice = self.active_dataset_slice(viewer_label, &request)?;
+            values.extend(slice_values_in_bbox(&slice, bbox)?);
+        }
+        Ok(values)
     }
 
     fn save_viewer(&mut self, window_label: &str, path: Option<PathBuf>) -> Result<String, String> {
@@ -3173,12 +3312,13 @@ impl ImageUiApp {
             .current_viewer_label(window_label)
             .unwrap_or(window_label)
             .to_string();
-        let histogram = self.adjust_histogram_for_viewer(&target, 256).ok();
+        let histogram = self.adjust_histogram_for_viewer(&target, 256, false).ok();
         self.adjust_dialog.kind = kind;
         self.adjust_dialog.window_label = target.clone();
         self.adjust_dialog.open = true;
         self.adjust_dialog.histogram = histogram;
         self.adjust_dialog.line_width = self.tool_options.line_width_px;
+        self.adjust_dialog.contrast_auto_threshold = 0;
 
         if let Some(session) = self.state.label_to_session.get(&target) {
             self.adjust_dialog.default_min = self
@@ -3212,6 +3352,18 @@ impl ImageUiApp {
             self.adjust_dialog.right = width;
             self.adjust_dialog.bottom = height;
             self.adjust_dialog.back = session.committed_summary.z_slices.max(1) as f32;
+            if kind == AdjustDialogKind::Coordinates {
+                if let Ok(dataset) = session.committed_source.to_dataset() {
+                    init_coordinates_dialog(
+                        &mut self.adjust_dialog,
+                        &dataset.metadata,
+                        self.viewers_ui.get(&target),
+                        session.committed_summary.z_slices.max(1),
+                        width,
+                        height,
+                    );
+                }
+            }
         }
 
         command_registry::CommandExecuteResult::ok(format!("{} dialog opened", kind.title()))
@@ -3251,14 +3403,33 @@ impl ImageUiApp {
             ));
         }
 
-        session.set_display_range(Some((low, high)));
+        let channel = params
+            .get("channel")
+            .and_then(Value::as_str)
+            .and_then(color_balance_channel_index);
+        if let Some(channel) = channel {
+            session.set_channel_display_range(channel, Some((low, high)));
+        } else {
+            session.set_display_range(Some((low, high)));
+        }
         if let Some(viewer) = self.viewers_ui.get_mut(&target) {
             viewer.last_generation = 0;
             viewer.last_request = None;
-            viewer.status_message = format!("Display range {low:.4}..{high:.4}");
+            viewer.status_message = if let Some(channel) = channel {
+                format!("Channel {} display range {low:.4}..{high:.4}", channel + 1)
+            } else {
+                format!("Display range {low:.4}..{high:.4}")
+            };
         }
 
-        Ok(format!("display range set to {low:.4}..{high:.4}"))
+        Ok(if let Some(channel) = channel {
+            format!(
+                "channel {} display range set to {low:.4}..{high:.4}",
+                channel + 1
+            )
+        } else {
+            format!("display range set to {low:.4}..{high:.4}")
+        })
     }
 
     fn reset_display_range(&mut self, window_label: &str) -> Result<String, String> {
@@ -3278,6 +3449,583 @@ impl ImageUiApp {
             viewer.status_message = "Display range reset".to_string();
         }
         Ok("display range reset".to_string())
+    }
+
+    fn ensure_apply_lut_supported(&self, window_label: &str) -> Result<(), String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        let dataset = session.committed_source.to_dataset()?;
+        if dataset.metadata.pixel_type == PixelType::F32 {
+            return Err("\"Apply\" does not work with 32-bit images".to_string());
+        }
+        Ok(())
+    }
+
+    fn set_threshold_overlay(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+
+        if params
+            .get("reset")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let no_reset = params
+                .get("no_reset")
+                .or_else(|| params.get("dont_reset_range"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            return self.reset_threshold_overlay(&target, no_reset);
+        }
+
+        let (low, high) = if let (Some(low), Some(high)) = (
+            params.get("min").and_then(Value::as_f64),
+            params.get("max").and_then(Value::as_f64),
+        ) {
+            (low as f32, high as f32)
+        } else {
+            let stack_histogram = params
+                .get("stack")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let viewer = self
+                .viewers_ui
+                .get(&target)
+                .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+            let bbox = selected_roi_bbox(viewer);
+            let request = ViewerFrameRequest {
+                z: viewer.z,
+                t: viewer.t,
+                channel: viewer.channel,
+            };
+            let slice = self.active_dataset_slice(&target, &request)?;
+            let pixel_type = slice.pixel_type;
+            let values = if stack_histogram {
+                self.viewer_stack_values(&target, viewer.channel, viewer.t, bbox)?
+            } else {
+                slice_values_in_bbox(&slice, bbox)?
+            };
+            let dataset = threshold_values_dataset(values, pixel_type)?;
+            let output = self
+                .state
+                .app
+                .ops_service()
+                .execute("threshold.make_binary", &dataset, params)
+                .map_err(|error| error.to_string())?;
+            let measurements = output
+                .measurements
+                .ok_or_else(|| "threshold did not report threshold range".to_string())?;
+            let low = measurements
+                .values
+                .get("threshold_min")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| "threshold did not report threshold_min".to_string())?
+                as f32;
+            let high = measurements
+                .values
+                .get("threshold_max")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| "threshold did not report threshold_max".to_string())?
+                as f32;
+            (low, high)
+        };
+
+        if !low.is_finite() || !high.is_finite() || high < low {
+            return Err("threshold min/max must be finite and ordered".to_string());
+        }
+
+        let mode = params
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(ThresholdOverlayMode::from_label)
+            .unwrap_or(ThresholdOverlayMode::Red);
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        session.set_threshold_overlay(Some(ThresholdOverlay { low, high, mode }));
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.last_generation = 0;
+            viewer.status_message = format!("Threshold {low:.4}..{high:.4}");
+        }
+        if self.adjust_dialog.open && self.adjust_dialog.window_label == target {
+            self.adjust_dialog.min = low;
+            self.adjust_dialog.max = high;
+        }
+        Ok(format!("threshold set to {low:.4}..{high:.4}"))
+    }
+
+    fn reset_threshold_overlay(
+        &mut self,
+        window_label: &str,
+        no_reset_range: bool,
+    ) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        session.set_threshold_overlay(None);
+        if !no_reset_range {
+            session.set_display_range(None);
+        }
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.last_generation = 0;
+            viewer.status_message = if no_reset_range {
+                "Threshold reset".to_string()
+            } else {
+                "Threshold and display range reset".to_string()
+            };
+        }
+        Ok(if no_reset_range {
+            "threshold reset".to_string()
+        } else {
+            "threshold and display range reset".to_string()
+        })
+    }
+
+    fn threshold_apply_bounds(
+        &self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<(f32, f32), String> {
+        if let (Some(lower), Some(upper)) = (
+            params.get("min").and_then(Value::as_f64),
+            params.get("max").and_then(Value::as_f64),
+        ) {
+            let lower = lower as f32;
+            let upper = upper as f32;
+            if lower.is_finite() && upper.is_finite() && upper >= lower {
+                return Ok((lower, upper));
+            }
+            return Err("threshold min/max must be finite and ordered".to_string());
+        }
+
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        let threshold = session
+            .threshold_overlay
+            .ok_or_else(|| "Threshold is not set".to_string())?;
+        Ok((threshold.low, threshold.high))
+    }
+
+    fn threshold_apply_needs_float_prompt(&self, window_label: &str) -> bool {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        self.state
+            .label_to_session
+            .get(&target)
+            .and_then(|session| session.committed_source.to_dataset().ok())
+            .is_some_and(|dataset| dataset.metadata.pixel_type == PixelType::F32)
+    }
+
+    fn apply_lut_needs_confirmation(&self, window_label: &str) -> bool {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        self.state
+            .label_to_session
+            .get(&target)
+            .and_then(|session| session.committed_source.to_dataset().ok())
+            .is_some_and(|dataset| {
+                matches!(dataset.metadata.pixel_type, PixelType::U8 | PixelType::U16)
+            })
+    }
+
+    fn handle_color_threshold_command(
+        &mut self,
+        window_label: &str,
+        params: Value,
+    ) -> command_registry::CommandExecuteResult {
+        let action = params
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("threshold");
+
+        match action {
+            "original" => {
+                let Some(target) = self.current_viewer_label(window_label).map(str::to_string)
+                else {
+                    return command_registry::CommandExecuteResult::blocked(
+                        "a loaded image is required for Color Threshold",
+                    );
+                };
+                let Some(session) = self.state.label_to_session.get_mut(&target) else {
+                    return command_registry::CommandExecuteResult::blocked(format!(
+                        "no viewer session for `{target}`"
+                    ));
+                };
+                session.set_active_preview(None);
+                if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+                    viewer.last_generation = 0;
+                    viewer.last_request = None;
+                    viewer.status_message = "Color threshold original".to_string();
+                }
+                command_registry::CommandExecuteResult::ok("color threshold original restored")
+            }
+            "filtered" => {
+                let mut params = params;
+                if let Some(map) = params.as_object_mut() {
+                    map.insert("output".to_string(), json!("filtered"));
+                }
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.color_threshold".to_string(),
+                        params,
+                        mode: OpRunMode::Preview,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "color threshold filtered preview started",
+                        json!({ "job_id": ticket.job_id, "op": "image.color_threshold" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "select" => match self.create_color_threshold_selection(window_label, &params) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "sample" => match self.sample_color_threshold_selection(window_label, &params) {
+                Ok(_) => {
+                    let mut preview_params = color_threshold_params(&self.adjust_dialog);
+                    if let Some(map) = preview_params.as_object_mut() {
+                        map.insert("output".to_string(), json!("filtered"));
+                    }
+                    match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "image.color_threshold".to_string(),
+                            params: preview_params,
+                            mode: OpRunMode::Preview,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "color threshold ranges sampled and preview started",
+                            json!({ "job_id": ticket.job_id, "op": "image.color_threshold" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    }
+                }
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "auto" => match self.auto_color_threshold_ranges(window_label, &params) {
+                Ok(_) => {
+                    let mut preview_params = color_threshold_params(&self.adjust_dialog);
+                    if let Some(map) = preview_params.as_object_mut() {
+                        map.insert("output".to_string(), json!("filtered"));
+                    }
+                    match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "image.color_threshold".to_string(),
+                            params: preview_params,
+                            mode: OpRunMode::Preview,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "color threshold auto ranges preview started",
+                            json!({ "job_id": ticket.job_id, "op": "image.color_threshold" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    }
+                }
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "stack" => {
+                let mut params = params;
+                if let Some(map) = params.as_object_mut() {
+                    map.insert("output".to_string(), json!("filtered"));
+                }
+                match self.viewer_start_op(
+                    window_label,
+                    ViewerOpRequest {
+                        op: "image.color_threshold".to_string(),
+                        params,
+                        mode: OpRunMode::Apply,
+                    },
+                ) {
+                    Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                        "color threshold stack started",
+                        json!({ "job_id": ticket.job_id, "op": "image.color_threshold" }),
+                    ),
+                    Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                }
+            }
+            "macro" => match self.record_color_threshold_macro(&params) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            "help" => match self.show_color_threshold_help(window_label) {
+                Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+            _ => match self.viewer_start_op(
+                window_label,
+                ViewerOpRequest {
+                    op: "image.color_threshold".to_string(),
+                    params,
+                    mode: OpRunMode::Apply,
+                },
+            ) {
+                Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                    "color threshold started",
+                    json!({ "job_id": ticket.job_id, "op": "image.color_threshold" }),
+                ),
+                Err(error) => command_registry::CommandExecuteResult::blocked(error),
+            },
+        }
+    }
+
+    fn show_color_threshold_help(&mut self, window_label: &str) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Color Threshold Help".to_string())?
+            .to_string();
+        let message = "Color Thresholder: choose HSB/RGB/CIE Lab/YUV component ranges; Pass keeps pixels inside a band, otherwise outside; Original restores the source, Filtered previews, Stack applies, Select traces, Sample reads the selection.";
+        let viewer = self
+            .viewers_ui
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+        viewer.status_message = "Color Threshold help shown".to_string();
+        viewer.tool_message = Some(message.to_string());
+        Ok("color threshold help shown".to_string())
+    }
+
+    fn create_color_threshold_selection(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Color Threshold Select".to_string())?
+            .to_string();
+        let (request, dataset) = {
+            let viewer = self
+                .viewers_ui
+                .get(&target)
+                .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+            let session = self
+                .state
+                .label_to_session
+                .get(&target)
+                .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+            (
+                ViewerFrameRequest {
+                    z: viewer.z,
+                    t: viewer.t,
+                    channel: 0,
+                },
+                session.committed_source.to_dataset()?,
+            )
+        };
+        let mask = self
+            .state
+            .app
+            .ops_service()
+            .execute("image.color_threshold", dataset.as_ref(), params)
+            .map_err(|error| error.to_string())?
+            .dataset;
+        let slice = extract_slice(&mask, request.z, request.t, 0)?;
+        let roi = mask_foreground_roi(&slice)
+            .ok_or_else(|| "Color Threshold Select found no thresholded pixels".to_string())?;
+        let viewer = self
+            .viewers_ui
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+        let position = interaction::roi::RoiPosition {
+            channel: viewer.channel,
+            z: viewer.z,
+            t: viewer.t,
+        };
+        viewer.rois.begin_active(roi, position);
+        viewer.rois.commit_active(false);
+        viewer.status_message = "Color threshold selection created".to_string();
+        Ok("color threshold selection created".to_string())
+    }
+
+    fn sample_color_threshold_selection(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Color Threshold Sample".to_string())?
+            .to_string();
+        let color_space = params
+            .get("color_space")
+            .or_else(|| params.get("space"))
+            .and_then(Value::as_str)
+            .unwrap_or("HSB");
+        let color_space = color_threshold_space_key(color_space);
+        let (bbox, z, t, dataset) = {
+            let viewer = self
+                .viewers_ui
+                .get(&target)
+                .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+            let roi = viewer
+                .rois
+                .active_roi
+                .as_ref()
+                .or_else(|| {
+                    viewer
+                        .rois
+                        .selected_roi_id
+                        .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
+                })
+                .ok_or_else(|| "Color Threshold Sample requires a selection".to_string())?;
+            let bbox = roi_kind_bbox(&roi.kind)
+                .ok_or_else(|| "Color Threshold Sample requires a bounded selection".to_string())?;
+            let session = self
+                .state
+                .label_to_session
+                .get(&target)
+                .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+            (
+                bbox,
+                viewer.z,
+                viewer.t,
+                session.committed_source.to_dataset()?,
+            )
+        };
+        let ranges = sample_color_threshold_ranges(dataset.as_ref(), bbox, z, t, &color_space)?;
+        self.adjust_dialog.hue_min = ranges[0].0;
+        self.adjust_dialog.hue_max = ranges[0].1;
+        self.adjust_dialog.saturation_min = ranges[1].0;
+        self.adjust_dialog.saturation_max = ranges[1].1;
+        self.adjust_dialog.brightness_min = ranges[2].0;
+        self.adjust_dialog.brightness_max = ranges[2].1;
+        self.adjust_dialog.hue_pass = true;
+        self.adjust_dialog.saturation_pass = true;
+        self.adjust_dialog.brightness_pass = true;
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.status_message = "Color threshold ranges sampled".to_string();
+        }
+        Ok("color threshold ranges sampled from selection".to_string())
+    }
+
+    fn auto_color_threshold_ranges(
+        &mut self,
+        window_label: &str,
+        params: &Value,
+    ) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .ok_or_else(|| "a loaded image is required for Color Threshold auto".to_string())?
+            .to_string();
+        let color_space = params
+            .get("color_space")
+            .or_else(|| params.get("space"))
+            .and_then(Value::as_str)
+            .unwrap_or("HSB");
+        let color_space = color_threshold_space_key(color_space);
+        let method = params
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("Default");
+        let background = if params
+            .get("dark_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            "dark"
+        } else {
+            "light"
+        };
+        let (z, t, dataset) = {
+            let viewer = self
+                .viewers_ui
+                .get(&target)
+                .ok_or_else(|| format!("no viewer UI state for `{target}`"))?;
+            let session = self
+                .state
+                .label_to_session
+                .get(&target)
+                .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+            (viewer.z, viewer.t, session.committed_source.to_dataset()?)
+        };
+        let ranges = color_threshold_auto_ranges(
+            dataset.as_ref(),
+            z,
+            t,
+            &color_space,
+            method,
+            background,
+            &self.state.app,
+        )?;
+        match color_space.as_str() {
+            "rgb" => {
+                self.adjust_dialog.hue_min = ranges[0].0;
+                self.adjust_dialog.hue_max = ranges[0].1;
+                self.adjust_dialog.saturation_min = ranges[1].0;
+                self.adjust_dialog.saturation_max = ranges[1].1;
+                self.adjust_dialog.brightness_min = ranges[2].0;
+                self.adjust_dialog.brightness_max = ranges[2].1;
+            }
+            "lab" | "yuv" => {
+                self.adjust_dialog.hue_min = ranges[0].0;
+                self.adjust_dialog.hue_max = ranges[0].1;
+            }
+            _ => {
+                self.adjust_dialog.brightness_min = ranges[2].0;
+                self.adjust_dialog.brightness_max = ranges[2].1;
+            }
+        }
+        self.adjust_dialog.hue_pass = true;
+        self.adjust_dialog.saturation_pass = true;
+        self.adjust_dialog.brightness_pass = true;
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.status_message = "Color threshold auto ranges set".to_string();
+        }
+        Ok("color threshold auto ranges set".to_string())
+    }
+
+    fn record_color_threshold_macro(&mut self, params: &Value) -> Result<String, String> {
+        if !self.macro_recorder.open || !self.macro_recorder.recording {
+            return Err(
+                "Color Threshold Macro requires the macro recorder to be running".to_string(),
+            );
+        }
+        let text = color_threshold_macro_text(params);
+        if !self.macro_recorder.text.is_empty() && !self.macro_recorder.text.ends_with('\n') {
+            self.macro_recorder.text.push('\n');
+        }
+        self.macro_recorder.text.push_str(&text);
+        if !self.macro_recorder.text.ends_with('\n') {
+            self.macro_recorder.text.push('\n');
+        }
+        Ok("color threshold macro recorded".to_string())
     }
 
     fn remember_repeatable_command(
@@ -4350,28 +5098,65 @@ impl ImageUiApp {
                 if request.params.is_none() {
                     return self.open_adjust_dialog(window_label, AdjustDialogKind::ColorBalance);
                 }
-                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
-                    viewer.status_message =
-                        "image.adjust.color_balance compatibility command acknowledged".to_string();
-                    viewer.tool_message = Some(viewer.status_message.clone());
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                if params
+                    .get("apply")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    if let Err(error) = self.ensure_apply_lut_supported(window_label) {
+                        return command_registry::CommandExecuteResult::blocked(error);
+                    }
+                    let low = params
+                        .get("min")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                        .unwrap_or(0.0);
+                    let high = params
+                        .get("max")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                        .unwrap_or(1.0);
+                    let mut op_params = json!({ "low": low, "high": high });
+                    if let Some(channel) = params
+                        .get("channel")
+                        .and_then(Value::as_str)
+                        .and_then(color_balance_channel_index)
+                        && let Some(map) = op_params.as_object_mut()
+                    {
+                        map.insert("channel".to_string(), json!(channel));
+                    }
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "intensity.window".to_string(),
+                            params: op_params,
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "apply LUT started",
+                            json!({ "job_id": ticket.job_id, "op": "intensity.window" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
                 }
-                command_registry::CommandExecuteResult::ok(
-                    "image.adjust.color_balance compatibility command acknowledged",
+                if params.get("min").is_some() || params.get("max").is_some() {
+                    return match self.apply_display_range(window_label, &params, "min", "max") {
+                        Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
+                command_registry::CommandExecuteResult::blocked(
+                    "color balance requires min/max display range parameters",
                 )
             }
             "image.adjust.color_threshold" => {
                 if request.params.is_none() {
                     return self.open_adjust_dialog(window_label, AdjustDialogKind::ColorThreshold);
                 }
-                if let Some(viewer) = self.viewers_ui.get_mut(window_label) {
-                    viewer.status_message =
-                        "image.adjust.color_threshold compatibility command acknowledged"
-                            .to_string();
-                    viewer.tool_message = Some(viewer.status_message.clone());
-                }
-                command_registry::CommandExecuteResult::ok(
-                    "image.adjust.color_threshold compatibility command acknowledged",
-                )
+                let params = command_registry::merge_params(&request.command_id, request.params);
+                self.handle_color_threshold_command(window_label, params)
             }
             "image.stacks.add_slice" | "image.stacks.delete_slice" => {
                 let viewer_z = self
@@ -5021,12 +5806,26 @@ impl ImageUiApp {
                 if let Some(session) = self.state.label_to_session.get(window_label) {
                     self.resize_dialog.width = session.committed_summary.shape[1];
                     self.resize_dialog.height = session.committed_summary.shape[0];
+                    self.resize_dialog.original_width = session.committed_summary.shape[1];
+                    self.resize_dialog.original_height = session.committed_summary.shape[0];
+                    self.resize_dialog.depth = session.committed_summary.z_slices.max(1);
+                    self.resize_dialog.frames = session.committed_summary.times.max(1);
                 }
                 self.resize_dialog.open = true;
                 command_registry::CommandExecuteResult::ok("resize dialog opened")
             }
             "image.adjust.canvas" => {
                 if let Some(params) = request.params {
+                    let mut params = params;
+                    if params.get("fill").is_none()
+                        && !params.get("zero").and_then(Value::as_bool).unwrap_or(false)
+                    {
+                        if let Some(map) = params.as_object_mut() {
+                            let background =
+                                f32::from(self.tool_options.background_color.r()) / 255.0;
+                            map.insert("fill".to_string(), json!(background));
+                        }
+                    }
                     return match self.viewer_start_op(
                         window_label,
                         ViewerOpRequest {
@@ -5045,6 +5844,10 @@ impl ImageUiApp {
                 if let Some(session) = self.state.label_to_session.get(window_label) {
                     self.canvas_dialog.width = session.committed_summary.shape[1];
                     self.canvas_dialog.height = session.committed_summary.shape[0];
+                    self.canvas_dialog.original_width = session.committed_summary.shape[1];
+                    self.canvas_dialog.original_height = session.committed_summary.shape[0];
+                    self.canvas_dialog.depth = session.committed_summary.z_slices.max(1);
+                    self.canvas_dialog.frames = session.committed_summary.times.max(1);
                 }
                 self.canvas_dialog.open = true;
                 command_registry::CommandExecuteResult::ok("canvas size dialog opened")
@@ -5090,6 +5893,9 @@ impl ImageUiApp {
                     .and_then(Value::as_bool)
                     .unwrap_or(false)
                 {
+                    if let Err(error) = self.ensure_apply_lut_supported(window_label) {
+                        return command_registry::CommandExecuteResult::blocked(error);
+                    }
                     let low = params
                         .get("min")
                         .and_then(Value::as_f64)
@@ -5159,6 +5965,39 @@ impl ImageUiApp {
                     return self.open_adjust_dialog(window_label, AdjustDialogKind::WindowLevel);
                 }
                 let params = command_registry::merge_params(&request.command_id, request.params);
+                if params
+                    .get("apply")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    if let Err(error) = self.ensure_apply_lut_supported(window_label) {
+                        return command_registry::CommandExecuteResult::blocked(error);
+                    }
+                    let low = params
+                        .get("low")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                        .unwrap_or(0.0);
+                    let high = params
+                        .get("high")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                        .unwrap_or(1.0);
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "intensity.window".to_string(),
+                            params: json!({ "low": low, "high": high }),
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "apply LUT started",
+                            json!({ "job_id": ticket.job_id, "op": "intensity.window" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
                 match self.apply_display_range(window_label, &params, "low", "high") {
                     Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
@@ -5169,26 +6008,54 @@ impl ImageUiApp {
                     return self.open_adjust_dialog(window_label, AdjustDialogKind::Threshold);
                 }
                 let params = command_registry::merge_params(&request.command_id, request.params);
-                let op = if params
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .is_some_and(|method| method.eq_ignore_ascii_case("otsu"))
+                if !params
+                    .get("apply")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
                 {
-                    "threshold.otsu"
-                } else {
-                    "threshold.make_binary"
-                };
+                    return match self.set_threshold_overlay(window_label, &params) {
+                        Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
+                if params
+                    .get("background_to_nan")
+                    .or_else(|| params.get("nan_background"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let (lower, upper) = match self.threshold_apply_bounds(window_label, &params) {
+                        Ok(bounds) => bounds,
+                        Err(error) => {
+                            return command_registry::CommandExecuteResult::blocked(error);
+                        }
+                    };
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "intensity.nan_background".to_string(),
+                            params: json!({ "lower": lower, "upper": upper }),
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "nan background started",
+                            json!({ "job_id": ticket.job_id, "op": "intensity.nan_background" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
                 match self.viewer_start_op(
                     window_label,
                     ViewerOpRequest {
-                        op: op.to_string(),
+                        op: "threshold.make_binary".to_string(),
                         params,
                         mode: OpRunMode::Apply,
                     },
                 ) {
                     Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
                         "binary threshold started",
-                        json!({ "job_id": ticket.job_id, "op": op }),
+                        json!({ "job_id": ticket.job_id, "op": "threshold.make_binary" }),
                     ),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
                 }
@@ -5997,7 +6864,13 @@ impl ImageUiApp {
 
         match compute_viewer_frame(&mut self.state, label, &request, None) {
             Ok(frame) => {
-                let color = to_color_image(&frame, viewer.lookup_table);
+                let threshold_overlay = self
+                    .state
+                    .label_to_session
+                    .get(label)
+                    .and_then(|session| session.threshold_overlay);
+                let color =
+                    to_color_image_with_threshold(&frame, viewer.lookup_table, threshold_overlay);
                 let viewer_state = self
                     .viewers_ui
                     .get_mut(label)
@@ -6744,6 +7617,8 @@ impl ImageUiApp {
     fn draw_utility_windows(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
         self.draw_new_image_dialog(ctx, actions);
         self.draw_adjust_dialog(ctx, actions);
+        self.draw_threshold_apply_dialog(ctx, actions);
+        self.draw_apply_lut_dialog(ctx, actions);
         self.draw_resize_dialog(ctx, actions, false);
         self.draw_resize_dialog(ctx, actions, true);
         self.draw_stack_position_dialog(ctx, actions);
@@ -7315,8 +8190,9 @@ impl ImageUiApp {
 
         let kind = self.adjust_dialog.kind;
         let mut open = self.adjust_dialog.open;
-        let mut close = false;
-        egui::Window::new(kind.title())
+        let close = false;
+        let title = adjust_dialog_window_title(&self.adjust_dialog);
+        egui::Window::new(title)
             .open(&mut open)
             .show(ctx, |ui| match kind {
                 AdjustDialogKind::BrightnessContrast => {
@@ -7325,11 +8201,14 @@ impl ImageUiApp {
                         self.adjust_dialog.histogram.as_ref(),
                         Some((self.adjust_dialog.min, self.adjust_dialog.max)),
                         None,
+                        self.adjust_dialog.log_histogram,
                     );
+                    ui.checkbox(&mut self.adjust_dialog.log_histogram, "Log scale");
                     let (slider_min, slider_max) = adjust_slider_bounds(&self.adjust_dialog);
+                    let mut display_range_changed = false;
                     ui.horizontal(|ui| {
                         ui.label("Minimum");
-                        let changed = ui
+                        let slider_changed = ui
                             .add(
                                 egui::Slider::new(
                                     &mut self.adjust_dialog.min,
@@ -7338,15 +8217,18 @@ impl ImageUiApp {
                                 .show_value(false),
                             )
                             .changed();
-                        ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).speed(0.1));
-                        if changed {
+                        let value_changed = ui
+                            .add(egui::DragValue::new(&mut self.adjust_dialog.min).speed(0.1))
+                            .changed();
+                        if slider_changed || value_changed {
                             clamp_adjust_min_max(&mut self.adjust_dialog);
                             sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
                         }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Maximum");
-                        let changed = ui
+                        let slider_changed = ui
                             .add(
                                 egui::Slider::new(
                                     &mut self.adjust_dialog.max,
@@ -7355,10 +8237,13 @@ impl ImageUiApp {
                                 .show_value(false),
                             )
                             .changed();
-                        ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).speed(0.1));
-                        if changed {
+                        let value_changed = ui
+                            .add(egui::DragValue::new(&mut self.adjust_dialog.max).speed(0.1))
+                            .changed();
+                        if slider_changed || value_changed {
                             clamp_adjust_min_max(&mut self.adjust_dialog);
                             sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
                         }
                     });
                     ui.horizontal(|ui| {
@@ -7371,7 +8256,9 @@ impl ImageUiApp {
                             .changed()
                         {
                             adjust_min_max_from_brightness(&mut self.adjust_dialog);
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
                             sync_contrast_from_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
                         }
                     });
                     ui.horizontal(|ui| {
@@ -7384,16 +8271,27 @@ impl ImageUiApp {
                             .changed()
                         {
                             adjust_min_max_from_contrast(&mut self.adjust_dialog);
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
                             sync_brightness_from_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
                         }
                     });
+                    if display_range_changed {
+                        push_adjust_display_range_action(
+                            actions,
+                            &self.adjust_dialog,
+                            "image.adjust.brightness",
+                            "min",
+                            "max",
+                        );
+                    }
                     egui::Grid::new("brightness_contrast_buttons")
                         .num_columns(2)
                         .spacing(egui::vec2(4.0, 4.0))
                         .show(ui, |ui| {
                             if ui.button("Auto").clicked() {
                                 let (min, max) =
-                                    auto_contrast_range(self.adjust_dialog.histogram.as_ref())
+                                    auto_contrast_range_for_dialog(&mut self.adjust_dialog)
                                         .unwrap_or((
                                             self.adjust_dialog.default_min,
                                             self.adjust_dialog.default_max,
@@ -7411,6 +8309,7 @@ impl ImageUiApp {
                                 });
                             }
                             if ui.button("Reset").clicked() {
+                                self.adjust_dialog.contrast_auto_threshold = 0;
                                 self.adjust_dialog.min = self.adjust_dialog.default_min;
                                 self.adjust_dialog.max = self.adjust_dialog.default_max;
                                 sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
@@ -7432,15 +8331,27 @@ impl ImageUiApp {
                                 });
                             }
                             if ui.button("Apply").clicked() {
-                                actions.push(UiAction::Command {
-                                    window_label: self.adjust_dialog.window_label.clone(),
-                                    command_id: "image.adjust.brightness".to_string(),
-                                    params: Some(json!({
-                                        "min": self.adjust_dialog.min,
-                                        "max": self.adjust_dialog.max,
-                                        "apply": true,
-                                    })),
+                                let window_label = self.adjust_dialog.window_label.clone();
+                                let command_id = "image.adjust.window_level".to_string();
+                                let params = json!({
+                                    "low": self.adjust_dialog.min,
+                                    "high": self.adjust_dialog.max,
+                                    "apply": true,
                                 });
+                                if self.apply_lut_needs_confirmation(&window_label) {
+                                    self.apply_lut_dialog = ApplyLutDialogState {
+                                        open: true,
+                                        window_label,
+                                        command_id,
+                                        params,
+                                    };
+                                } else {
+                                    actions.push(UiAction::Command {
+                                        window_label,
+                                        command_id,
+                                        params: Some(params),
+                                    });
+                                }
                             }
                         });
                 }
@@ -7450,144 +8361,752 @@ impl ImageUiApp {
                         self.adjust_dialog.histogram.as_ref(),
                         Some((self.adjust_dialog.min, self.adjust_dialog.max)),
                         None,
+                        self.adjust_dialog.log_histogram,
                     );
-                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Low "));
-                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("High "));
-                    if ui.button("Set").clicked() {
-                        actions.push(UiAction::Command {
-                            window_label: self.adjust_dialog.window_label.clone(),
-                            command_id: "image.adjust.window_level".to_string(),
-                            params: Some(json!({
-                                "low": self.adjust_dialog.min,
-                                "high": self.adjust_dialog.max,
-                            })),
-                        });
-                        close = true;
-                    }
-                }
-                AdjustDialogKind::ColorBalance => {
-                    ui.add(egui::Slider::new(&mut self.adjust_dialog.red, 0.0..=2.0).text("Red"));
-                    ui.add(
-                        egui::Slider::new(&mut self.adjust_dialog.green, 0.0..=2.0).text("Green"),
-                    );
-                    ui.add(egui::Slider::new(&mut self.adjust_dialog.blue, 0.0..=2.0).text("Blue"));
-                    if ui.button("Apply").clicked() {
-                        actions.push(UiAction::Command {
-                            window_label: self.adjust_dialog.window_label.clone(),
-                            command_id: "image.adjust.color_balance".to_string(),
-                            params: Some(json!({
-                                "red": self.adjust_dialog.red,
-                                "green": self.adjust_dialog.green,
-                                "blue": self.adjust_dialog.blue,
-                            })),
-                        });
-                        close = true;
-                    }
-                }
-                AdjustDialogKind::Threshold => {
-                    let high = self
-                        .adjust_dialog
-                        .histogram
-                        .as_ref()
-                        .map(|histogram| histogram.max)
-                        .unwrap_or(self.adjust_dialog.max);
-                    draw_adjust_histogram(
-                        ui,
-                        self.adjust_dialog.histogram.as_ref(),
-                        Some((self.adjust_dialog.threshold, high)),
-                        Some(self.adjust_dialog.threshold),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut self.adjust_dialog.threshold)
-                            .prefix("Threshold "),
-                    );
-                    ui.checkbox(&mut self.adjust_dialog.dark_background, "Dark background");
+                    ui.checkbox(&mut self.adjust_dialog.log_histogram, "Log scale");
+                    let level = self.adjust_dialog.min
+                        + (self.adjust_dialog.max - self.adjust_dialog.min) * 0.5;
+                    let window = self.adjust_dialog.max - self.adjust_dialog.min;
+                    let mut display_range_changed = false;
                     ui.horizontal(|ui| {
-                        if ui.button("Auto").clicked() {
-                            actions.push(UiAction::Command {
-                                window_label: self.adjust_dialog.window_label.clone(),
-                                command_id: "image.adjust.threshold".to_string(),
-                                params: Some(json!({ "method": "otsu" })),
-                            });
-                            close = true;
-                        }
-                        if ui.button("Apply").clicked() {
-                            let background = if self.adjust_dialog.dark_background {
-                                "dark"
-                            } else {
-                                "light"
-                            };
-                            actions.push(UiAction::Command {
-                                window_label: self.adjust_dialog.window_label.clone(),
-                                command_id: "image.adjust.threshold".to_string(),
-                                params: Some(json!({
-                                    "method": "fixed",
-                                    "threshold": self.adjust_dialog.threshold,
-                                    "background": background,
-                                })),
-                            });
-                            close = true;
+                        ui.label(format!("Level: {level:.4}"));
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.adjust_dialog.brightness, 0.0..=1.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            adjust_min_max_from_brightness(&mut self.adjust_dialog);
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
+                            sync_contrast_from_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Window: {window:.4}"));
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.adjust_dialog.contrast, 0.0..=1.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            adjust_min_max_from_contrast(&mut self.adjust_dialog);
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
+                            sync_brightness_from_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
+                        }
+                    });
+                    if display_range_changed {
+                        push_adjust_display_range_action(
+                            actions,
+                            &self.adjust_dialog,
+                            "image.adjust.window_level",
+                            "low",
+                            "high",
+                        );
+                    }
+                    egui::Grid::new("window_level_buttons")
+                        .num_columns(2)
+                        .spacing(egui::vec2(4.0, 4.0))
+                        .show(ui, |ui| {
+                            if ui.button("Auto").clicked() {
+                                let (min, max) =
+                                    auto_contrast_range_for_dialog(&mut self.adjust_dialog)
+                                        .unwrap_or((
+                                            self.adjust_dialog.default_min,
+                                            self.adjust_dialog.default_max,
+                                        ));
+                                self.adjust_dialog.min = min;
+                                self.adjust_dialog.max = max;
+                                sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.window_level".to_string(),
+                                    params: Some(json!({
+                                        "low": self.adjust_dialog.min,
+                                        "high": self.adjust_dialog.max,
+                                    })),
+                                });
+                            }
+                            if ui.button("Reset").clicked() {
+                                self.adjust_dialog.contrast_auto_threshold = 0;
+                                self.adjust_dialog.min = self.adjust_dialog.default_min;
+                                self.adjust_dialog.max = self.adjust_dialog.default_max;
+                                sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.window_level".to_string(),
+                                    params: Some(json!({
+                                        "low": self.adjust_dialog.min,
+                                        "high": self.adjust_dialog.max,
+                                    })),
+                                });
+                            }
+                            ui.end_row();
+                            if ui.button("Set").clicked() {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.window_level".to_string(),
+                                    params: Some(json!({
+                                        "low": self.adjust_dialog.min,
+                                        "high": self.adjust_dialog.max,
+                                    })),
+                                });
+                            }
+                            if ui.button("Apply").clicked() {
+                                let window_label = self.adjust_dialog.window_label.clone();
+                                let command_id = "image.adjust.brightness".to_string();
+                                let params = json!({
+                                    "min": self.adjust_dialog.min,
+                                    "max": self.adjust_dialog.max,
+                                    "apply": true,
+                                });
+                                if self.apply_lut_needs_confirmation(&window_label) {
+                                    self.apply_lut_dialog = ApplyLutDialogState {
+                                        open: true,
+                                        window_label,
+                                        command_id,
+                                        params,
+                                    };
+                                } else {
+                                    actions.push(UiAction::Command {
+                                        window_label,
+                                        command_id,
+                                        params: Some(params),
+                                    });
+                                }
+                            }
+                        });
                 }
-                AdjustDialogKind::ColorThreshold => {
+                AdjustDialogKind::ColorBalance => {
                     draw_adjust_histogram(
                         ui,
                         self.adjust_dialog.histogram.as_ref(),
                         Some((self.adjust_dialog.min, self.adjust_dialog.max)),
                         None,
+                        self.adjust_dialog.log_histogram,
                     );
-                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Minimum "));
-                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("Maximum "));
-                    if ui.button("Apply").clicked() {
+                    ui.checkbox(&mut self.adjust_dialog.log_histogram, "Log scale");
+                    let mut display_range_changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Brightness");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.adjust_dialog.brightness, 0.0..=1.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            adjust_min_max_from_brightness(&mut self.adjust_dialog);
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
+                            display_range_changed = true;
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("color_balance_channel_choice")
+                        .selected_text(&self.adjust_dialog.color_balance_channel)
+                        .show_ui(ui, |ui| {
+                            for channel in
+                                ["Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "All"]
+                            {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.color_balance_channel,
+                                    channel.to_string(),
+                                    channel,
+                                );
+                            }
+                        });
+                    if display_range_changed {
                         actions.push(UiAction::Command {
                             window_label: self.adjust_dialog.window_label.clone(),
-                            command_id: "image.adjust.color_threshold".to_string(),
+                            command_id: "image.adjust.color_balance".to_string(),
+                            params: Some(json!(color_balance_params(&self.adjust_dialog))),
+                        });
+                    }
+                    egui::Grid::new("color_balance_buttons")
+                        .num_columns(2)
+                        .spacing(egui::vec2(4.0, 4.0))
+                        .show(ui, |ui| {
+                            if ui.button("Auto").clicked() {
+                                let (min, max) =
+                                    auto_contrast_range_for_dialog(&mut self.adjust_dialog)
+                                        .unwrap_or((
+                                            self.adjust_dialog.default_min,
+                                            self.adjust_dialog.default_max,
+                                        ));
+                                self.adjust_dialog.min = min;
+                                self.adjust_dialog.max = max;
+                                sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_balance".to_string(),
+                                    params: Some(json!(color_balance_params(&self.adjust_dialog))),
+                                });
+                            }
+                            if ui.button("Reset").clicked() {
+                                self.adjust_dialog.contrast_auto_threshold = 0;
+                                self.adjust_dialog.min = self.adjust_dialog.default_min;
+                                self.adjust_dialog.max = self.adjust_dialog.default_max;
+                                sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_balance".to_string(),
+                                    params: Some(json!(color_balance_params(&self.adjust_dialog))),
+                                });
+                            }
+                            ui.end_row();
+                            if ui.button("Set").clicked() {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_balance".to_string(),
+                                    params: Some(json!(color_balance_params(&self.adjust_dialog))),
+                                });
+                            }
+                            if ui.button("Apply").clicked() {
+                                let mut params = color_balance_params(&self.adjust_dialog);
+                                if let Some(map) = params.as_object_mut() {
+                                    map.insert("apply".to_string(), json!(true));
+                                }
+                                let window_label = self.adjust_dialog.window_label.clone();
+                                let command_id = "image.adjust.color_balance".to_string();
+                                if self.apply_lut_needs_confirmation(&window_label) {
+                                    self.apply_lut_dialog = ApplyLutDialogState {
+                                        open: true,
+                                        window_label,
+                                        command_id,
+                                        params,
+                                    };
+                                } else {
+                                    actions.push(UiAction::Command {
+                                        window_label,
+                                        command_id,
+                                        params: Some(params),
+                                    });
+                                }
+                            }
+                        });
+                }
+                AdjustDialogKind::Threshold => {
+                    draw_adjust_histogram(
+                        ui,
+                        self.adjust_dialog.histogram.as_ref(),
+                        Some((self.adjust_dialog.min, self.adjust_dialog.max)),
+                        None,
+                        false,
+                    );
+                    let in_range_count = self
+                        .adjust_dialog
+                        .histogram
+                        .as_ref()
+                        .map(|histogram| {
+                            histogram
+                                .counts
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, count)| {
+                                    let denominator =
+                                        histogram.counts.len().saturating_sub(1).max(1) as f32;
+                                    let bin_value = histogram.min
+                                        + (index as f32 / denominator)
+                                            * (histogram.max - histogram.min);
+                                    (bin_value >= self.adjust_dialog.min
+                                        && bin_value <= self.adjust_dialog.max)
+                                        .then_some(*count)
+                                })
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0);
+                    let total_count = self
+                        .adjust_dialog
+                        .histogram
+                        .as_ref()
+                        .map(|histogram| histogram.pixel_count as u64)
+                        .unwrap_or(0);
+                    if total_count > 0 {
+                        ui.label(format!(
+                            "{:.1}% ({}/{})",
+                            (in_range_count as f32 / total_count as f32) * 100.0,
+                            in_range_count,
+                            total_count
+                        ));
+                    }
+                    let (slider_min, slider_max) = adjust_slider_bounds(&self.adjust_dialog);
+                    let mut threshold_range_changed = false;
+                    egui::Grid::new("threshold_adjust_grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(8.0, 4.0))
+                        .show(ui, |ui| {
+                            if ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.adjust_dialog.min,
+                                        slider_min..=slider_max,
+                                    )
+                                    .show_value(false),
+                                )
+                                .changed()
+                            {
+                                threshold_range_changed = true;
+                            }
+                            if ui
+                                .add(egui::DragValue::new(&mut self.adjust_dialog.min).speed(0.1))
+                                .changed()
+                            {
+                                threshold_range_changed = true;
+                            }
+                            ui.end_row();
+                            if ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.adjust_dialog.max,
+                                        slider_min..=slider_max,
+                                    )
+                                    .show_value(false),
+                                )
+                                .changed()
+                            {
+                                threshold_range_changed = true;
+                            }
+                            if ui
+                                .add(egui::DragValue::new(&mut self.adjust_dialog.max).speed(0.1))
+                                .changed()
+                            {
+                                threshold_range_changed = true;
+                            }
+                            ui.end_row();
+                        });
+                    clamp_adjust_min_max(&mut self.adjust_dialog);
+                    if threshold_range_changed {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.threshold".to_string(),
                             params: Some(json!({
                                 "min": self.adjust_dialog.min,
                                 "max": self.adjust_dialog.max,
+                                "mode": self.adjust_dialog.threshold_mode,
+                                "background": threshold_background_param(
+                                    self.adjust_dialog.dark_background
+                                ),
                             })),
                         });
-                        close = true;
                     }
+                    let method_changed = egui::ComboBox::from_id_salt("threshold_method_choice")
+                        .selected_text(&self.adjust_dialog.threshold_method)
+                        .show_ui(ui, |ui| {
+                            for method in threshold_method_labels() {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.threshold_method,
+                                    (*method).to_string(),
+                                    *method,
+                                );
+                            }
+                        })
+                        .response
+                        .changed();
+                    let mode_changed = egui::ComboBox::from_id_salt("threshold_mode_choice")
+                        .selected_text(&self.adjust_dialog.threshold_mode)
+                        .show_ui(ui, |ui| {
+                            for mode in ["Red", "B&W", "Over/Under"] {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.threshold_mode,
+                                    mode.to_string(),
+                                    mode,
+                                );
+                            }
+                        })
+                        .response
+                        .changed();
+                    if mode_changed {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.threshold".to_string(),
+                            params: Some(json!({
+                                "min": self.adjust_dialog.min,
+                                "max": self.adjust_dialog.max,
+                                "mode": self.adjust_dialog.threshold_mode,
+                                "background": threshold_background_param(
+                                    self.adjust_dialog.dark_background
+                                ),
+                            })),
+                        });
+                    }
+                    let mut histogram_options_changed = false;
+                    let mut dark_background_changed = false;
+                    egui::Grid::new("threshold_checkbox_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            dark_background_changed |= ui
+                                .checkbox(
+                                    &mut self.adjust_dialog.dark_background,
+                                    "Dark background",
+                                )
+                                .changed();
+                            histogram_options_changed |= ui
+                                .checkbox(
+                                    &mut self.adjust_dialog.threshold_stack_histogram,
+                                    "Stack histogram",
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.checkbox(
+                                &mut self.adjust_dialog.threshold_no_reset,
+                                "Don't reset range",
+                            );
+                            ui.checkbox(&mut self.adjust_dialog.threshold_raw_values, "Raw values");
+                            ui.end_row();
+                            let mut sixteen_bit_histogram =
+                                self.adjust_dialog.threshold_sixteen_bit_histogram;
+                            if ui
+                                .checkbox(&mut sixteen_bit_histogram, "16-bit histogram")
+                                .changed()
+                            {
+                                set_threshold_sixteen_bit_histogram(
+                                    &mut self.adjust_dialog,
+                                    sixteen_bit_histogram,
+                                );
+                                histogram_options_changed = true;
+                            }
+                            ui.end_row();
+                        });
+                    if histogram_options_changed {
+                        let bins = threshold_histogram_bins(&self.adjust_dialog);
+                        if let Ok(histogram) = self.adjust_histogram_for_viewer(
+                            &self.adjust_dialog.window_label,
+                            bins,
+                            self.adjust_dialog.threshold_stack_histogram,
+                        ) {
+                            self.adjust_dialog.default_min = histogram.min;
+                            self.adjust_dialog.default_max = histogram.max;
+                            self.adjust_dialog.histogram = Some(histogram);
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
+                        }
+                    }
+                    if method_changed || dark_background_changed {
+                        let method = threshold_method_param(&self.adjust_dialog.threshold_method);
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.threshold".to_string(),
+                            params: Some(json!({
+                                "method": method,
+                                "mode": self.adjust_dialog.threshold_mode,
+                                "stack": self.adjust_dialog.threshold_stack_histogram,
+                                "sixteen_bit": self
+                                    .adjust_dialog
+                                    .threshold_sixteen_bit_histogram,
+                                "background": threshold_background_param(
+                                    self.adjust_dialog.dark_background
+                                ),
+                            })),
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Auto").clicked() {
+                            let method =
+                                threshold_method_param(&self.adjust_dialog.threshold_method);
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.threshold".to_string(),
+                                params: Some(json!({
+                                    "method": method,
+                                    "mode": self.adjust_dialog.threshold_mode,
+                                    "stack": self.adjust_dialog.threshold_stack_histogram,
+                                    "sixteen_bit": self
+                                        .adjust_dialog
+                                        .threshold_sixteen_bit_histogram,
+                                    "background": threshold_background_param(
+                                        self.adjust_dialog.dark_background
+                                    ),
+                                })),
+                            });
+                        }
+                        if ui.button("Apply").clicked() {
+                            if self.threshold_apply_needs_float_prompt(
+                                &self.adjust_dialog.window_label,
+                            ) {
+                                self.threshold_apply_dialog = ThresholdApplyDialogState {
+                                    open: true,
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    min: self.adjust_dialog.min,
+                                    max: self.adjust_dialog.max,
+                                    dark_background: self.adjust_dialog.dark_background,
+                                };
+                            } else {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.threshold".to_string(),
+                                    params: Some(json!({
+                                        "apply": true,
+                                        "min": self.adjust_dialog.min,
+                                        "max": self.adjust_dialog.max,
+                                        "background": threshold_background_param(
+                                            self.adjust_dialog.dark_background
+                                        ),
+                                    })),
+                                });
+                            }
+                        }
+                        if ui.button("Reset").clicked() {
+                            self.adjust_dialog.min = self.adjust_dialog.default_min;
+                            self.adjust_dialog.max = self.adjust_dialog.default_max;
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.threshold".to_string(),
+                                params: Some(json!({
+                                    "reset": true,
+                                    "no_reset": self.adjust_dialog.threshold_no_reset,
+                                })),
+                            });
+                        }
+                        if ui.button("Set").clicked() {
+                            actions.push(UiAction::Command {
+                                window_label: self.adjust_dialog.window_label.clone(),
+                                command_id: "image.adjust.threshold".to_string(),
+                                params: Some(json!({
+                                    "min": self.adjust_dialog.min,
+                                    "max": self.adjust_dialog.max,
+                                    "mode": self.adjust_dialog.threshold_mode,
+                                    "background": threshold_background_param(
+                                        self.adjust_dialog.dark_background
+                                    ),
+                                })),
+                            });
+                        }
+                    });
+                }
+                AdjustDialogKind::ColorThreshold => {
+                    let color_space_changed = egui::ComboBox::from_label("Color space")
+                        .selected_text(&self.adjust_dialog.color_threshold_space)
+                        .show_ui(ui, |ui| {
+                            for space in ["HSB", "RGB", "Lab", "YUV"] {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.color_threshold_space,
+                                    space.to_string(),
+                                    space,
+                                );
+                            }
+                        })
+                        .response
+                        .changed();
+                    let band_labels = match self.adjust_dialog.color_threshold_space.as_str() {
+                        "RGB" => ["Red", "Green", "Blue"],
+                        "Lab" => ["L*", "a*", "b*"],
+                        "YUV" => ["Y", "U", "V"],
+                        _ => ["Hue", "Saturation", "Brightness"],
+                    };
+                    draw_color_threshold_band(
+                        ui,
+                        "color_threshold_hue",
+                        band_labels[0],
+                        &mut self.adjust_dialog.hue_min,
+                        &mut self.adjust_dialog.hue_max,
+                        &mut self.adjust_dialog.hue_pass,
+                        self.adjust_dialog.histogram.as_ref(),
+                    );
+                    draw_color_threshold_band(
+                        ui,
+                        "color_threshold_saturation",
+                        band_labels[1],
+                        &mut self.adjust_dialog.saturation_min,
+                        &mut self.adjust_dialog.saturation_max,
+                        &mut self.adjust_dialog.saturation_pass,
+                        self.adjust_dialog.histogram.as_ref(),
+                    );
+                    draw_color_threshold_band(
+                        ui,
+                        "color_threshold_brightness",
+                        band_labels[2],
+                        &mut self.adjust_dialog.brightness_min,
+                        &mut self.adjust_dialog.brightness_max,
+                        &mut self.adjust_dialog.brightness_pass,
+                        self.adjust_dialog.histogram.as_ref(),
+                    );
+                    let method_changed = egui::ComboBox::from_label("Thresholding method")
+                        .selected_text(&self.adjust_dialog.color_threshold_method)
+                        .show_ui(ui, |ui| {
+                            for method in threshold_method_labels() {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.color_threshold_method,
+                                    (*method).to_string(),
+                                    *method,
+                                );
+                            }
+                        })
+                        .response
+                        .changed();
+                    egui::ComboBox::from_label("Threshold color")
+                        .selected_text(&self.adjust_dialog.color_threshold_mode)
+                        .show_ui(ui, |ui| {
+                            for mode in ["Red", "White", "Black", "B&W"] {
+                                ui.selectable_value(
+                                    &mut self.adjust_dialog.color_threshold_mode,
+                                    mode.to_string(),
+                                    mode,
+                                );
+                            }
+                        });
+                    let dark_background_changed = ui
+                        .checkbox(&mut self.adjust_dialog.dark_background, "Dark background")
+                        .changed();
+                    if color_space_changed || method_changed || dark_background_changed {
+                        let mut params = color_threshold_params(&self.adjust_dialog);
+                        if let Value::Object(map) = &mut params {
+                            map.insert("action".to_string(), json!("auto"));
+                        }
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.color_threshold".to_string(),
+                            params: Some(params),
+                        });
+                    }
+                    egui::Grid::new("color_threshold_buttons")
+                        .num_columns(4)
+                        .spacing(egui::vec2(6.0, 4.0))
+                        .show(ui, |ui| {
+                            if ui.button("Original").clicked() {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(json!({ "action": "original" })),
+                                });
+                            }
+                            if ui.button("Filtered").clicked() {
+                                let mut params = color_threshold_params(&self.adjust_dialog);
+                                if let Value::Object(map) = &mut params {
+                                    map.insert("action".to_string(), json!("filtered"));
+                                }
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(params),
+                                });
+                            }
+                            if ui.button("Select").clicked() {
+                                let mut params = color_threshold_params(&self.adjust_dialog);
+                                if let Value::Object(map) = &mut params {
+                                    map.insert("action".to_string(), json!("select"));
+                                }
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(params),
+                                });
+                            }
+                            if ui.button("Sample").clicked() {
+                                let mut params = color_threshold_params(&self.adjust_dialog);
+                                if let Value::Object(map) = &mut params {
+                                    map.insert("action".to_string(), json!("sample"));
+                                }
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(params),
+                                });
+                            }
+                            ui.end_row();
+                            if ui.button("Stack").clicked() {
+                                let mut params = color_threshold_params(&self.adjust_dialog);
+                                if let Value::Object(map) = &mut params {
+                                    map.insert("action".to_string(), json!("stack"));
+                                }
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(params),
+                                });
+                            }
+                            if ui.button("Macro").clicked() {
+                                let mut params = color_threshold_params(&self.adjust_dialog);
+                                if let Value::Object(map) = &mut params {
+                                    map.insert("action".to_string(), json!("macro"));
+                                }
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(params),
+                                });
+                            }
+                            if ui.button("Help").clicked() {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.color_threshold".to_string(),
+                                    params: Some(json!({ "action": "help" })),
+                                });
+                            }
+                        });
                 }
                 AdjustDialogKind::LineWidth => {
-                    ui.add(
-                        egui::DragValue::new(&mut self.adjust_dialog.line_width)
-                            .range(0.1..=999.0)
-                            .prefix("Width "),
-                    );
-                    if ui.button("Apply").clicked() {
+                    let mut changed = false;
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.adjust_dialog.line_width, 1.0..=300.0)
+                                .integer()
+                                .text("Width"),
+                        )
+                        .changed();
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.adjust_dialog.line_width)
+                                .range(1.0..=f32::INFINITY)
+                                .speed(1.0),
+                        )
+                        .changed();
+                    if changed {
+                        self.adjust_dialog.line_width =
+                            self.adjust_dialog.line_width.round().max(1.0);
                         actions.push(UiAction::Command {
                             window_label: self.adjust_dialog.window_label.clone(),
                             command_id: "image.adjust.line_width".to_string(),
-                            params: Some(json!({ "width": self.adjust_dialog.line_width })),
+                            params: Some(json!({
+                                "width": self.adjust_dialog.line_width
+                            })),
                         });
-                        close = true;
                     }
                 }
                 AdjustDialogKind::Coordinates => {
-                    egui::Grid::new("adjust_coordinates_grid")
+                    egui::Grid::new("coordinates_adjust_grid")
                         .num_columns(2)
+                        .spacing(egui::vec2(8.0, 4.0))
                         .show(ui, |ui| {
-                            ui.label("Left");
-                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.left));
-                            ui.end_row();
-                            ui.label("Right");
-                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.right));
-                            ui.end_row();
-                            ui.label("Top");
-                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.top));
-                            ui.end_row();
-                            ui.label("Bottom");
-                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.bottom));
-                            ui.end_row();
-                            ui.label("Front");
-                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.front));
-                            ui.end_row();
-                            ui.label("Back");
-                            ui.add(egui::DragValue::new(&mut self.adjust_dialog.back));
-                            ui.end_row();
+                            if self.adjust_dialog.coordinates_mode == "point" {
+                                for (label, value) in [
+                                    ("X", &mut self.adjust_dialog.left),
+                                    ("Y", &mut self.adjust_dialog.top),
+                                ] {
+                                    ui.label(label);
+                                    ui.add(egui::DragValue::new(value).speed(1.0));
+                                    ui.end_row();
+                                }
+                                if self.adjust_dialog.coordinates_depth > 1.0 {
+                                    ui.label("Z");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.adjust_dialog.front)
+                                            .speed(1.0),
+                                    );
+                                    ui.end_row();
+                                }
+                            } else {
+                                for (label, value) in [
+                                    ("Left", &mut self.adjust_dialog.left),
+                                    ("Right", &mut self.adjust_dialog.right),
+                                    ("Top", &mut self.adjust_dialog.top),
+                                    ("Bottom", &mut self.adjust_dialog.bottom),
+                                ] {
+                                    ui.label(label);
+                                    ui.add(egui::DragValue::new(value).speed(1.0));
+                                    ui.end_row();
+                                }
+                                if self.adjust_dialog.coordinates_depth > 1.0 {
+                                    for (label, value) in [
+                                        ("Front", &mut self.adjust_dialog.front),
+                                        ("Back", &mut self.adjust_dialog.back),
+                                    ] {
+                                        ui.label(label);
+                                        ui.add(egui::DragValue::new(value).speed(1.0));
+                                        ui.end_row();
+                                    }
+                                }
+                            }
                             ui.label("X Unit");
                             ui.text_edit_singleline(&mut self.adjust_dialog.x_unit);
                             ui.end_row();
@@ -7598,28 +9117,135 @@ impl ImageUiApp {
                             ui.text_edit_singleline(&mut self.adjust_dialog.z_unit);
                             ui.end_row();
                         });
-                    if ui.button("Apply").clicked() {
-                        actions.push(UiAction::Command {
-                            window_label: self.adjust_dialog.window_label.clone(),
-                            command_id: "image.adjust.coordinates".to_string(),
-                            params: Some(json!({
+                    if ui.button("OK").clicked() {
+                        let params = if self.adjust_dialog.coordinates_mode == "point" {
+                            json!({
+                                "mode": "point",
+                                "point_x_coordinate": self.adjust_dialog.left,
+                                "point_y_coordinate": self.adjust_dialog.top,
+                                "point_z_coordinate": self.adjust_dialog.front,
+                                "point_x_pixel": self.adjust_dialog.coordinates_x_pixel,
+                                "point_y_pixel": self.adjust_dialog.coordinates_y_pixel,
+                                "point_z_pixel": self.adjust_dialog.coordinates_z_pixel,
+                                "x_unit": self.adjust_dialog.x_unit,
+                                "y_unit": self.adjust_dialog.y_unit,
+                                "z_unit": self.adjust_dialog.z_unit,
+                            })
+                        } else {
+                            json!({
+                                "mode": self.adjust_dialog.coordinates_mode,
                                 "left": self.adjust_dialog.left,
                                 "right": self.adjust_dialog.right,
                                 "top": self.adjust_dialog.top,
                                 "bottom": self.adjust_dialog.bottom,
                                 "front": self.adjust_dialog.front,
                                 "back": self.adjust_dialog.back,
-                                "x_unit": self.adjust_dialog.x_unit.clone(),
-                                "y_unit": self.adjust_dialog.y_unit.clone(),
-                                "z_unit": self.adjust_dialog.z_unit.clone(),
-                            })),
+                                "x_pixel_start": self.adjust_dialog.coordinates_x_pixel,
+                                "x_pixel_size": self.adjust_dialog.coordinates_width,
+                                "y_pixel_start": self.adjust_dialog.coordinates_y_pixel,
+                                "y_pixel_size": self.adjust_dialog.coordinates_height,
+                                "z_pixel_start": 0.0,
+                                "z_pixel_size": self.adjust_dialog.coordinates_depth,
+                                "x_unit": self.adjust_dialog.x_unit,
+                                "y_unit": self.adjust_dialog.y_unit,
+                                "z_unit": self.adjust_dialog.z_unit,
+                            })
+                        };
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.coordinates".to_string(),
+                            params: Some(params),
                         });
-                        close = true;
                     }
                 }
             });
-
         self.adjust_dialog.open = open && !close;
+    }
+
+    fn draw_threshold_apply_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.threshold_apply_dialog.open {
+            return;
+        }
+        let mut open = self.threshold_apply_dialog.open;
+        let mut convert_to_mask = false;
+        let mut set_to_nan = false;
+        let mut cancel = false;
+        egui::Window::new("Thresholder")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("Convert to 8-bit mask or set background pixels to NaN?");
+                ui.horizontal(|ui| {
+                    if ui.button("Convert to Mask").clicked() {
+                        convert_to_mask = true;
+                    }
+                    if ui.button("Set to NaN").clicked() {
+                        set_to_nan = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if convert_to_mask || set_to_nan {
+            let params = json!({
+                "apply": true,
+                "min": self.threshold_apply_dialog.min,
+                "max": self.threshold_apply_dialog.max,
+                "background": threshold_background_param(
+                    self.threshold_apply_dialog.dark_background
+                ),
+                "background_to_nan": set_to_nan,
+            });
+            actions.push(UiAction::Command {
+                window_label: self.threshold_apply_dialog.window_label.clone(),
+                command_id: "image.adjust.threshold".to_string(),
+                params: Some(params),
+            });
+            self.threshold_apply_dialog.open = false;
+        } else if cancel {
+            self.threshold_apply_dialog.open = false;
+        } else {
+            self.threshold_apply_dialog.open = open;
+        }
+    }
+
+    fn draw_apply_lut_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.apply_lut_dialog.open {
+            return;
+        }
+        let mut open = self.apply_lut_dialog.open;
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("Apply Lookup Table?")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("WARNING: the pixel values will");
+                ui.label("change if you click \"OK\".");
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        ok = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ok {
+            actions.push(UiAction::Command {
+                window_label: self.apply_lut_dialog.window_label.clone(),
+                command_id: self.apply_lut_dialog.command_id.clone(),
+                params: Some(self.apply_lut_dialog.params.clone()),
+            });
+            self.apply_lut_dialog.open = false;
+        } else if cancel {
+            self.apply_lut_dialog.open = false;
+        } else {
+            self.apply_lut_dialog.open = open;
+        }
     }
 
     fn draw_resize_dialog(
@@ -7628,6 +9254,7 @@ impl ImageUiApp {
         actions: &mut Vec<UiAction>,
         canvas: bool,
     ) {
+        let background_fill = f32::from(self.tool_options.background_color.r()) / 255.0;
         let dialog = if canvas {
             &mut self.canvas_dialog
         } else {
@@ -7637,19 +9264,140 @@ impl ImageUiApp {
             return;
         }
         let mut open = dialog.open;
-        egui::Window::new(if canvas { "Canvas Size" } else { "Resize" })
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.add(egui::DragValue::new(&mut dialog.width).prefix("Width "));
-                ui.add(egui::DragValue::new(&mut dialog.height).prefix("Height "));
-                if canvas {
-                    ui.add(egui::DragValue::new(&mut dialog.fill).prefix("Fill "));
+        let mut close = false;
+        let old_width = dialog.width;
+        let old_height = dialog.height;
+        let title = if canvas {
+            if dialog.depth > 1 || dialog.frames > 1 {
+                "Resize Stack Canvas"
+            } else {
+                "Resize Image Canvas"
+            }
+        } else {
+            "Resize"
+        };
+        egui::Window::new(title).open(&mut open).show(ctx, |ui| {
+            egui::Grid::new(if canvas {
+                "canvas_size_dialog_grid"
+            } else {
+                "resize_dialog_grid"
+            })
+            .num_columns(2)
+            .spacing(egui::vec2(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.label(if canvas { "Width:" } else { "Width (pixels):" });
+                ui.add(egui::DragValue::new(&mut dialog.width).range(1..=usize::MAX));
+                ui.end_row();
+
+                ui.label(if canvas {
+                    "Height:"
+                } else {
+                    "Height (pixels):"
+                });
+                ui.add(egui::DragValue::new(&mut dialog.height).range(1..=usize::MAX));
+                ui.end_row();
+
+                if !canvas && dialog.depth > 1 {
+                    ui.label("Depth (images):");
+                    ui.add(egui::DragValue::new(&mut dialog.depth).range(1..=usize::MAX));
+                    ui.end_row();
                 }
-                if ui.button("Apply").clicked() {
+
+                if !canvas && dialog.frames > 1 {
+                    ui.label("Time (frames):");
+                    ui.add(egui::DragValue::new(&mut dialog.frames).range(1..=usize::MAX));
+                    ui.end_row();
+                }
+            });
+
+            if canvas {
+                egui::ComboBox::from_label("Position:")
+                    .selected_text(&dialog.position)
+                    .show_ui(ui, |ui| {
+                        for position in [
+                            "Top-Left",
+                            "Top-Center",
+                            "Top-Right",
+                            "Center-Left",
+                            "Center",
+                            "Center-Right",
+                            "Bottom-Left",
+                            "Bottom-Center",
+                            "Bottom-Right",
+                        ] {
+                            ui.selectable_value(
+                                &mut dialog.position,
+                                position.to_string(),
+                                position,
+                            );
+                        }
+                    });
+                ui.checkbox(&mut dialog.zero_fill, "Zero Fill");
+            } else {
+                ui.checkbox(&mut dialog.constrain_aspect, "Constrain aspect ratio");
+                if dialog.constrain_aspect && dialog.width != old_width && dialog.original_width > 0
+                {
+                    dialog.height = ((dialog.width as f32)
+                        * (dialog.original_height as f32 / dialog.original_width as f32))
+                        .round()
+                        .max(1.0) as usize;
+                } else if dialog.constrain_aspect
+                    && dialog.height != old_height
+                    && dialog.original_height > 0
+                {
+                    dialog.width = ((dialog.height as f32)
+                        * (dialog.original_width as f32 / dialog.original_height as f32))
+                        .round()
+                        .max(1.0) as usize;
+                }
+                ui.checkbox(
+                    &mut dialog.average_when_downsizing,
+                    "Average when downsizing",
+                );
+                egui::ComboBox::from_label("Interpolation:")
+                    .selected_text(&dialog.interpolation)
+                    .show_ui(ui, |ui| {
+                        for method in ["None", "Bilinear", "Bicubic"] {
+                            ui.selectable_value(
+                                &mut dialog.interpolation,
+                                method.to_string(),
+                                method,
+                            );
+                        }
+                    });
+            }
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() {
                     let command_id = if canvas {
                         "__dialog.canvas_resize"
                     } else {
                         "__dialog.resize"
+                    };
+                    let fill = if canvas && dialog.zero_fill {
+                        0.0
+                    } else if canvas {
+                        background_fill
+                    } else {
+                        dialog.fill
+                    };
+                    let params = if canvas {
+                        json!({
+                            "width": dialog.width,
+                            "height": dialog.height,
+                            "position": dialog.position,
+                            "fill": fill,
+                            "zero": dialog.zero_fill,
+                        })
+                    } else {
+                        json!({
+                            "width": dialog.width,
+                            "height": dialog.height,
+                            "depth": dialog.depth,
+                            "frames": dialog.frames,
+                            "constrain": dialog.constrain_aspect,
+                            "average_when_downsizing": dialog.average_when_downsizing,
+                            "interpolation": dialog.interpolation,
+                        })
                     };
                     actions.push(UiAction::Command {
                         window_label: self
@@ -7657,16 +9405,16 @@ impl ImageUiApp {
                             .clone()
                             .unwrap_or_else(|| LAUNCHER_LABEL.to_string()),
                         command_id: command_id.to_string(),
-                        params: Some(json!({
-                            "width": dialog.width,
-                            "height": dialog.height,
-                            "fill": dialog.fill,
-                        })),
+                        params: Some(params),
                     });
-                    dialog.open = false;
+                    close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
                 }
             });
-        dialog.open = open;
+        });
+        dialog.open = open && !close;
     }
 
     fn draw_stack_position_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -9602,7 +11350,13 @@ fn compute_viewer_frame(
     let display_range = state
         .label_to_session
         .get(window_label)
-        .and_then(|session| session.display_range);
+        .and_then(|session| {
+            session
+                .channel_display_ranges
+                .get(&request.channel)
+                .copied()
+                .or(session.display_range)
+        });
     let frame = Arc::new(build_frame(&source, request, display_range)?);
 
     if let Some(session) = state.label_to_session.get_mut(window_label) {
@@ -9705,7 +11459,7 @@ fn line_width_from_params(params: &Value) -> Result<f32, String> {
     if !width.is_finite() || width <= 0.0 {
         return Err("line width must be a finite positive number".to_string());
     }
-    Ok(width)
+    Ok(width.round().max(1.0))
 }
 
 fn roi_stroke_width(line_width_px: f32, selected: bool) -> f32 {
@@ -9895,6 +11649,17 @@ fn draw_simple_window(
     egui::Window::new(title).open(open).show(ctx, |ui| draw(ui));
 }
 
+fn adjust_dialog_window_title(dialog: &AdjustDialogState) -> String {
+    if dialog.kind != AdjustDialogKind::Coordinates {
+        return dialog.kind.title().to_string();
+    }
+    match dialog.coordinates_mode.as_str() {
+        "point" => "Point Coordinates".to_string(),
+        "selection" => "Selection Coordinates".to_string(),
+        _ => "Image Coordinates".to_string(),
+    }
+}
+
 fn selected_roi_bbox(viewer: &ViewerUiState) -> Option<(usize, usize, usize, usize)> {
     let roi = viewer
         .rois
@@ -9902,6 +11667,127 @@ fn selected_roi_bbox(viewer: &ViewerUiState) -> Option<(usize, usize, usize, usi
         .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
         .or(viewer.rois.active_roi.as_ref())?;
     roi_kind_bbox(&roi.kind)
+}
+
+fn selected_roi_model(viewer: &ViewerUiState) -> Option<&RoiModel> {
+    viewer
+        .rois
+        .selected_roi_id
+        .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
+        .or(viewer.rois.active_roi.as_ref())
+}
+
+fn init_coordinates_dialog(
+    dialog: &mut AdjustDialogState,
+    metadata: &Metadata,
+    viewer: Option<&ViewerUiState>,
+    z_slices: usize,
+    image_width: f32,
+    image_height: f32,
+) {
+    let x_axis = metadata.axis_index(AxisKind::X);
+    let y_axis = metadata.axis_index(AxisKind::Y);
+    let z_axis = metadata.axis_index(AxisKind::Z);
+    let x_unit = x_axis
+        .and_then(|axis| metadata.dims[axis].unit.clone())
+        .unwrap_or_else(|| "pixel".to_string());
+    let y_unit = y_axis
+        .and_then(|axis| metadata.dims[axis].unit.clone())
+        .unwrap_or_else(|| x_unit.clone());
+    let z_unit = z_axis
+        .and_then(|axis| metadata.dims[axis].unit.clone())
+        .unwrap_or_else(|| x_unit.clone());
+
+    dialog.x_unit = x_unit.clone();
+    dialog.y_unit = if y_unit == x_unit {
+        "<same as x unit>".to_string()
+    } else {
+        y_unit
+    };
+    dialog.z_unit = if z_unit == x_unit {
+        "<same as x unit>".to_string()
+    } else {
+        z_unit
+    };
+    dialog.coordinates_z_pixel = viewer.map(|viewer| viewer.z as f32).unwrap_or(0.0);
+    dialog.coordinates_depth = z_slices.max(1) as f32;
+
+    let selected = viewer.and_then(selected_roi_model);
+    let single_point = selected.and_then(single_point_roi_position);
+    if let Some(point) = single_point {
+        dialog.coordinates_mode = "point".to_string();
+        dialog.coordinates_x_pixel = point.x;
+        dialog.coordinates_y_pixel = point.y;
+        dialog.left = calibrated_axis_coordinate(metadata, x_axis, "x", point.x);
+        dialog.top = calibrated_axis_coordinate(metadata, y_axis, "y", point.y);
+        dialog.front =
+            calibrated_axis_coordinate(metadata, z_axis, "z", dialog.coordinates_z_pixel);
+        return;
+    }
+
+    let rect = selected
+        .and_then(|roi| roi_bounds(&roi.kind))
+        .unwrap_or_else(|| {
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(image_width, image_height))
+        });
+    let min = rect.min;
+    let max = rect.max;
+    dialog.coordinates_mode = if selected.is_some() {
+        "selection".to_string()
+    } else {
+        "image".to_string()
+    };
+    dialog.coordinates_x_pixel = min.x.max(0.0);
+    dialog.coordinates_y_pixel = min.y.max(0.0);
+    dialog.coordinates_width = (max.x - min.x).abs().max(1.0);
+    dialog.coordinates_height = (max.y - min.y).abs().max(1.0);
+    dialog.left = calibrated_axis_coordinate(metadata, x_axis, "x", dialog.coordinates_x_pixel);
+    dialog.right = calibrated_axis_coordinate(
+        metadata,
+        x_axis,
+        "x",
+        dialog.coordinates_x_pixel + dialog.coordinates_width,
+    );
+    dialog.top = calibrated_axis_coordinate(metadata, y_axis, "y", dialog.coordinates_y_pixel);
+    dialog.bottom = calibrated_axis_coordinate(
+        metadata,
+        y_axis,
+        "y",
+        dialog.coordinates_y_pixel + dialog.coordinates_height,
+    );
+    dialog.front = calibrated_axis_coordinate(metadata, z_axis, "z", 0.0);
+    dialog.back = calibrated_axis_coordinate(metadata, z_axis, "z", dialog.coordinates_depth);
+}
+
+fn single_point_roi_position(roi: &RoiModel) -> Option<egui::Pos2> {
+    match &roi.kind {
+        RoiKind::Point { points, .. } if points.len() == 1 => points.first().copied(),
+        _ => None,
+    }
+}
+
+fn calibrated_axis_coordinate(
+    metadata: &Metadata,
+    axis: Option<usize>,
+    label: &str,
+    pixel: f32,
+) -> f32 {
+    let Some(axis) = axis else {
+        return pixel;
+    };
+    let origin = metadata
+        .extras
+        .get(&format!("{label}_origin_coordinate"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let spacing = metadata.dims[axis].spacing.unwrap_or(1.0);
+    let inverted = metadata
+        .extras
+        .get(&format!("{label}_coordinate_inverted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let direction = if inverted { -1.0 } else { 1.0 };
+    origin + direction * spacing * pixel
 }
 
 fn selected_roi_profile_params(
@@ -11540,6 +13426,18 @@ fn adjust_histogram(values: &[f32], bins: usize) -> Result<AdjustHistogram, Stri
     })
 }
 
+fn threshold_values_dataset(values: Vec<f32>, pixel_type: PixelType) -> Result<DatasetF32, String> {
+    if values.is_empty() {
+        return Err("threshold requires image values".to_string());
+    }
+    let shape = [values.len()];
+    let mut metadata = Metadata::from_shape(&shape, pixel_type);
+    metadata.pixel_type = pixel_type;
+    let data = ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|_| "failed to build threshold sample dataset".to_string())?;
+    Dataset::new(data, metadata).map_err(|error| error.to_string())
+}
+
 fn adjust_slider_bounds(dialog: &AdjustDialogState) -> (f32, f32) {
     let mut min = dialog.default_min.min(dialog.default_max);
     let mut max = dialog.default_min.max(dialog.default_max);
@@ -11619,39 +13517,49 @@ fn adjust_min_max_from_contrast(dialog: &mut AdjustDialogState) {
     }
 }
 
-fn auto_contrast_range(histogram: Option<&AdjustHistogram>) -> Option<(f32, f32)> {
+fn auto_contrast_range_for_dialog(dialog: &mut AdjustDialogState) -> Option<(f32, f32)> {
+    auto_contrast_range(
+        dialog.histogram.as_ref(),
+        &mut dialog.contrast_auto_threshold,
+    )
+}
+
+fn auto_contrast_range(
+    histogram: Option<&AdjustHistogram>,
+    auto_threshold: &mut u32,
+) -> Option<(f32, f32)> {
     let histogram = histogram?;
     let total = histogram.pixel_count as u64;
     if total == 0 || histogram.max <= histogram.min {
         return Some((histogram.min, histogram.max));
     }
-    let saturated_each_tail = ((total as f32 * 0.0035 * 0.5).round() as u64).max(1);
-    let low_bin = percentile_bin(&histogram.counts, saturated_each_tail, false);
-    let high_bin = percentile_bin(&histogram.counts, saturated_each_tail, true);
+
+    if *auto_threshold < 10 {
+        *auto_threshold = 5_000;
+    } else {
+        *auto_threshold /= 2;
+    }
+    let limit = total / 10;
+    let threshold = total / u64::from(*auto_threshold);
+    let low_bin = histogram.counts.iter().position(|count| {
+        let count = if *count > limit { 0 } else { *count };
+        count > threshold
+    })?;
+    let high_bin = histogram.counts.iter().rposition(|count| {
+        let count = if *count > limit { 0 } else { *count };
+        count > threshold
+    })?;
+    if high_bin < low_bin {
+        return None;
+    }
+
     let bin_width = (histogram.max - histogram.min) / histogram.counts.len().max(1) as f32;
     let low = histogram.min + low_bin as f32 * bin_width;
-    let high = histogram.min + (high_bin + 1) as f32 * bin_width;
-    Some((low.min(high), high.max(low)))
-}
-
-fn percentile_bin(counts: &[u64], target: u64, reverse: bool) -> usize {
-    let mut cumulative = 0_u64;
-    if reverse {
-        for (index, count) in counts.iter().enumerate().rev() {
-            cumulative += *count;
-            if cumulative >= target {
-                return index;
-            }
-        }
-        0
+    let high = histogram.min + high_bin as f32 * bin_width;
+    if (high - low).abs() <= f32::EPSILON {
+        Some((histogram.min, histogram.max))
     } else {
-        for (index, count) in counts.iter().enumerate() {
-            cumulative += *count;
-            if cumulative >= target {
-                return index;
-            }
-        }
-        counts.len().saturating_sub(1)
+        Some((low, high))
     }
 }
 
@@ -11671,11 +13579,755 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
+fn threshold_method_labels() -> &'static [&'static str] {
+    &[
+        "Default",
+        "Huang",
+        "Intermodes",
+        "IsoData",
+        "IJ_IsoData",
+        "Li",
+        "MaxEntropy",
+        "Mean",
+        "MinError",
+        "Minimum",
+        "Moments",
+        "Otsu",
+        "Percentile",
+        "RenyiEntropy",
+        "Shanbhag",
+        "Triangle",
+        "Yen",
+    ]
+}
+
+fn threshold_method_param(method: &str) -> &'static str {
+    match method {
+        "Huang" => "huang",
+        "Intermodes" => "intermodes",
+        "IsoData" => "isodata",
+        "IJ_IsoData" => "ij_isodata",
+        "Li" => "li",
+        "MaxEntropy" => "max_entropy",
+        "MinError" => "min_error",
+        "Minimum" => "minimum",
+        "Moments" => "moments",
+        "Otsu" => "otsu",
+        "Mean" => "mean",
+        "Percentile" => "percentile",
+        "RenyiEntropy" => "renyi_entropy",
+        "Shanbhag" => "shanbhag",
+        "Triangle" => "triangle",
+        "Yen" => "yen",
+        "Default" => "default",
+        _ => "ij_isodata",
+    }
+}
+
+fn threshold_background_param(dark_background: bool) -> &'static str {
+    if dark_background { "dark" } else { "light" }
+}
+
+fn color_balance_channel_index(channel: &str) -> Option<usize> {
+    match channel {
+        "Red" | "Cyan" | "red" | "cyan" => Some(0),
+        "Green" | "Magenta" | "green" | "magenta" => Some(1),
+        "Blue" | "Yellow" | "blue" | "yellow" => Some(2),
+        _ => None,
+    }
+}
+
+fn to_color_image_with_threshold(
+    frame: &ViewerFrameBuffer,
+    lut: LookupTable,
+    threshold: Option<ThresholdOverlay>,
+) -> egui::ColorImage {
+    let Some(threshold) = threshold else {
+        return to_color_image(frame, lut);
+    };
+
+    let mut rgba = Vec::with_capacity(frame.pixels_u8.len() * 4);
+    for (index, gray) in frame.pixels_u8.iter().enumerate() {
+        let value = frame.values.get(index).copied().unwrap_or_default();
+        let in_range = value.is_finite() && value >= threshold.low && value <= threshold.high;
+        let color = match threshold.mode {
+            ThresholdOverlayMode::Red if in_range => egui::Color32::RED,
+            ThresholdOverlayMode::BlackAndWhite => {
+                if in_range {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::BLACK
+                }
+            }
+            ThresholdOverlayMode::OverUnder if value.is_finite() && value < threshold.low => {
+                egui::Color32::BLUE
+            }
+            ThresholdOverlayMode::OverUnder if value.is_finite() && value > threshold.high => {
+                egui::Color32::RED
+            }
+            _ => lookup_table_color(lut, *gray),
+        };
+        rgba.extend_from_slice(&[color.r(), color.g(), color.b(), 255]);
+    }
+    egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &rgba)
+}
+
+fn push_adjust_display_range_action(
+    actions: &mut Vec<UiAction>,
+    dialog: &AdjustDialogState,
+    command_id: &str,
+    low_key: &str,
+    high_key: &str,
+) {
+    let mut params = Map::new();
+    params.insert(low_key.to_string(), json!(dialog.min));
+    params.insert(high_key.to_string(), json!(dialog.max));
+    actions.push(UiAction::Command {
+        window_label: dialog.window_label.clone(),
+        command_id: command_id.to_string(),
+        params: Some(Value::Object(params)),
+    });
+}
+
+fn color_balance_params(dialog: &AdjustDialogState) -> Value {
+    json!({
+        "min": dialog.min,
+        "max": dialog.max,
+        "brightness": dialog.brightness,
+        "channel": dialog.color_balance_channel,
+        "log_histogram": dialog.log_histogram,
+    })
+}
+
+fn threshold_histogram_bins(dialog: &AdjustDialogState) -> usize {
+    if dialog.threshold_sixteen_bit_histogram {
+        65_536
+    } else {
+        256
+    }
+}
+
+fn set_threshold_sixteen_bit_histogram(dialog: &mut AdjustDialogState, enabled: bool) {
+    dialog.threshold_sixteen_bit_histogram = enabled;
+    if enabled {
+        dialog.threshold_no_reset = true;
+    }
+}
+
+fn color_threshold_params(dialog: &AdjustDialogState) -> Value {
+    json!({
+        "color_space": dialog.color_threshold_space,
+        "method": dialog.color_threshold_method,
+        "mode": dialog.color_threshold_mode,
+        "dark_background": dialog.dark_background,
+        "hue": {
+            "min": dialog.hue_min,
+            "max": dialog.hue_max,
+            "pass": dialog.hue_pass,
+        },
+        "saturation": {
+            "min": dialog.saturation_min,
+            "max": dialog.saturation_max,
+            "pass": dialog.saturation_pass,
+        },
+        "brightness": {
+            "min": dialog.brightness_min,
+            "max": dialog.brightness_max,
+            "pass": dialog.brightness_pass,
+        },
+    })
+}
+
+fn color_threshold_space_key(space: &str) -> String {
+    match space
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cielab" | "lab" => "lab".to_string(),
+        "hsb" => "hsb".to_string(),
+        "rgb" => "rgb".to_string(),
+        "yuv" => "yuv".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn mask_foreground_bbox(slice: &SliceImage) -> Option<(usize, usize, usize, usize)> {
+    let mut bbox: Option<(usize, usize, usize, usize)> = None;
+    for y in 0..slice.height {
+        for x in 0..slice.width {
+            let value = slice.values[x + y * slice.width];
+            if value <= 0.0 || !value.is_finite() {
+                continue;
+            }
+            bbox = Some(match bbox {
+                Some((min_x, min_y, max_x, max_y)) => {
+                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                }
+                None => (x, y, x, y),
+            });
+        }
+    }
+    bbox
+}
+
+fn mask_foreground_roi(slice: &SliceImage) -> Option<RoiKind> {
+    let outline = mask_foreground_outline_points(slice)?;
+    if outline.len() >= 3 {
+        Some(RoiKind::Polygon {
+            points: outline,
+            closed: true,
+        })
+    } else {
+        let (min_x, min_y, max_x, max_y) = mask_foreground_bbox(slice)?;
+        Some(RoiKind::Rect {
+            start: egui::pos2(min_x as f32, min_y as f32),
+            end: egui::pos2((max_x + 1) as f32, (max_y + 1) as f32),
+            rounded: false,
+            rotated: false,
+        })
+    }
+}
+
+fn mask_foreground_outline_points(slice: &SliceImage) -> Option<Vec<egui::Pos2>> {
+    type Point = (i32, i32);
+    type Edge = (Point, Point);
+
+    fn foreground(slice: &SliceImage, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x >= slice.width as i32 || y >= slice.height as i32 {
+            return false;
+        }
+        let value = slice.values[x as usize + y as usize * slice.width];
+        value.is_finite() && value > 0.0
+    }
+
+    let mut outgoing: HashMap<Point, Vec<Point>> = HashMap::new();
+    let mut unused: HashSet<Edge> = HashSet::new();
+    for y in 0..slice.height as i32 {
+        for x in 0..slice.width as i32 {
+            if !foreground(slice, x, y) {
+                continue;
+            }
+            for edge in [
+                (!foreground(slice, x, y - 1)).then_some(((x, y), (x + 1, y))),
+                (!foreground(slice, x + 1, y)).then_some(((x + 1, y), (x + 1, y + 1))),
+                (!foreground(slice, x, y + 1)).then_some(((x + 1, y + 1), (x, y + 1))),
+                (!foreground(slice, x - 1, y)).then_some(((x, y + 1), (x, y))),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                outgoing.entry(edge.0).or_default().push(edge.1);
+                unused.insert(edge);
+            }
+        }
+    }
+
+    let mut best_loop: Vec<Point> = Vec::new();
+    while let Some(edge) = unused.iter().next().copied() {
+        let start = edge.0;
+        let mut current = edge;
+        let mut loop_points = vec![current.0, current.1];
+        unused.remove(&current);
+
+        while current.1 != start {
+            let Some(next) = outgoing.get(&current.1).and_then(|targets| {
+                targets
+                    .iter()
+                    .copied()
+                    .find(|target| unused.contains(&(current.1, *target)))
+            }) else {
+                break;
+            };
+            current = (current.1, next);
+            unused.remove(&current);
+            loop_points.push(current.1);
+        }
+
+        if loop_points.last().copied() == Some(start) {
+            loop_points.pop();
+        }
+        if loop_points.len() > best_loop.len() {
+            best_loop = loop_points;
+        }
+    }
+
+    if best_loop.len() < 3 {
+        return None;
+    }
+    Some(
+        best_loop
+            .into_iter()
+            .map(|(x, y)| egui::pos2(x as f32, y as f32))
+            .collect(),
+    )
+}
+
+fn sample_color_threshold_ranges(
+    dataset: &DatasetF32,
+    bbox: (usize, usize, usize, usize),
+    z: usize,
+    t: usize,
+    color_space: &str,
+) -> Result<[(f32, f32); 3], String> {
+    let channel_axis = dataset
+        .axis_index(AxisKind::Channel)
+        .ok_or_else(|| "Color Threshold Sample requires an RGB channel image".to_string())?;
+    if dataset.shape()[channel_axis] < 3 {
+        return Err("Color Threshold Sample requires at least 3 channels".to_string());
+    }
+    let y_axis = dataset
+        .axis_index(AxisKind::Y)
+        .unwrap_or(0)
+        .min(dataset.ndim().saturating_sub(1));
+    let x_axis = dataset
+        .axis_index(AxisKind::X)
+        .unwrap_or(1.min(dataset.ndim().saturating_sub(1)));
+    if y_axis == x_axis {
+        return Err("Color Threshold Sample could not infer X/Y axes".to_string());
+    }
+    let width = dataset.shape()[x_axis];
+    let height = dataset.shape()[y_axis];
+    if width == 0 || height == 0 {
+        return Err("Color Threshold Sample requires a non-empty image".to_string());
+    }
+    let (min_x, min_y, max_x, max_y) = bbox;
+    let min_x = min_x.min(width - 1);
+    let max_x = max_x.min(width - 1);
+    let min_y = min_y.min(height - 1);
+    let max_y = max_y.min(height - 1);
+    if max_x < min_x || max_y < min_y {
+        return Err("Color Threshold Sample selection is outside the image".to_string());
+    }
+
+    let mut mins = [f32::INFINITY; 3];
+    let mut maxes = [f32::NEG_INFINITY; 3];
+    let mut index = vec![0usize; dataset.ndim()];
+    if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
+        index[z_axis] = z.min(dataset.shape()[z_axis].saturating_sub(1));
+    }
+    if let Some(t_axis) = dataset.axis_index(AxisKind::Time) {
+        index[t_axis] = t.min(dataset.shape()[t_axis].saturating_sub(1));
+    }
+    let color_space = color_threshold_space_key(color_space);
+    for y in min_y..=max_y {
+        index[y_axis] = y;
+        for x in min_x..=max_x {
+            index[x_axis] = x;
+            let components =
+                sampled_color_components(dataset, &mut index, channel_axis, &color_space)?;
+            for band in 0..3 {
+                mins[band] = mins[band].min(components[band]);
+                maxes[band] = maxes[band].max(components[band]);
+            }
+        }
+    }
+
+    if mins.iter().any(|value| !value.is_finite()) || maxes.iter().any(|value| !value.is_finite()) {
+        return Err("Color Threshold Sample found no finite RGB pixels".to_string());
+    }
+
+    Ok([
+        (
+            mins[0].floor().clamp(0.0, 255.0),
+            maxes[0].ceil().clamp(0.0, 255.0),
+        ),
+        (
+            mins[1].floor().clamp(0.0, 255.0),
+            maxes[1].ceil().clamp(0.0, 255.0),
+        ),
+        (
+            mins[2].floor().clamp(0.0, 255.0),
+            maxes[2].ceil().clamp(0.0, 255.0),
+        ),
+    ])
+}
+
+fn color_threshold_auto_ranges(
+    dataset: &DatasetF32,
+    z: usize,
+    t: usize,
+    color_space: &str,
+    method: &str,
+    background: &str,
+    app: &AppContext,
+) -> Result<[(f32, f32); 3], String> {
+    let values = color_threshold_component_values(dataset, None, z, t, color_space)?;
+    let mut ranges = [(0.0, 255.0); 3];
+    let color_space = color_threshold_space_key(color_space);
+    let active_bands = match color_space.as_str() {
+        "rgb" => [true, true, true],
+        "lab" | "yuv" => [true, false, false],
+        _ => [false, false, true],
+    };
+    for band in 0..3 {
+        if !active_bands[band] {
+            continue;
+        }
+        ranges[band] = auto_threshold_range_for_values(&values[band], method, background, app)?;
+    }
+    Ok(ranges)
+}
+
+fn color_threshold_component_values(
+    dataset: &DatasetF32,
+    bbox: Option<(usize, usize, usize, usize)>,
+    z: usize,
+    t: usize,
+    color_space: &str,
+) -> Result<[Vec<f32>; 3], String> {
+    let channel_axis = dataset
+        .axis_index(AxisKind::Channel)
+        .ok_or_else(|| "Color Threshold requires an RGB channel image".to_string())?;
+    if dataset.shape()[channel_axis] < 3 {
+        return Err("Color Threshold requires at least 3 channels".to_string());
+    }
+    let y_axis = dataset
+        .axis_index(AxisKind::Y)
+        .unwrap_or(0)
+        .min(dataset.ndim().saturating_sub(1));
+    let x_axis = dataset
+        .axis_index(AxisKind::X)
+        .unwrap_or(1.min(dataset.ndim().saturating_sub(1)));
+    if y_axis == x_axis {
+        return Err("Color Threshold could not infer X/Y axes".to_string());
+    }
+    let width = dataset.shape()[x_axis];
+    let height = dataset.shape()[y_axis];
+    if width == 0 || height == 0 {
+        return Err("Color Threshold requires a non-empty image".to_string());
+    }
+
+    let (min_x, min_y, max_x, max_y) = bbox.unwrap_or((0, 0, width - 1, height - 1));
+    let min_x = min_x.min(width - 1);
+    let max_x = max_x.min(width - 1);
+    let min_y = min_y.min(height - 1);
+    let max_y = max_y.min(height - 1);
+    if max_x < min_x || max_y < min_y {
+        return Err("Color Threshold selection is outside the image".to_string());
+    }
+
+    let capacity = (max_x - min_x + 1) * (max_y - min_y + 1);
+    let mut values = [
+        Vec::with_capacity(capacity),
+        Vec::with_capacity(capacity),
+        Vec::with_capacity(capacity),
+    ];
+    let mut index = vec![0usize; dataset.ndim()];
+    if let Some(z_axis) = dataset.axis_index(AxisKind::Z) {
+        index[z_axis] = z.min(dataset.shape()[z_axis].saturating_sub(1));
+    }
+    if let Some(t_axis) = dataset.axis_index(AxisKind::Time) {
+        index[t_axis] = t.min(dataset.shape()[t_axis].saturating_sub(1));
+    }
+    let color_space = color_threshold_space_key(color_space);
+    for y in min_y..=max_y {
+        index[y_axis] = y;
+        for x in min_x..=max_x {
+            index[x_axis] = x;
+            let components =
+                sampled_color_components(dataset, &mut index, channel_axis, &color_space)?;
+            for band in 0..3 {
+                if components[band].is_finite() {
+                    values[band].push(components[band]);
+                }
+            }
+        }
+    }
+    if values.iter().any(Vec::is_empty) {
+        return Err("Color Threshold found no finite RGB pixels".to_string());
+    }
+    Ok(values)
+}
+
+fn auto_threshold_range_for_values(
+    values: &[f32],
+    method: &str,
+    background: &str,
+    app: &AppContext,
+) -> Result<(f32, f32), String> {
+    let data = ArrayD::from_shape_vec(IxDyn(&[values.len()]), values.to_vec())
+        .map_err(|error| format!("color threshold auto histogram shape error: {error}"))?;
+    let dataset = DatasetF32::new(
+        data,
+        Metadata {
+            dims: vec![Dim::new(AxisKind::X, values.len())],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let output = app
+        .ops_service()
+        .execute(
+            "threshold.make_binary",
+            &dataset,
+            &json!({
+                "method": method,
+                "background": background,
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+    let measurements = output
+        .measurements
+        .ok_or_else(|| "Color Threshold auto did not report threshold range".to_string())?;
+    let min = measurements
+        .values
+        .get("threshold_min")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "Color Threshold auto did not report threshold_min".to_string())?
+        as f32;
+    let max = measurements
+        .values
+        .get("threshold_max")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "Color Threshold auto did not report threshold_max".to_string())?
+        as f32;
+    Ok((min.floor().clamp(0.0, 255.0), max.ceil().clamp(0.0, 255.0)))
+}
+
+fn sampled_color_components(
+    dataset: &DatasetF32,
+    index: &mut [usize],
+    channel_axis: usize,
+    color_space: &str,
+) -> Result<[f32; 3], String> {
+    index[channel_axis] = 0;
+    let r = component_to_color_u8(dataset.data[IxDyn(index)], dataset.metadata.pixel_type);
+    index[channel_axis] = 1;
+    let g = component_to_color_u8(dataset.data[IxDyn(index)], dataset.metadata.pixel_type);
+    index[channel_axis] = 2;
+    let b = component_to_color_u8(dataset.data[IxDyn(index)], dataset.metadata.pixel_type);
+    match color_space {
+        "hsb" => Ok(rgb_to_hsb_255_local(r, g, b)),
+        "rgb" => Ok([r, g, b]),
+        "lab" => Ok(rgb_to_lab_255_local(r, g, b)),
+        "yuv" => Ok(rgb_to_yuv_255_local(r, g, b)),
+        other => Err(format!("unsupported color threshold space `{other}`")),
+    }
+}
+
+fn component_to_color_u8(value: f32, pixel_type: PixelType) -> f32 {
+    match pixel_type {
+        PixelType::U8 => value.clamp(0.0, 255.0),
+        PixelType::U16 => (value.clamp(0.0, 65_535.0) / 257.0).round(),
+        PixelType::F32 if value <= 1.0 => (value.clamp(0.0, 1.0) * 255.0).round(),
+        PixelType::F32 => value.clamp(0.0, 255.0),
+    }
+}
+
+fn rgb_to_hsb_255_local(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let r = r / 255.0;
+    let g = g / 255.0;
+    let b = b / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if (max - r).abs() <= f32::EPSILON {
+        60.0 * (((g - b) / delta) % 6.0)
+    } else if (max - g).abs() <= f32::EPSILON {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let hue = if hue < 0.0 { hue + 360.0 } else { hue };
+    let saturation = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
+    [hue / 360.0 * 255.0, saturation * 255.0, max * 255.0]
+}
+
+fn rgb_to_yuv_255_local(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let y = 0.299 * r + 0.587 * g + 0.114 * b;
+    let u = (0.492 * (b - y) + 128.0).clamp(0.0, 255.0);
+    let v = (0.877 * (r - y) + 128.0).clamp(0.0, 255.0);
+    [y.clamp(0.0, 255.0), u, v]
+}
+
+fn rgb_to_lab_255_local(r: f32, g: f32, b: f32) -> [f32; 3] {
+    let r = srgb_to_linear_local(r / 255.0);
+    let g = srgb_to_linear_local(g / 255.0);
+    let b = srgb_to_linear_local(b / 255.0);
+    let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
+    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175 * b;
+    let z = (0.019_333_9 * r + 0.119_192 * g + 0.950_304_1 * b) / 1.088_83;
+    let fx = lab_pivot_local(x);
+    let fy = lab_pivot_local(y);
+    let fz = lab_pivot_local(z);
+    [
+        (116.0 * fy - 16.0).clamp(0.0, 100.0) * 2.55,
+        (500.0 * (fx - fy) + 128.0).clamp(0.0, 255.0),
+        (200.0 * (fy - fz) + 128.0).clamp(0.0, 255.0),
+    ]
+}
+
+fn srgb_to_linear_local(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn lab_pivot_local(value: f32) -> f32 {
+    if value > 0.008_856 {
+        value.powf(1.0 / 3.0)
+    } else {
+        7.787 * value + 16.0 / 116.0
+    }
+}
+
+fn color_threshold_macro_text(params: &Value) -> String {
+    let space = params
+        .get("color_space")
+        .or_else(|| params.get("space"))
+        .and_then(Value::as_str)
+        .unwrap_or("HSB");
+    let space_key = color_threshold_space_key(space).to_ascii_uppercase();
+    let mode = params.get("mode").and_then(Value::as_str).unwrap_or("Red");
+    let method = params
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("Default");
+    let band = |index: usize, key: &str| {
+        let object = params.get(key).and_then(Value::as_object);
+        let min = object
+            .and_then(|object| object.get("min"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let max = object
+            .and_then(|object| object.get("max"))
+            .and_then(Value::as_f64)
+            .unwrap_or(255.0);
+        let pass = object
+            .and_then(|object| object.get("pass"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        format!(
+            "min[{index}]={min:.0};\nmax[{index}]={max:.0};\nfilter[{index}]=\"{}\";\n",
+            if pass { "pass" } else { "stop" }
+        )
+    };
+    let setup = match space_key.as_str() {
+        "HSB" => concat!(
+            "run(\"HSB Stack\");\n",
+            "run(\"Convert Stack to Images\");\n",
+            "selectWindow(\"Hue\");\nrename(\"0\");\n",
+            "selectWindow(\"Saturation\");\nrename(\"1\");\n",
+            "selectWindow(\"Brightness\");\nrename(\"2\");\n",
+        )
+        .to_string(),
+        "LAB" => concat!(
+            "call(\"ij.plugin.frame.ColorThresholder.RGBtoLab\");\n",
+            "run(\"RGB Stack\");\n",
+            "run(\"Convert Stack to Images\");\n",
+            "selectWindow(\"Red\");\nrename(\"0\");\n",
+            "selectWindow(\"Green\");\nrename(\"1\");\n",
+            "selectWindow(\"Blue\");\nrename(\"2\");\n",
+        )
+        .to_string(),
+        "YUV" => concat!(
+            "call(\"ij.plugin.frame.ColorThresholder.RGBtoYUV\");\n",
+            "run(\"RGB Stack\");\n",
+            "run(\"Convert Stack to Images\");\n",
+            "selectWindow(\"Red\");\nrename(\"0\");\n",
+            "selectWindow(\"Green\");\nrename(\"1\");\n",
+            "selectWindow(\"Blue\");\nrename(\"2\");\n",
+        )
+        .to_string(),
+        _ => concat!(
+            "run(\"RGB Stack\");\n",
+            "run(\"Convert Stack to Images\");\n",
+            "selectWindow(\"Red\");\nrename(\"0\");\n",
+            "selectWindow(\"Green\");\nrename(\"1\");\n",
+            "selectWindow(\"Blue\");\nrename(\"2\");\n",
+        )
+        .to_string(),
+    };
+    format!(
+        concat!(
+            "// Color Thresholder\n",
+            "// Autogenerated macro, single images only!\n",
+            "// color_space={space} method={method} threshold_color={mode}\n",
+            "min=newArray(3);\n",
+            "max=newArray(3);\n",
+            "filter=newArray(3);\n",
+            "a=getTitle();\n",
+            "{setup}",
+            "{band0}",
+            "{band1}",
+            "{band2}",
+            "for (i=0;i<3;i++){{\n",
+            "  selectWindow(\"\"+i);\n",
+            "  setThreshold(min[i], max[i]);\n",
+            "  run(\"Convert to Mask\");\n",
+            "  if (filter[i]==\"stop\")  run(\"Invert\");\n",
+            "}}\n",
+            "imageCalculator(\"AND create\", \"0\",\"1\");\n",
+            "imageCalculator(\"AND create\", \"Result of 0\",\"2\");\n",
+            "for (i=0;i<3;i++){{\n",
+            "  selectWindow(\"\"+i);\n",
+            "  close();\n",
+            "}}\n",
+            "selectWindow(\"Result of 0\");\n",
+            "close();\n",
+            "selectWindow(\"Result of Result of 0\");\n",
+            "rename(a);\n",
+            "// Colour Thresholding-------------\n",
+        ),
+        space = space,
+        method = method,
+        mode = mode,
+        setup = setup,
+        band0 = band(0, "hue"),
+        band1 = band(1, "saturation"),
+        band2 = band(2, "brightness"),
+    )
+}
+
+fn draw_color_threshold_band(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    min: &mut f32,
+    max: &mut f32,
+    pass: &mut bool,
+    histogram: Option<&AdjustHistogram>,
+) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.checkbox(pass, "Pass");
+    });
+    draw_adjust_histogram(ui, histogram, Some((*min, *max)), None, false);
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing(egui::vec2(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.add(egui::Slider::new(min, 0.0..=255.0).show_value(false));
+            ui.add(egui::DragValue::new(min).range(0.0..=255.0).speed(1.0));
+            ui.end_row();
+            ui.add(egui::Slider::new(max, 0.0..=255.0).show_value(false));
+            ui.add(egui::DragValue::new(max).range(0.0..=255.0).speed(1.0));
+            ui.end_row();
+        });
+    if *max < *min {
+        std::mem::swap(min, max);
+    }
+}
+
 fn draw_adjust_histogram(
     ui: &mut egui::Ui,
     histogram: Option<&AdjustHistogram>,
     range: Option<(f32, f32)>,
     marker: Option<f32>,
+    log_scale: bool,
 ) {
     let available = egui::vec2(ui.available_width().max(240.0), 120.0);
     let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
@@ -11700,13 +14352,15 @@ fn draw_adjust_histogram(
     };
 
     let max_count = display_histogram_max(&histogram.counts).max(1) as f32;
+    let max_height = histogram_count_height(max_count, log_scale).max(f32::EPSILON);
     let bin_width = rect.width() / histogram.counts.len().max(1) as f32;
     for (index, count) in histogram.counts.iter().enumerate() {
         if *count == 0 {
             continue;
         }
         let x = rect.left() + index as f32 * bin_width + bin_width * 0.5;
-        let normalized = (*count as f32).min(max_count) / max_count;
+        let normalized =
+            histogram_count_height((*count as f32).min(max_count), log_scale) / max_height;
         let y = rect.bottom() - normalized * rect.height();
         painter.line_segment(
             [egui::pos2(x, rect.bottom()), egui::pos2(x, y)],
@@ -11771,7 +14425,14 @@ fn draw_adjust_histogram(
         ui.small(format!("min {:.4}", histogram.min));
         ui.small(format!("max {:.4}", histogram.max));
         ui.small(format!("n {}", histogram.pixel_count));
+        if log_scale {
+            ui.small("log");
+        }
     });
+}
+
+fn histogram_count_height(count: f32, log_scale: bool) -> f32 {
+    if log_scale { count.ln_1p() } else { count }
 }
 
 fn display_histogram_max(counts: &[u64]) -> u64 {
@@ -12062,6 +14723,7 @@ mod tests {
 
     use crate::formats::NativeRasterImage;
     use crate::model::{AxisKind, DatasetF32, Dim, Metadata, PixelType};
+    use crate::runtime::AppContext;
     use crate::ui::interaction::roi::{RoiPosition, RoiStore};
     use crate::ui::interaction::transform::ViewerTransformState;
     use crate::ui::state::{BinaryOptions, MeasurementSettings, OverlaySettings};
@@ -12070,34 +14732,40 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        HoverInfo, ImageSummary, LauncherStatusModel, LookupTable, OverlayVisibility,
-        ProgressState, RepaintDecisionInputs, RoiKind, RoiModel, SliceImage, ToolId, UiState,
+        AdjustDialogState, AdjustHistogram, HoverInfo, ImageSummary, ImageUiApp,
+        LauncherStatusModel, LookupTable, OverlayVisibility, ProgressState, RepaintDecisionInputs,
+        RoiKind, RoiModel, SliceImage, ThresholdOverlay, ThresholdOverlayMode, ToolId, UiState,
         ViewerFrameBuffer, ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry,
         ViewerUiState, ZoomCommand, add_selection_to_overlay, adjust_histogram,
-        apply_overlay_visibility, apply_zoom_command, binary_morphology_params, build_frame,
-        canonical_json, centered_circular_roi, combine_stack_datasets,
+        apply_overlay_visibility, apply_zoom_command, auto_contrast_range,
+        binary_morphology_params, build_frame, canonical_json, centered_circular_roi,
+        color_threshold_auto_ranges, color_threshold_macro_text, combine_stack_datasets,
         compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
         create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
         first_report_line, flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
         function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
         imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
-        initialize_view_to_open_state, insert_stack_dataset, install_macro_file_to_dir,
-        installed_macro_file_name, installed_macro_menu_entry_from_block, interpolate_roi_kind,
-        line_width_from_params, list_installed_macro_files_in_dir, lookup_table_color,
-        lookup_table_from_command, lookup_table_slice_to_rgb, macro_display_name,
-        macro_name_shortcut, macro_named_block_statement_map, macro_options_to_json,
-        macro_record_line_for_command, macro_save_path, macro_shortcut_matches_text,
-        macro_source_executable_lines, macro_source_named_blocks, new_image_dataset,
+        init_coordinates_dialog, initialize_view_to_open_state, insert_stack_dataset,
+        install_macro_file_to_dir, installed_macro_file_name,
+        installed_macro_menu_entry_from_block, interpolate_roi_kind, line_width_from_params,
+        list_installed_macro_files_in_dir, lookup_table_color, lookup_table_from_command,
+        lookup_table_slice_to_rgb, macro_display_name, macro_name_shortcut,
+        macro_named_block_statement_map, macro_options_to_json, macro_record_line_for_command,
+        macro_save_path, macro_shortcut_matches_text, macro_source_executable_lines,
+        macro_source_named_blocks, mask_foreground_bbox, mask_foreground_roi, new_image_dataset,
         overlay_element_rows, overlay_from_roi_manager, overlay_label_for_roi,
         overlay_to_roi_manager, parse_macro_command_line, preview_cache_key,
         remove_stack_slice_labels_dataset, renamed_image_path, results_distribution,
-        results_rows_to_dataset, results_summary_rows, roi_label_anchor, roi_stroke_width,
-        sanitize_image_title, selection_properties_row, set_stack_slice_label_dataset,
-        should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
-        stack_measurement_rows, stack_position_from_params, stack_slice_label, stack_slice_path,
-        stack_to_image_datasets, stack_xy_profile_rows, startup_auto_run_macro_block,
-        strip_macro_line_comment, tool_from_command_id, tool_shortcut_command, viewer_sort_key,
-        xy_coordinate_rows, zoom_set_params,
+        results_rows_to_dataset, results_summary_rows, roi_kind_bbox, roi_label_anchor,
+        roi_stroke_width, sample_color_threshold_ranges, sanitize_image_title,
+        selection_properties_row, set_stack_slice_label_dataset,
+        set_threshold_sixteen_bit_histogram, should_request_periodic_repaint,
+        should_request_repaint_now, source_ptr_eq, stack_measurement_rows,
+        stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
+        stack_xy_profile_rows, startup_auto_run_macro_block, strip_macro_line_comment,
+        threshold_method_labels, threshold_method_param, to_color_image_with_threshold,
+        tool_from_command_id, tool_shortcut_command, viewer_sort_key, xy_coordinate_rows,
+        zoom_set_params,
     };
     use tempfile::tempdir;
 
@@ -12808,10 +15476,76 @@ mod tests {
         assert_eq!(line_width_from_params(&json!({})).expect("default"), 1.0);
         assert_eq!(
             line_width_from_params(&json!({"width": 5.5})).expect("custom"),
-            5.5
+            6.0
         );
         assert!(line_width_from_params(&json!({"width": 0.0})).is_err());
         assert!(line_width_from_params(&json!({"width": -1.0})).is_err());
+    }
+
+    #[test]
+    fn coordinates_dialog_defaults_to_selection_bounds_like_imagej() {
+        let mut metadata = Metadata::from_shape(&[10, 10], PixelType::F32);
+        metadata.dims[1].spacing = Some(2.0);
+        metadata.dims[0].spacing = Some(5.0);
+        metadata
+            .extras
+            .insert("x_origin_coordinate".to_string(), json!(10.0));
+        metadata
+            .extras
+            .insert("y_origin_coordinate".to_string(), json!(20.0));
+        let mut viewer = ViewerUiState::new("viewer-1", "test".to_string());
+        viewer.rois.begin_active(
+            RoiKind::Rect {
+                start: egui::pos2(2.0, 3.0),
+                end: egui::pos2(6.0, 7.0),
+                rounded: false,
+                rotated: false,
+            },
+            RoiPosition::default(),
+        );
+        viewer.rois.commit_active(true);
+        let mut dialog = AdjustDialogState::default();
+
+        init_coordinates_dialog(&mut dialog, &metadata, Some(&viewer), 1, 10.0, 10.0);
+
+        assert_eq!(dialog.coordinates_mode, "selection");
+        assert_eq!(dialog.coordinates_x_pixel, 2.0);
+        assert_eq!(dialog.coordinates_y_pixel, 3.0);
+        assert_eq!(dialog.coordinates_width, 4.0);
+        assert_eq!(dialog.coordinates_height, 4.0);
+        assert_eq!(dialog.left, 14.0);
+        assert_eq!(dialog.right, 22.0);
+        assert_eq!(dialog.top, 35.0);
+        assert_eq!(dialog.bottom, 55.0);
+    }
+
+    #[test]
+    fn coordinates_dialog_uses_point_mode_for_single_point_selection() {
+        let mut metadata = Metadata::from_shape(&[10, 10, 3], PixelType::F32);
+        metadata.dims[1].spacing = Some(2.0);
+        metadata.dims[0].spacing = Some(5.0);
+        metadata.dims[2].spacing = Some(10.0);
+        let mut viewer = ViewerUiState::new("viewer-1", "test".to_string());
+        viewer.z = 1;
+        viewer.rois.begin_active(
+            RoiKind::Point {
+                points: vec![egui::pos2(4.0, 6.0)],
+                multi: false,
+            },
+            RoiPosition::default(),
+        );
+        viewer.rois.commit_active(true);
+        let mut dialog = AdjustDialogState::default();
+
+        init_coordinates_dialog(&mut dialog, &metadata, Some(&viewer), 3, 10.0, 10.0);
+
+        assert_eq!(dialog.coordinates_mode, "point");
+        assert_eq!(dialog.coordinates_x_pixel, 4.0);
+        assert_eq!(dialog.coordinates_y_pixel, 6.0);
+        assert_eq!(dialog.coordinates_z_pixel, 1.0);
+        assert_eq!(dialog.left, 8.0);
+        assert_eq!(dialog.top, 30.0);
+        assert_eq!(dialog.front, 10.0);
     }
 
     #[test]
@@ -14643,6 +17377,562 @@ mod tests {
     }
 
     #[test]
+    fn compute_viewer_frame_prefers_channel_display_range() {
+        let data = Array::from_shape_vec(
+            IxDyn(&[2, 2, 3]),
+            vec![
+                0.0, 0.0, 0.0, //
+                0.0, 5.0, 0.0, //
+                0.0, 10.0, 0.0, //
+                0.0, 20.0, 0.0,
+            ],
+        )
+        .expect("shape");
+        let dataset = Arc::new(
+            DatasetF32::new(
+                data,
+                Metadata {
+                    dims: vec![
+                        Dim::new(AxisKind::Y, 2),
+                        Dim::new(AxisKind::X, 2),
+                        Dim::new(AxisKind::Channel, 3),
+                    ],
+                    pixel_type: PixelType::U8,
+                    ..Metadata::default()
+                },
+            )
+            .expect("dataset"),
+        );
+        let mut state = UiState::new(None);
+        let label = "viewer-1".to_string();
+        let mut session = ViewerSession::new(
+            PathBuf::from("/tmp/channel-display-range.tif"),
+            ViewerImageSource::Dataset(dataset.clone()),
+        );
+        session.set_display_range(Some((0.0, 255.0)));
+        session.set_channel_display_range(1, Some((0.0, 10.0)));
+        state.label_to_session.insert(label.clone(), session);
+
+        let frame = compute_viewer_frame(
+            &mut state,
+            &label,
+            &ViewerFrameRequest {
+                channel: 1,
+                ..ViewerFrameRequest::default()
+            },
+            None,
+        )
+        .expect("channel frame");
+
+        assert_eq!(frame.values, vec![0.0, 5.0, 10.0, 20.0]);
+        assert_eq!(frame.pixels_u8, vec![0, 128, 255, 255]);
+        let session = state.label_to_session.get(&label).expect("session");
+        assert!(Arc::ptr_eq(
+            &session.committed_dataset().expect("committed"),
+            &dataset
+        ));
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn adjust_apply_lut_rejects_float_images_like_imagej() {
+        let label = "viewer-1".to_string();
+        let dataset = dataset_2x2_with_pixel_type([0.0, 0.25, 0.5, 1.0], PixelType::F32);
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/float-apply-lut.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "float-apply-lut".to_string()),
+        );
+
+        let brightness = app.dispatch_command(
+            &label,
+            "image.adjust.brightness",
+            Some(json!({"min": 0.0, "max": 1.0, "apply": true})),
+        );
+        assert!(matches!(
+            brightness.status,
+            crate::ui::command_registry::CommandExecuteStatus::Blocked
+        ));
+        assert!(brightness.message.contains("32-bit"));
+
+        let window_level = app.dispatch_command(
+            &label,
+            "image.adjust.window_level",
+            Some(json!({"low": 0.0, "high": 1.0, "apply": true})),
+        );
+        assert!(matches!(
+            window_level.status,
+            crate::ui::command_registry::CommandExecuteStatus::Blocked
+        ));
+        assert!(window_level.message.contains("32-bit"));
+    }
+
+    #[test]
+    fn adjust_apply_lut_prompts_before_changing_integer_pixels() {
+        let byte_label = "viewer-1".to_string();
+        let float_label = "viewer-2".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            byte_label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/apply-lut-u8.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+        app.state.label_to_session.insert(
+            float_label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/apply-lut-f32.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 0.25, 0.5, 1.0],
+                    PixelType::F32,
+                )),
+            ),
+        );
+
+        assert!(app.apply_lut_needs_confirmation(&byte_label));
+        assert!(!app.apply_lut_needs_confirmation(&float_label));
+    }
+
+    #[test]
+    fn threshold_apply_can_route_float_images_to_nan_background() {
+        let label = "viewer-1".to_string();
+        let dataset = dataset_2x2_with_pixel_type([0.0, 0.25, 0.75, 1.0], PixelType::F32);
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/threshold-nan-background.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "threshold-nan-background".to_string()),
+        );
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.threshold",
+            Some(json!({
+                "apply": true,
+                "min": 0.25,
+                "max": 0.75,
+                "background_to_nan": true
+            })),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(
+            result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("op")),
+            Some(&json!("intensity.nan_background"))
+        );
+    }
+
+    #[test]
+    fn threshold_apply_prompts_for_float_images_only() {
+        let float_label = "viewer-1".to_string();
+        let byte_label = "viewer-2".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            float_label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/threshold-float-prompt.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 0.25, 0.75, 1.0],
+                    PixelType::F32,
+                )),
+            ),
+        );
+        app.state.label_to_session.insert(
+            byte_label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/threshold-byte-prompt.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+
+        assert!(app.threshold_apply_needs_float_prompt(&float_label));
+        assert!(!app.threshold_apply_needs_float_prompt(&byte_label));
+    }
+
+    #[test]
+    fn threshold_overlay_renders_without_committing_pixels() {
+        let original = dataset_2x2_with_pixel_type([0.0, 5.0, 10.0, 20.0], PixelType::U8);
+        let mut session = ViewerSession::new(
+            PathBuf::from("/tmp/threshold-overlay.tif"),
+            ViewerImageSource::Dataset(original.clone()),
+        );
+        session.set_threshold_overlay(Some(ThresholdOverlay {
+            low: 5.0,
+            high: 10.0,
+            mode: ThresholdOverlayMode::Red,
+        }));
+
+        let frame = build_frame(
+            &session.committed_source(),
+            &ViewerFrameRequest::default(),
+            session.display_range,
+        )
+        .expect("frame");
+        let image =
+            to_color_image_with_threshold(&frame, LookupTable::Grays, session.threshold_overlay);
+
+        assert_eq!(image.pixels[0], egui::Color32::BLACK);
+        assert_eq!(image.pixels[1], egui::Color32::RED);
+        assert_eq!(image.pixels[2], egui::Color32::RED);
+        assert_eq!(image.pixels[3], egui::Color32::from_gray(20));
+        assert!(Arc::ptr_eq(
+            &session.committed_dataset().expect("committed"),
+            &original
+        ));
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn threshold_reset_honors_no_reset_range_checkbox() {
+        let label = "viewer-1".to_string();
+        let dataset = dataset_2x2_with_pixel_type([0.0, 5.0, 10.0, 20.0], PixelType::U8);
+        let mut app = ImageUiApp::new_for_test();
+        let mut session = ViewerSession::new(
+            PathBuf::from("/tmp/threshold-reset.tif"),
+            ViewerImageSource::Dataset(dataset),
+        );
+        session.set_display_range(Some((0.0, 10.0)));
+        session.set_threshold_overlay(Some(ThresholdOverlay {
+            low: 5.0,
+            high: 10.0,
+            mode: ThresholdOverlayMode::Red,
+        }));
+        app.state.label_to_session.insert(label.clone(), session);
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "threshold-reset".to_string()),
+        );
+
+        app.set_threshold_overlay(&label, &json!({"reset": true, "no_reset": true}))
+            .expect("reset threshold only");
+        let session = app.state.label_to_session.get_mut(&label).expect("session");
+        assert!(session.threshold_overlay.is_none());
+        assert_eq!(session.display_range, Some((0.0, 10.0)));
+        session.set_threshold_overlay(Some(ThresholdOverlay {
+            low: 5.0,
+            high: 10.0,
+            mode: ThresholdOverlayMode::Red,
+        }));
+
+        app.set_threshold_overlay(&label, &json!({"reset": true, "no_reset": false}))
+            .expect("reset threshold and display");
+        let session = app.state.label_to_session.get(&label).expect("session");
+        assert!(session.threshold_overlay.is_none());
+        assert_eq!(session.display_range, None);
+    }
+
+    #[test]
+    fn threshold_auto_uses_current_slice_unless_stack_histogram_enabled() {
+        let data = Array::from_shape_vec(
+            (2, 2, 2),
+            vec![0.0, 100.0, 0.0, 100.0, 0.0, 100.0, 10.0, 100.0],
+        )
+        .expect("shape")
+        .into_dyn();
+        let dataset = Arc::new(DatasetF32::from_data_with_default_metadata(
+            data,
+            PixelType::F32,
+        ));
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/threshold-stack.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "stack".to_string()),
+        );
+
+        app.set_threshold_overlay(&label, &json!({"method": "mean", "background": "dark"}))
+            .expect("slice threshold");
+        let slice_low = app
+            .state
+            .label_to_session
+            .get(&label)
+            .and_then(|session| session.threshold_overlay.as_ref())
+            .map(|threshold| threshold.low)
+            .expect("slice overlay");
+
+        app.set_threshold_overlay(
+            &label,
+            &json!({"method": "mean", "background": "dark", "stack": true}),
+        )
+        .expect("stack threshold");
+        let stack_low = app
+            .state
+            .label_to_session
+            .get(&label)
+            .and_then(|session| session.threshold_overlay.as_ref())
+            .map(|threshold| threshold.low)
+            .expect("stack overlay");
+
+        assert!(slice_low < 10.0, "slice threshold was {slice_low}");
+        assert!(stack_low > 40.0, "stack threshold was {stack_low}");
+    }
+
+    #[test]
+    fn color_threshold_selection_bbox_uses_foreground_mask_pixels() {
+        let slice = SliceImage {
+            width: 4,
+            height: 3,
+            pixel_type: PixelType::U8,
+            values: vec![
+                0.0, 0.0, 0.0, 0.0, //
+                0.0, 255.0, 255.0, 0.0, //
+                0.0, 0.0, 255.0, 0.0,
+            ],
+        };
+
+        assert_eq!(mask_foreground_bbox(&slice), Some((1, 1, 2, 2)));
+    }
+
+    #[test]
+    fn color_threshold_selection_traces_mask_outline_instead_of_bbox() {
+        let slice = SliceImage {
+            width: 4,
+            height: 4,
+            pixel_type: PixelType::U8,
+            values: vec![
+                0.0, 0.0, 0.0, 0.0, //
+                0.0, 255.0, 0.0, 0.0, //
+                0.0, 255.0, 255.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0,
+            ],
+        };
+
+        let roi = mask_foreground_roi(&slice).expect("roi");
+        let RoiKind::Polygon { points, closed } = roi else {
+            panic!("expected traced polygon");
+        };
+
+        assert!(closed);
+        assert!(points.len() > 4, "outline points: {points:?}");
+        let bounds = roi_kind_bbox(&RoiKind::Polygon {
+            points: points.clone(),
+            closed,
+        })
+        .expect("bounds");
+        assert_eq!(bounds, (1, 1, 3, 3));
+    }
+
+    #[test]
+    fn color_threshold_sample_ranges_use_selected_rgb_pixels() {
+        let data = Array::from_shape_vec(
+            IxDyn(&[2, 2, 3]),
+            vec![
+                10.0, 20.0, 30.0, //
+                40.0, 50.0, 60.0, //
+                70.0, 80.0, 90.0, //
+                100.0, 110.0, 120.0,
+            ],
+        )
+        .expect("shape");
+        let dataset = DatasetF32::new(
+            data,
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 2),
+                    Dim::new(AxisKind::X, 2),
+                    Dim::new(AxisKind::Channel, 3),
+                ],
+                pixel_type: PixelType::U8,
+                ..Metadata::default()
+            },
+        )
+        .expect("dataset");
+
+        let ranges = sample_color_threshold_ranges(&dataset, (1, 0, 1, 1), 0, 0, "RGB")
+            .expect("sample ranges");
+
+        assert_eq!(ranges, [(40.0, 100.0), (50.0, 110.0), (60.0, 120.0)]);
+    }
+
+    #[test]
+    fn color_threshold_auto_ranges_follow_imagej_rgb_band_rule() {
+        let data = Array::from_shape_vec(
+            IxDyn(&[2, 2, 3]),
+            vec![
+                0.0, 0.0, 0.0, //
+                10.0, 20.0, 30.0, //
+                240.0, 220.0, 200.0, //
+                250.0, 240.0, 230.0,
+            ],
+        )
+        .expect("shape");
+        let dataset = DatasetF32::new(
+            data,
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 2),
+                    Dim::new(AxisKind::X, 2),
+                    Dim::new(AxisKind::Channel, 3),
+                ],
+                pixel_type: PixelType::U8,
+                ..Metadata::default()
+            },
+        )
+        .expect("dataset");
+        let app = AppContext::new();
+
+        let ranges = color_threshold_auto_ranges(&dataset, 0, 0, "RGB", "mean", "dark", &app)
+            .expect("auto ranges");
+
+        assert!(ranges[0].0 > 100.0 && ranges[0].1 == 250.0);
+        assert!(ranges[1].0 > 100.0 && ranges[1].1 == 240.0);
+        assert!(ranges[2].0 > 100.0 && ranges[2].1 == 230.0);
+    }
+
+    #[test]
+    fn color_threshold_auto_ranges_follow_imagej_hsb_brightness_rule() {
+        let data = Array::from_shape_vec(
+            IxDyn(&[2, 2, 3]),
+            vec![
+                0.0, 0.0, 0.0, //
+                32.0, 32.0, 32.0, //
+                224.0, 224.0, 224.0, //
+                255.0, 255.0, 255.0,
+            ],
+        )
+        .expect("shape");
+        let dataset = DatasetF32::new(
+            data,
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 2),
+                    Dim::new(AxisKind::X, 2),
+                    Dim::new(AxisKind::Channel, 3),
+                ],
+                pixel_type: PixelType::U8,
+                ..Metadata::default()
+            },
+        )
+        .expect("dataset");
+        let app = AppContext::new();
+
+        let ranges = color_threshold_auto_ranges(&dataset, 0, 0, "HSB", "mean", "dark", &app)
+            .expect("auto ranges");
+
+        assert_eq!(ranges[0], (0.0, 255.0));
+        assert_eq!(ranges[1], (0.0, 255.0));
+        assert!(ranges[2].0 > 100.0 && ranges[2].1 == 255.0);
+    }
+
+    #[test]
+    fn color_threshold_macro_text_records_current_ranges() {
+        let text = color_threshold_macro_text(&json!({
+            "color_space": "RGB",
+            "method": "Otsu",
+            "mode": "B&W",
+            "hue": {"min": 10, "max": 200, "pass": true},
+            "saturation": {"min": 20, "max": 180, "pass": false},
+            "brightness": {"min": 30, "max": 160, "pass": true}
+        }));
+
+        assert!(text.contains("color_space=RGB"));
+        assert!(text.contains("method=Otsu"));
+        assert!(text.contains("threshold_color=B&W"));
+        assert!(text.contains("min[1]=20;"));
+        assert!(text.contains("max[1]=180;"));
+        assert!(text.contains("filter[1]=\"stop\";"));
+        assert!(text.contains("run(\"RGB Stack\");"));
+        assert!(text.contains("imageCalculator(\"AND create\", \"0\",\"1\");"));
+        assert!(text.contains("// Colour Thresholding-------------"));
+
+        let lab_text = color_threshold_macro_text(&json!({
+            "color_space": "CIE Lab"
+        }));
+        assert!(lab_text.contains("call(\"ij.plugin.frame.ColorThresholder.RGBtoLab\");"));
+    }
+
+    #[test]
+    fn color_threshold_help_action_reports_imagej_controls() {
+        let label = "viewer-1".to_string();
+        let dataset = dataset_2x2_with_pixel_type([0.0, 5.0, 10.0, 20.0], PixelType::U8);
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/color-threshold-help.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "color-threshold-help".to_string()),
+        );
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.color_threshold",
+            Some(json!({"action": "help"})),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        let viewer = app.viewers_ui.get(&label).expect("viewer");
+        let help = viewer.tool_message.as_deref().expect("help message");
+        assert!(help.contains("Pass"));
+        assert!(help.contains("Stack"));
+        assert!(help.contains("Sample"));
+    }
+
+    #[test]
+    fn threshold_method_labels_include_imagej_ij_isodata() {
+        assert!(threshold_method_labels().contains(&"IJ_IsoData"));
+        assert_eq!(threshold_method_param("IJ_IsoData"), "ij_isodata");
+    }
+
+    #[test]
+    fn threshold_sixteen_bit_histogram_forces_no_reset_range() {
+        let mut dialog = AdjustDialogState {
+            threshold_no_reset: false,
+            ..AdjustDialogState::default()
+        };
+
+        set_threshold_sixteen_bit_histogram(&mut dialog, true);
+
+        assert!(dialog.threshold_sixteen_bit_histogram);
+        assert!(dialog.threshold_no_reset);
+
+        set_threshold_sixteen_bit_histogram(&mut dialog, false);
+
+        assert!(!dialog.threshold_sixteen_bit_histogram);
+        assert!(dialog.threshold_no_reset);
+    }
+
+    #[test]
     fn adjust_histogram_counts_finite_values_into_bins() {
         let histogram = adjust_histogram(&[0.0, 0.2, 0.8, 1.0, f32::NAN], 2).expect("histogram");
 
@@ -14650,6 +17940,24 @@ mod tests {
         assert_eq!(histogram.min, 0.0);
         assert_eq!(histogram.max, 1.0);
         assert_eq!(histogram.pixel_count, 4);
+    }
+
+    #[test]
+    fn auto_contrast_range_matches_imagej_contrast_adjuster_threshold() {
+        let histogram = AdjustHistogram {
+            counts: vec![50, 1, 20, 1, 50],
+            min: 0.0,
+            max: 100.0,
+            pixel_count: 122,
+        };
+        let mut auto_threshold = 0;
+
+        let first = auto_contrast_range(Some(&histogram), &mut auto_threshold).expect("auto");
+        let second = auto_contrast_range(Some(&histogram), &mut auto_threshold).expect("auto");
+
+        assert_eq!(auto_threshold, 2500);
+        assert_eq!(first, (20.0, 60.0));
+        assert_eq!(second, (20.0, 60.0));
     }
 
     #[test]

@@ -36,6 +36,15 @@ pub(super) struct ResizeDialogState {
     pub(super) open: bool,
     pub(super) width: usize,
     pub(super) height: usize,
+    pub(super) original_width: usize,
+    pub(super) original_height: usize,
+    pub(super) depth: usize,
+    pub(super) frames: usize,
+    pub(super) constrain_aspect: bool,
+    pub(super) average_when_downsizing: bool,
+    pub(super) interpolation: String,
+    pub(super) position: String,
+    pub(super) zero_fill: bool,
     pub(super) fill: f32,
 }
 
@@ -45,6 +54,15 @@ impl Default for ResizeDialogState {
             open: false,
             width: 512,
             height: 512,
+            original_width: 512,
+            original_height: 512,
+            depth: 1,
+            frames: 1,
+            constrain_aspect: true,
+            average_when_downsizing: true,
+            interpolation: "Bilinear".to_string(),
+            position: "Center".to_string(),
+            zero_fill: false,
             fill: 0.0,
         }
     }
@@ -64,11 +82,11 @@ pub(super) enum AdjustDialogKind {
 impl AdjustDialogKind {
     pub(super) fn title(self) -> &'static str {
         match self {
-            Self::BrightnessContrast => "Brightness/Contrast",
-            Self::WindowLevel => "Window/Level",
-            Self::ColorBalance => "Color Balance",
+            Self::BrightnessContrast => "B&C",
+            Self::WindowLevel => "W&L",
+            Self::ColorBalance => "Color",
             Self::Threshold => "Threshold",
-            Self::ColorThreshold => "Color Threshold",
+            Self::ColorThreshold => "Threshold Color",
             Self::LineWidth => "Line Width",
             Self::Coordinates => "Coordinates",
         }
@@ -95,11 +113,29 @@ pub(super) struct AdjustDialogState {
     pub(super) max: f32,
     pub(super) brightness: f32,
     pub(super) contrast: f32,
+    pub(super) contrast_auto_threshold: u32,
+    pub(super) log_histogram: bool,
     pub(super) threshold: f32,
+    pub(super) threshold_method: String,
+    pub(super) threshold_mode: String,
+    pub(super) threshold_stack_histogram: bool,
+    pub(super) threshold_no_reset: bool,
+    pub(super) threshold_raw_values: bool,
+    pub(super) threshold_sixteen_bit_histogram: bool,
     pub(super) dark_background: bool,
-    pub(super) red: f32,
-    pub(super) green: f32,
-    pub(super) blue: f32,
+    pub(super) color_balance_channel: String,
+    pub(super) color_threshold_space: String,
+    pub(super) color_threshold_method: String,
+    pub(super) color_threshold_mode: String,
+    pub(super) hue_min: f32,
+    pub(super) hue_max: f32,
+    pub(super) saturation_min: f32,
+    pub(super) saturation_max: f32,
+    pub(super) brightness_min: f32,
+    pub(super) brightness_max: f32,
+    pub(super) hue_pass: bool,
+    pub(super) saturation_pass: bool,
+    pub(super) brightness_pass: bool,
     pub(super) line_width: f32,
     pub(super) left: f32,
     pub(super) right: f32,
@@ -107,6 +143,13 @@ pub(super) struct AdjustDialogState {
     pub(super) bottom: f32,
     pub(super) front: f32,
     pub(super) back: f32,
+    pub(super) coordinates_mode: String,
+    pub(super) coordinates_x_pixel: f32,
+    pub(super) coordinates_y_pixel: f32,
+    pub(super) coordinates_width: f32,
+    pub(super) coordinates_height: f32,
+    pub(super) coordinates_z_pixel: f32,
+    pub(super) coordinates_depth: f32,
     pub(super) x_unit: String,
     pub(super) y_unit: String,
     pub(super) z_unit: String,
@@ -125,11 +168,29 @@ impl Default for AdjustDialogState {
             max: 1.0,
             brightness: 0.5,
             contrast: 0.5,
+            contrast_auto_threshold: 0,
+            log_histogram: false,
             threshold: 0.5,
+            threshold_method: "Default".to_string(),
+            threshold_mode: "Red".to_string(),
+            threshold_stack_histogram: false,
+            threshold_no_reset: true,
+            threshold_raw_values: false,
+            threshold_sixteen_bit_histogram: false,
             dark_background: true,
-            red: 1.0,
-            green: 1.0,
-            blue: 1.0,
+            color_balance_channel: "Red".to_string(),
+            color_threshold_space: "HSB".to_string(),
+            color_threshold_method: "Default".to_string(),
+            color_threshold_mode: "Red".to_string(),
+            hue_min: 0.0,
+            hue_max: 255.0,
+            saturation_min: 0.0,
+            saturation_max: 255.0,
+            brightness_min: 0.0,
+            brightness_max: 255.0,
+            hue_pass: true,
+            saturation_pass: true,
+            brightness_pass: true,
             line_width: 1.0,
             left: 0.0,
             right: 512.0,
@@ -137,9 +198,56 @@ impl Default for AdjustDialogState {
             bottom: 512.0,
             front: 0.0,
             back: 1.0,
+            coordinates_mode: "image".to_string(),
+            coordinates_x_pixel: 0.0,
+            coordinates_y_pixel: 0.0,
+            coordinates_width: 512.0,
+            coordinates_height: 512.0,
+            coordinates_z_pixel: 0.0,
+            coordinates_depth: 1.0,
             x_unit: "pixel".to_string(),
             y_unit: "pixel".to_string(),
             z_unit: "pixel".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ThresholdApplyDialogState {
+    pub(super) open: bool,
+    pub(super) window_label: String,
+    pub(super) min: f32,
+    pub(super) max: f32,
+    pub(super) dark_background: bool,
+}
+
+impl Default for ThresholdApplyDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            min: 0.0,
+            max: 1.0,
+            dark_background: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ApplyLutDialogState {
+    pub(super) open: bool,
+    pub(super) window_label: String,
+    pub(super) command_id: String,
+    pub(super) params: serde_json::Value,
+}
+
+impl Default for ApplyLutDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            command_id: String::new(),
+            params: serde_json::Value::Null,
         }
     }
 }
