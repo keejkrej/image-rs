@@ -39,7 +39,7 @@ const SOURCE_PREVIEW_PREFIX: &str = "preview:";
 const VIEWER_MIN_WINDOW_SIZE: [f32; 2] = [220.0, 160.0];
 #[cfg(test)]
 const VIEWER_WINDOW_EXTRA_SIZE: [f32; 2] = [24.0, 120.0];
-const LAUNCHER_MIN_WINDOW_SIZE: [f32; 2] = [600.0, 200.0];
+const LAUNCHER_MIN_WINDOW_SIZE: [f32; 2] = [600.0, 720.0];
 const BINARY_MAX_ITERATIONS: usize = 100;
 const BINARY_MAX_COUNT: usize = 8;
 const SLICE_LABELS_KEY: &str = "slice_labels";
@@ -544,12 +544,25 @@ impl AdjustDialogKind {
 }
 
 #[derive(Debug, Clone)]
+struct AdjustHistogram {
+    counts: Vec<u64>,
+    min: f32,
+    max: f32,
+    pixel_count: usize,
+}
+
+#[derive(Debug, Clone)]
 struct AdjustDialogState {
     open: bool,
     window_label: String,
     kind: AdjustDialogKind,
+    histogram: Option<AdjustHistogram>,
+    default_min: f32,
+    default_max: f32,
     min: f32,
     max: f32,
+    brightness: f32,
+    contrast: f32,
     threshold: f32,
     dark_background: bool,
     red: f32,
@@ -573,8 +586,13 @@ impl Default for AdjustDialogState {
             open: false,
             window_label: String::new(),
             kind: AdjustDialogKind::BrightnessContrast,
+            histogram: None,
+            default_min: 0.0,
+            default_max: 1.0,
             min: 0.0,
             max: 1.0,
+            brightness: 0.5,
+            contrast: 0.5,
             threshold: 0.5,
             dark_background: true,
             red: 1.0,
@@ -2988,6 +3006,26 @@ impl ImageUiApp {
         extract_slice_from_source(&source, request.z, request.t, request.channel)
     }
 
+    fn adjust_histogram_for_viewer(
+        &self,
+        viewer_label: &str,
+        bins: usize,
+    ) -> Result<AdjustHistogram, String> {
+        let viewer = self
+            .viewers_ui
+            .get(viewer_label)
+            .ok_or_else(|| format!("no viewer UI state for `{viewer_label}`"))?;
+        let request = ViewerFrameRequest {
+            z: viewer.z,
+            t: viewer.t,
+            channel: viewer.channel,
+        };
+        let bbox = selected_roi_bbox(viewer);
+        let slice = self.active_dataset_slice(viewer_label, &request)?;
+        let values = slice_values_in_bbox(&slice, bbox)?;
+        adjust_histogram(&values, bins)
+    }
+
     fn save_viewer(&mut self, window_label: &str, path: Option<PathBuf>) -> Result<String, String> {
         let current_path = self
             .state
@@ -5082,17 +5120,35 @@ impl ImageUiApp {
             .current_viewer_label(window_label)
             .unwrap_or(window_label)
             .to_string();
+        let histogram = self.adjust_histogram_for_viewer(&target, 256).ok();
         self.adjust_dialog.kind = kind;
         self.adjust_dialog.window_label = target.clone();
         self.adjust_dialog.open = true;
+        self.adjust_dialog.histogram = histogram;
         self.adjust_dialog.line_width = self.tool_options.line_width_px;
 
         if let Some(session) = self.state.label_to_session.get(&target) {
+            self.adjust_dialog.default_min = self
+                .adjust_dialog
+                .histogram
+                .as_ref()
+                .map(|histogram| histogram.min)
+                .unwrap_or(session.committed_summary.min);
+            self.adjust_dialog.default_max = self
+                .adjust_dialog
+                .histogram
+                .as_ref()
+                .map(|histogram| histogram.max)
+                .unwrap_or(session.committed_summary.max);
             let (display_min, display_max) = session
                 .display_range
                 .unwrap_or((session.committed_summary.min, session.committed_summary.max));
             self.adjust_dialog.min = display_min;
             self.adjust_dialog.max = display_max;
+            if display_min.is_finite() && display_max.is_finite() {
+                self.adjust_dialog.threshold = (display_min + display_max) * 0.5;
+            }
+            sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
             let width = session.committed_summary.shape.get(1).copied().unwrap_or(1) as f32;
             let height = session
                 .committed_summary
@@ -5150,6 +5206,25 @@ impl ImageUiApp {
         }
 
         Ok(format!("display range set to {low:.4}..{high:.4}"))
+    }
+
+    fn reset_display_range(&mut self, window_label: &str) -> Result<String, String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get_mut(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        session.set_display_range(None);
+        if let Some(viewer) = self.viewers_ui.get_mut(&target) {
+            viewer.last_generation = 0;
+            viewer.last_request = None;
+            viewer.status_message = "Display range reset".to_string();
+        }
+        Ok("display range reset".to_string())
     }
 
     fn remember_repeatable_command(
@@ -6947,6 +7022,46 @@ impl ImageUiApp {
                         .open_adjust_dialog(window_label, AdjustDialogKind::BrightnessContrast);
                 }
                 let params = command_registry::merge_params(&request.command_id, request.params);
+                if params
+                    .get("reset")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return match self.reset_display_range(window_label) {
+                        Ok(message) => command_registry::CommandExecuteResult::ok(message),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
+                if params
+                    .get("apply")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let low = params
+                        .get("min")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                        .unwrap_or(0.0);
+                    let high = params
+                        .get("max")
+                        .and_then(Value::as_f64)
+                        .map(|value| value as f32)
+                        .unwrap_or(1.0);
+                    return match self.viewer_start_op(
+                        window_label,
+                        ViewerOpRequest {
+                            op: "intensity.window".to_string(),
+                            params: json!({ "low": low, "high": high }),
+                            mode: OpRunMode::Apply,
+                        },
+                    ) {
+                        Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
+                            "apply LUT started",
+                            json!({ "job_id": ticket.job_id, "op": "intensity.window" }),
+                        ),
+                        Err(error) => command_registry::CommandExecuteResult::blocked(error),
+                    };
+                }
                 match self.apply_display_range(window_label, &params, "min", "max") {
                     Ok(message) => command_registry::CommandExecuteResult::ok(message),
                     Err(error) => command_registry::CommandExecuteResult::blocked(error),
@@ -9152,31 +9267,137 @@ impl ImageUiApp {
             .open(&mut open)
             .show(ctx, |ui| match kind {
                 AdjustDialogKind::BrightnessContrast => {
-                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Minimum "));
-                    ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("Maximum "));
+                    draw_adjust_histogram(
+                        ui,
+                        self.adjust_dialog.histogram.as_ref(),
+                        Some((self.adjust_dialog.min, self.adjust_dialog.max)),
+                        None,
+                    );
+                    let (slider_min, slider_max) = adjust_slider_bounds(&self.adjust_dialog);
                     ui.horizontal(|ui| {
-                        if ui.button("Auto").clicked() {
-                            actions.push(UiAction::Command {
-                                window_label: self.adjust_dialog.window_label.clone(),
-                                command_id: "image.adjust.brightness".to_string(),
-                                params: Some(json!({})),
-                            });
-                            close = true;
-                        }
-                        if ui.button("Set").clicked() {
-                            actions.push(UiAction::Command {
-                                window_label: self.adjust_dialog.window_label.clone(),
-                                command_id: "image.adjust.brightness".to_string(),
-                                params: Some(json!({
-                                    "min": self.adjust_dialog.min,
-                                    "max": self.adjust_dialog.max,
-                                })),
-                            });
-                            close = true;
+                        ui.label("Minimum");
+                        let changed = ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.adjust_dialog.min,
+                                    slider_min..=slider_max,
+                                )
+                                .show_value(false),
+                            )
+                            .changed();
+                        ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).speed(0.1));
+                        if changed {
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
+                            sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ui.label("Maximum");
+                        let changed = ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.adjust_dialog.max,
+                                    slider_min..=slider_max,
+                                )
+                                .show_value(false),
+                            )
+                            .changed();
+                        ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).speed(0.1));
+                        if changed {
+                            clamp_adjust_min_max(&mut self.adjust_dialog);
+                            sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Brightness");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.adjust_dialog.brightness, 0.0..=1.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            adjust_min_max_from_brightness(&mut self.adjust_dialog);
+                            sync_contrast_from_min_max(&mut self.adjust_dialog);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Contrast");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.adjust_dialog.contrast, 0.0..=1.0)
+                                    .show_value(false),
+                            )
+                            .changed()
+                        {
+                            adjust_min_max_from_contrast(&mut self.adjust_dialog);
+                            sync_brightness_from_min_max(&mut self.adjust_dialog);
+                        }
+                    });
+                    egui::Grid::new("brightness_contrast_buttons")
+                        .num_columns(2)
+                        .spacing(egui::vec2(4.0, 4.0))
+                        .show(ui, |ui| {
+                            if ui.button("Auto").clicked() {
+                                let (min, max) =
+                                    auto_contrast_range(self.adjust_dialog.histogram.as_ref())
+                                        .unwrap_or((
+                                            self.adjust_dialog.default_min,
+                                            self.adjust_dialog.default_max,
+                                        ));
+                                self.adjust_dialog.min = min;
+                                self.adjust_dialog.max = max;
+                                sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.brightness".to_string(),
+                                    params: Some(json!({
+                                        "min": self.adjust_dialog.min,
+                                        "max": self.adjust_dialog.max,
+                                    })),
+                                });
+                            }
+                            if ui.button("Reset").clicked() {
+                                self.adjust_dialog.min = self.adjust_dialog.default_min;
+                                self.adjust_dialog.max = self.adjust_dialog.default_max;
+                                sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.brightness".to_string(),
+                                    params: Some(json!({ "reset": true })),
+                                });
+                            }
+                            ui.end_row();
+                            if ui.button("Set").clicked() {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.brightness".to_string(),
+                                    params: Some(json!({
+                                        "min": self.adjust_dialog.min,
+                                        "max": self.adjust_dialog.max,
+                                    })),
+                                });
+                            }
+                            if ui.button("Apply").clicked() {
+                                actions.push(UiAction::Command {
+                                    window_label: self.adjust_dialog.window_label.clone(),
+                                    command_id: "image.adjust.brightness".to_string(),
+                                    params: Some(json!({
+                                        "min": self.adjust_dialog.min,
+                                        "max": self.adjust_dialog.max,
+                                        "apply": true,
+                                    })),
+                                });
+                            }
+                        });
                 }
                 AdjustDialogKind::WindowLevel => {
+                    draw_adjust_histogram(
+                        ui,
+                        self.adjust_dialog.histogram.as_ref(),
+                        Some((self.adjust_dialog.min, self.adjust_dialog.max)),
+                        None,
+                    );
                     ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Low "));
                     ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("High "));
                     if ui.button("Set").clicked() {
@@ -9211,6 +9432,18 @@ impl ImageUiApp {
                     }
                 }
                 AdjustDialogKind::Threshold => {
+                    let high = self
+                        .adjust_dialog
+                        .histogram
+                        .as_ref()
+                        .map(|histogram| histogram.max)
+                        .unwrap_or(self.adjust_dialog.max);
+                    draw_adjust_histogram(
+                        ui,
+                        self.adjust_dialog.histogram.as_ref(),
+                        Some((self.adjust_dialog.threshold, high)),
+                        Some(self.adjust_dialog.threshold),
+                    );
                     ui.add(
                         egui::DragValue::new(&mut self.adjust_dialog.threshold)
                             .prefix("Threshold "),
@@ -9245,6 +9478,12 @@ impl ImageUiApp {
                     });
                 }
                 AdjustDialogKind::ColorThreshold => {
+                    draw_adjust_histogram(
+                        ui,
+                        self.adjust_dialog.histogram.as_ref(),
+                        Some((self.adjust_dialog.min, self.adjust_dialog.max)),
+                        None,
+                    );
                     ui.add(egui::DragValue::new(&mut self.adjust_dialog.min).prefix("Minimum "));
                     ui.add(egui::DragValue::new(&mut self.adjust_dialog.max).prefix("Maximum "));
                     if ui.button("Apply").clicked() {
@@ -10074,6 +10313,11 @@ impl ImageUiApp {
                 let safe_available = egui::vec2(available.x.max(1.0), available.y.max(1.0));
                 let (rect, response) =
                     ui.allocate_exact_size(safe_available, egui::Sense::click_and_drag());
+                if selected_tool != ToolId::Zoom {
+                    response.context_menu(|ui| {
+                        draw_imagej_viewer_popup_menu(ui, label, actions);
+                    });
+                }
                 ui.painter()
                     .rect_filled(rect, 0.0, egui::Color32::from_gray(16));
 
@@ -13377,6 +13621,171 @@ fn clamped_bbox(
     Some((min_x, min_y, max_x, max_y))
 }
 
+fn slice_values_in_bbox(
+    slice: &SliceImage,
+    bbox: Option<(usize, usize, usize, usize)>,
+) -> Result<Vec<f32>, String> {
+    let (min_x, min_y, max_x, max_y) = clamped_bbox(slice.width, slice.height, bbox)
+        .ok_or_else(|| "image slice is empty".to_string())?;
+    let mut values = Vec::with_capacity((max_x - min_x + 1) * (max_y - min_y + 1));
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            values.push(slice.values[x + y * slice.width]);
+        }
+    }
+    Ok(values)
+}
+
+fn adjust_histogram(values: &[f32], bins: usize) -> Result<AdjustHistogram, String> {
+    if bins == 0 {
+        return Err("histogram bins must be > 0".to_string());
+    }
+
+    let mut finite = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
+        return Err("histogram requires finite image values".to_string());
+    }
+
+    let (min, max) = min_max(&finite);
+    let span = max - min;
+    let mut counts = vec![0_u64; bins];
+    for value in finite.drain(..) {
+        let bin = if span <= f32::EPSILON {
+            0
+        } else {
+            (((value - min) / span) * bins as f32).floor().max(0.0) as usize
+        }
+        .min(bins - 1);
+        counts[bin] += 1;
+    }
+
+    Ok(AdjustHistogram {
+        pixel_count: counts.iter().sum::<u64>() as usize,
+        counts,
+        min,
+        max,
+    })
+}
+
+fn adjust_slider_bounds(dialog: &AdjustDialogState) -> (f32, f32) {
+    let mut min = dialog.default_min.min(dialog.default_max);
+    let mut max = dialog.default_min.max(dialog.default_max);
+    if !min.is_finite() || !max.is_finite() {
+        min = 0.0;
+        max = 1.0;
+    }
+    if max <= min {
+        max = min + 1.0;
+    }
+    (min, max)
+}
+
+fn adjust_default_range(dialog: &AdjustDialogState) -> f32 {
+    let (min, max) = adjust_slider_bounds(dialog);
+    (max - min).max(f32::EPSILON)
+}
+
+fn clamp_adjust_min_max(dialog: &mut AdjustDialogState) {
+    let (slider_min, slider_max) = adjust_slider_bounds(dialog);
+    dialog.min = dialog.min.clamp(slider_min, slider_max);
+    dialog.max = dialog.max.clamp(slider_min, slider_max);
+    if dialog.max < dialog.min {
+        std::mem::swap(&mut dialog.min, &mut dialog.max);
+    }
+    if (dialog.max - dialog.min).abs() < f32::EPSILON {
+        dialog.max = (dialog.min + f32::EPSILON).min(slider_max);
+        if dialog.max <= dialog.min {
+            dialog.min = (dialog.max - f32::EPSILON).max(slider_min);
+        }
+    }
+}
+
+fn sync_brightness_from_min_max(dialog: &mut AdjustDialogState) {
+    let range = adjust_default_range(dialog);
+    let center = dialog.min + (dialog.max - dialog.min) * 0.5;
+    dialog.brightness = (1.0 - (center - dialog.default_min) / range).clamp(0.0, 1.0);
+}
+
+fn sync_contrast_from_min_max(dialog: &mut AdjustDialogState) {
+    let range = adjust_default_range(dialog);
+    let width = (dialog.max - dialog.min).abs().max(f32::EPSILON);
+    dialog.contrast = if width <= range {
+        1.0 - (width / range) * 0.5
+    } else {
+        (range / width) * 0.5
+    }
+    .clamp(0.0, 1.0);
+}
+
+fn sync_brightness_contrast_from_min_max(dialog: &mut AdjustDialogState) {
+    sync_brightness_from_min_max(dialog);
+    sync_contrast_from_min_max(dialog);
+}
+
+fn adjust_min_max_from_brightness(dialog: &mut AdjustDialogState) {
+    let range = adjust_default_range(dialog);
+    let width = (dialog.max - dialog.min).abs().max(f32::EPSILON);
+    let center = dialog.default_min + range * (1.0 - dialog.brightness.clamp(0.0, 1.0));
+    dialog.min = center - width * 0.5;
+    dialog.max = center + width * 0.5;
+}
+
+fn adjust_min_max_from_contrast(dialog: &mut AdjustDialogState) {
+    let range = adjust_default_range(dialog);
+    let center = dialog.min + (dialog.max - dialog.min) * 0.5;
+    let contrast = dialog.contrast.clamp(0.0, 0.999_999);
+    let slope = if contrast <= 0.5 {
+        contrast / 0.5
+    } else {
+        0.5 / (1.0 - contrast)
+    };
+    if slope > f32::EPSILON {
+        let width = range / slope;
+        dialog.min = center - width * 0.5;
+        dialog.max = center + width * 0.5;
+    }
+}
+
+fn auto_contrast_range(histogram: Option<&AdjustHistogram>) -> Option<(f32, f32)> {
+    let histogram = histogram?;
+    let total = histogram.pixel_count as u64;
+    if total == 0 || histogram.max <= histogram.min {
+        return Some((histogram.min, histogram.max));
+    }
+    let saturated_each_tail = ((total as f32 * 0.0035 * 0.5).round() as u64).max(1);
+    let low_bin = percentile_bin(&histogram.counts, saturated_each_tail, false);
+    let high_bin = percentile_bin(&histogram.counts, saturated_each_tail, true);
+    let bin_width = (histogram.max - histogram.min) / histogram.counts.len().max(1) as f32;
+    let low = histogram.min + low_bin as f32 * bin_width;
+    let high = histogram.min + (high_bin + 1) as f32 * bin_width;
+    Some((low.min(high), high.max(low)))
+}
+
+fn percentile_bin(counts: &[u64], target: u64, reverse: bool) -> usize {
+    let mut cumulative = 0_u64;
+    if reverse {
+        for (index, count) in counts.iter().enumerate().rev() {
+            cumulative += *count;
+            if cumulative >= target {
+                return index;
+            }
+        }
+        0
+    } else {
+        for (index, count) in counts.iter().enumerate() {
+            cumulative += *count;
+            if cumulative >= target {
+                return index;
+            }
+        }
+        counts.len().saturating_sub(1)
+    }
+}
+
 fn canonical_json(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -13684,6 +14093,168 @@ fn extract_slice_from_native(
                     .map(|chunk| f32::from(chunk[selected]))
                     .collect(),
             })
+        }
+    }
+}
+
+fn draw_adjust_histogram(
+    ui: &mut egui::Ui,
+    histogram: Option<&AdjustHistogram>,
+    range: Option<(f32, f32)>,
+    marker: Option<f32>,
+) {
+    let available = egui::vec2(ui.available_width().max(240.0), 120.0);
+    let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::BLACK),
+        egui::StrokeKind::Outside,
+    );
+
+    let Some(histogram) = histogram else {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No histogram",
+            egui::FontId::proportional(13.0),
+            egui::Color32::DARK_GRAY,
+        );
+        return;
+    };
+
+    let max_count = display_histogram_max(&histogram.counts).max(1) as f32;
+    let bin_width = rect.width() / histogram.counts.len().max(1) as f32;
+    for (index, count) in histogram.counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        let x = rect.left() + index as f32 * bin_width + bin_width * 0.5;
+        let normalized = (*count as f32).min(max_count) / max_count;
+        let y = rect.bottom() - normalized * rect.height();
+        painter.line_segment(
+            [egui::pos2(x, rect.bottom()), egui::pos2(x, y)],
+            egui::Stroke::new(bin_width.max(1.0), egui::Color32::from_rgb(110, 110, 150)),
+        );
+        painter.circle_filled(egui::pos2(x, y), 1.0, egui::Color32::BLACK);
+    }
+
+    let value_to_x = |value: f32| {
+        let span = (histogram.max - histogram.min).max(f32::EPSILON);
+        rect.left() + ((value - histogram.min) / span).clamp(0.0, 1.0) * rect.width()
+    };
+
+    if let Some((low, high)) = range
+        && low.is_finite()
+        && high.is_finite()
+    {
+        let raw_low = low;
+        let raw_high = high;
+        let low = raw_low.min(raw_high);
+        let high = raw_low.max(raw_high);
+        let left = value_to_x(low);
+        let right = value_to_x(high);
+        let range_rect = egui::Rect::from_min_max(
+            egui::pos2(left, rect.top()),
+            egui::pos2(right, rect.bottom()),
+        );
+        painter.rect_filled(
+            range_rect,
+            0.0,
+            egui::Color32::from_rgba_premultiplied(110, 110, 150, 28),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(left, rect.bottom()),
+                egui::pos2(right, rect.top()),
+            ],
+            egui::Stroke::new(2.0, egui::Color32::BLACK),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(right, rect.bottom() - 5.0),
+                egui::pos2(right, rect.bottom()),
+            ],
+            egui::Stroke::new(2.0, egui::Color32::BLACK),
+        );
+        painter.circle_filled(egui::pos2(left, rect.bottom()), 4.0, egui::Color32::BLACK);
+        painter.circle_filled(egui::pos2(right, rect.top()), 4.0, egui::Color32::BLACK);
+    }
+
+    if let Some(marker) = marker
+        && marker.is_finite()
+    {
+        let x = value_to_x(marker);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 196, 64)),
+        );
+    }
+
+    ui.horizontal(|ui| {
+        ui.small(format!("min {:.4}", histogram.min));
+        ui.small(format!("max {:.4}", histogram.max));
+        ui.small(format!("n {}", histogram.pixel_count));
+    });
+}
+
+fn display_histogram_max(counts: &[u64]) -> u64 {
+    let mut max_count = 0_u64;
+    let mut mode = 0usize;
+    for (index, count) in counts.iter().enumerate() {
+        if *count > max_count {
+            max_count = *count;
+            mode = index;
+        }
+    }
+    let mut second_max = 0_u64;
+    for (index, count) in counts.iter().enumerate() {
+        if index != mode {
+            second_max = second_max.max(*count);
+        }
+    }
+    if second_max != 0 && max_count > second_max * 2 {
+        ((second_max as f32) * 1.5) as u64
+    } else {
+        max_count
+    }
+}
+
+fn draw_imagej_viewer_popup_menu(
+    ui: &mut egui::Ui,
+    window_label: &str,
+    actions: &mut Vec<UiAction>,
+) {
+    for (label, command_id) in [
+        ("Show Info...", Some("image.show_info")),
+        ("Properties...", Some("image.properties")),
+        ("Rename...", Some("image.rename")),
+        ("Measure", Some("analyze.measure")),
+        ("Histogram", Some("analyze.histogram")),
+        ("Duplicate Image...", Some("image.duplicate")),
+        ("Original Scale", Some("image.zoom.original")),
+        ("-", None),
+        ("Record...", Some("plugins.macros.record")),
+        ("Find Commands...", Some("plugins.commands.find")),
+        ("Capture Screen", None),
+    ] {
+        if label == "-" {
+            ui.separator();
+            continue;
+        }
+        let Some(command_id) = command_id else {
+            ui.add_enabled(false, egui::Button::new(label));
+            continue;
+        };
+        if ui.button(label).clicked() {
+            actions.push(UiAction::Command {
+                window_label: window_label.to_string(),
+                command_id: command_id.to_string(),
+                params: None,
+            });
+            ui.close_menu();
         }
     }
 }
@@ -14069,7 +14640,7 @@ mod tests {
         HoverInfo, ImageSummary, LauncherStatusModel, LookupTable, NativeRasterImage,
         OverlayVisibility, ProgressState, RepaintDecisionInputs, RoiKind, RoiModel, SliceImage,
         ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest, ViewerImageSource, ViewerSession,
-        ViewerTelemetry, ViewerUiState, ZoomCommand, add_selection_to_overlay,
+        ViewerTelemetry, ViewerUiState, ZoomCommand, add_selection_to_overlay, adjust_histogram,
         apply_overlay_visibility, apply_zoom_command, binary_morphology_params, build_frame,
         canonical_json, centered_circular_roi, combine_stack_datasets,
         compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
@@ -16636,6 +17207,16 @@ mod tests {
         assert!(!session.can_undo());
         assert_eq!(session.committed_summary.min, 0.0);
         assert_eq!(session.committed_summary.max, 20.0);
+    }
+
+    #[test]
+    fn adjust_histogram_counts_finite_values_into_bins() {
+        let histogram = adjust_histogram(&[0.0, 0.2, 0.8, 1.0, f32::NAN], 2).expect("histogram");
+
+        assert_eq!(histogram.counts, vec![2, 2]);
+        assert_eq!(histogram.min, 0.0);
+        assert_eq!(histogram.max, 1.0);
+        assert_eq!(histogram.pixel_count, 4);
     }
 
     #[test]
