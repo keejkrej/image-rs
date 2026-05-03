@@ -9232,21 +9232,22 @@ impl ImageUiApp {
                     }
                 }
                 AdjustDialogKind::Coordinates => {
+                    let is_stack = coordinates_dialog_is_stack(&self.adjust_dialog);
                     egui::Grid::new("coordinates_adjust_grid")
                         .num_columns(2)
                         .spacing(egui::vec2(8.0, 4.0))
                         .show(ui, |ui| {
                             if self.adjust_dialog.coordinates_mode == "point" {
                                 for (label, value) in [
-                                    ("X", &mut self.adjust_dialog.left),
-                                    ("Y", &mut self.adjust_dialog.top),
+                                    ("X:", &mut self.adjust_dialog.left),
+                                    ("Y:", &mut self.adjust_dialog.top),
                                 ] {
                                     ui.label(label);
                                     ui.add(egui::DragValue::new(value).speed(1.0));
                                     ui.end_row();
                                 }
-                                if self.adjust_dialog.coordinates_depth > 1.0 {
-                                    ui.label("Z");
+                                if is_stack {
+                                    ui.label("Z:");
                                     ui.add(
                                         egui::DragValue::new(&mut self.adjust_dialog.front)
                                             .speed(1.0),
@@ -9255,19 +9256,19 @@ impl ImageUiApp {
                                 }
                             } else {
                                 for (label, value) in [
-                                    ("Left", &mut self.adjust_dialog.left),
-                                    ("Right", &mut self.adjust_dialog.right),
-                                    ("Top", &mut self.adjust_dialog.top),
-                                    ("Bottom", &mut self.adjust_dialog.bottom),
+                                    ("Left:", &mut self.adjust_dialog.left),
+                                    ("Right:", &mut self.adjust_dialog.right),
+                                    ("Top:", &mut self.adjust_dialog.top),
+                                    ("Bottom:", &mut self.adjust_dialog.bottom),
                                 ] {
                                     ui.label(label);
                                     ui.add(egui::DragValue::new(value).speed(1.0));
                                     ui.end_row();
                                 }
-                                if self.adjust_dialog.coordinates_depth > 1.0 {
+                                if is_stack {
                                     for (label, value) in [
-                                        ("Front", &mut self.adjust_dialog.front),
-                                        ("Back", &mut self.adjust_dialog.back),
+                                        ("Front:", &mut self.adjust_dialog.front),
+                                        ("Back:", &mut self.adjust_dialog.back),
                                     ] {
                                         ui.label(label);
                                         ui.add(egui::DragValue::new(value).speed(1.0));
@@ -9275,15 +9276,17 @@ impl ImageUiApp {
                                     }
                                 }
                             }
-                            ui.label("X Unit");
+                            ui.label("X_unit:");
                             ui.text_edit_singleline(&mut self.adjust_dialog.x_unit);
                             ui.end_row();
-                            ui.label("Y Unit");
+                            ui.label("Y_unit:");
                             ui.text_edit_singleline(&mut self.adjust_dialog.y_unit);
                             ui.end_row();
-                            ui.label("Z Unit");
-                            ui.text_edit_singleline(&mut self.adjust_dialog.z_unit);
-                            ui.end_row();
+                            if is_stack {
+                                ui.label("Z_unit:");
+                                ui.text_edit_singleline(&mut self.adjust_dialog.z_unit);
+                                ui.end_row();
+                            }
                         });
                     if ui.button("OK").clicked() {
                         let params = if self.adjust_dialog.coordinates_mode == "point" {
@@ -12194,6 +12197,10 @@ fn adjust_dialog_window_title(dialog: &AdjustDialogState) -> String {
         "selection" => "Selection Coordinates".to_string(),
         _ => "Image Coordinates".to_string(),
     }
+}
+
+fn coordinates_dialog_is_stack(dialog: &AdjustDialogState) -> bool {
+    dialog.coordinates_depth > 1.0
 }
 
 fn selected_roi_bbox(viewer: &ViewerUiState) -> Option<(usize, usize, usize, usize)> {
@@ -15289,12 +15296,12 @@ mod tests {
         binary_morphology_params, build_frame, canonical_json, centered_circular_roi,
         color_threshold_auto_ranges, color_threshold_macro_text, combine_stack_datasets,
         compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
-        create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
-        first_report_line, flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
-        function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
-        imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
-        init_coordinates_dialog, initialize_view_to_open_state, insert_stack_dataset,
-        install_macro_file_to_dir, installed_macro_file_name,
+        coordinates_dialog_is_stack, create_circular_masks_dataset, dominant_scroll_component,
+        effective_scroll_delta, first_report_line, flatten_overlay_slice, format_launcher_status,
+        full_image_rect_roi, function_key_for_macro_shortcut, image_draw_rect,
+        image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
+        images_to_stack_dataset, init_coordinates_dialog, initialize_view_to_open_state,
+        insert_stack_dataset, install_macro_file_to_dir, installed_macro_file_name,
         installed_macro_menu_entry_from_block, interpolate_roi_kind, line_width_from_params,
         list_installed_macro_files_in_dir, lookup_table_color, lookup_table_from_command,
         lookup_table_slice_to_rgb, macro_display_name, macro_name_shortcut,
@@ -16094,6 +16101,16 @@ mod tests {
         assert_eq!(dialog.left, 8.0);
         assert_eq!(dialog.top, 30.0);
         assert_eq!(dialog.front, 10.0);
+    }
+
+    #[test]
+    fn coordinates_dialog_only_shows_z_controls_for_stacks_like_imagej() {
+        let mut dialog = AdjustDialogState::default();
+        dialog.coordinates_depth = 1.0;
+        assert!(!coordinates_dialog_is_stack(&dialog));
+
+        dialog.coordinates_depth = 2.0;
+        assert!(coordinates_dialog_is_stack(&dialog));
     }
 
     #[test]
