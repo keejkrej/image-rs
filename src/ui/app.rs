@@ -345,6 +345,7 @@ struct ViewerOpRequest {
 enum OpRunMode {
     Preview,
     Apply,
+    NewWindow,
 }
 
 impl OpRunMode {
@@ -352,6 +353,7 @@ impl OpRunMode {
         match self {
             Self::Preview => "preview",
             Self::Apply => "apply",
+            Self::NewWindow => "new window",
         }
     }
 }
@@ -389,6 +391,7 @@ enum WorkerEvent {
         generation: u64,
         mode: OpRunMode,
         op: String,
+        new_window_title: Option<String>,
         preview_key: Option<String>,
         result: Result<OpRunOutput, String>,
     },
@@ -952,11 +955,13 @@ impl ImageUiApp {
                     generation,
                     mode,
                     op,
+                    new_window_title,
                     preview_key,
                     result,
                 } => {
                     let mut status = format!("{op} failed");
                     let mut measurements = None;
+                    let mut new_window_dataset = None;
                     if let Some(session) = self.state.label_to_session.get_mut(&window_label) {
                         if !session.is_active_job(job_id, generation) {
                             continue;
@@ -978,6 +983,11 @@ impl ImageUiApp {
                                         session.commit_dataset(output.dataset);
                                         measurements = output.measurements;
                                     }
+                                    OpRunMode::NewWindow => {
+                                        new_window_dataset =
+                                            Some((output.dataset.clone(), new_window_title));
+                                        measurements = output.measurements;
+                                    }
                                 }
                                 session.active_job = None;
                                 status = format!("Applied {op} (job {job_id})");
@@ -987,6 +997,23 @@ impl ImageUiApp {
                                 status = error;
                             }
                         }
+                    }
+
+                    if let Some((dataset, title)) = new_window_dataset {
+                        let title = title
+                            .as_deref()
+                            .filter(|title| !title.trim().is_empty())
+                            .map(sanitize_image_title)
+                            .unwrap_or_else(|| {
+                                format!("Untitled-{}", self.state.next_window_id + 1)
+                            });
+                        let path = normalize_path(&PathBuf::from(format!(
+                            "{}-{}.tif",
+                            title,
+                            self.state.next_window_id + 1
+                        )));
+                        let label = self.create_viewer(path, ViewerImageSource::Dataset(dataset));
+                        status = format!("Created {label} from {op} (job {job_id})");
                     }
 
                     if let Some(measurements) = measurements {
@@ -4492,13 +4519,18 @@ impl ImageUiApp {
             } else {
                 "image.canvas_resize"
             };
+            let mode = if command_id == "__dialog.resize" {
+                resize_op_mode_from_params(&params)
+            } else {
+                OpRunMode::Apply
+            };
             return Some(
                 match self.viewer_start_op(
                     &viewer_label,
                     ViewerOpRequest {
                         op: op.to_string(),
                         params,
-                        mode: OpRunMode::Apply,
+                        mode,
                     },
                 ) {
                     Ok(_) => command_registry::CommandExecuteResult::ok("image transform started"),
@@ -5977,12 +6009,13 @@ impl ImageUiApp {
             }
             "image.adjust.size" => {
                 if let Some(params) = request.params {
+                    let mode = resize_op_mode_from_params(&params);
                     return match self.viewer_start_op(
                         window_label,
                         ViewerOpRequest {
                             op: "image.resize".to_string(),
                             params,
-                            mode: OpRunMode::Apply,
+                            mode,
                         },
                     ) {
                         Ok(ticket) => command_registry::CommandExecuteResult::with_payload(
@@ -6002,6 +6035,13 @@ impl ImageUiApp {
                     self.resize_dialog.z_scale = 1.0;
                     self.resize_dialog.depth = session.committed_summary.z_slices.max(1);
                     self.resize_dialog.frames = session.committed_summary.times.max(1);
+                    self.resize_dialog.create_new_window = true;
+                    self.resize_dialog.title = session
+                        .path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .map(sanitize_image_title)
+                        .unwrap_or_else(|| "Untitled".to_string());
                 }
                 self.resize_dialog.open = true;
                 command_registry::CommandExecuteResult::ok("resize dialog opened")
@@ -6960,8 +7000,13 @@ impl ImageUiApp {
         let job_id = self.state.next_job_id();
         let preview_key = match request.mode {
             OpRunMode::Preview => Some(preview_cache_key(&request.op, &request.params)?),
-            OpRunMode::Apply => None,
+            OpRunMode::Apply | OpRunMode::NewWindow => None,
         };
+        let new_window_title = request
+            .params
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         if let Some(key) = &preview_key
             && let Some(session) = self.state.label_to_session.get_mut(window_label)
@@ -7026,6 +7071,7 @@ impl ImageUiApp {
                 generation,
                 mode,
                 op: op_name,
+                new_window_title,
                 preview_key: preview_key_for_task,
                 result,
             });
@@ -9939,6 +9985,11 @@ impl ImageUiApp {
                             );
                         }
                     });
+                ui.checkbox(&mut dialog.create_new_window, "Create new window");
+                ui.horizontal(|ui| {
+                    ui.label("Title:");
+                    ui.text_edit_singleline(&mut dialog.title);
+                });
             }
             ui.horizontal(|ui| {
                 if ui.button("OK").clicked() {
@@ -9971,6 +10022,8 @@ impl ImageUiApp {
                             "constrain": dialog.constrain_aspect,
                             "average_when_downsizing": dialog.average_when_downsizing,
                             "interpolation": dialog.interpolation,
+                            "create_new_window": dialog.create_new_window,
+                            "title": dialog.title,
                         })
                     };
                     actions.push(UiAction::Command {
@@ -12101,6 +12154,18 @@ fn line_width_from_params(params: &Value) -> Result<f32, String> {
         return Err("line width must be a finite positive number".to_string());
     }
     Ok(width.round().max(1.0))
+}
+
+fn resize_op_mode_from_params(params: &Value) -> OpRunMode {
+    if params
+        .get("create_new_window")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        OpRunMode::NewWindow
+    } else {
+        OpRunMode::Apply
+    }
 }
 
 fn roi_stroke_width(line_width_px: f32, selected: bool) -> f32 {
@@ -15434,20 +15499,21 @@ mod tests {
 
     use super::{
         AdjustDialogState, AdjustHistogram, HoverInfo, ImageSummary, ImageUiApp,
-        LauncherStatusModel, LookupTable, OverlayVisibility, ProgressState, RepaintDecisionInputs,
-        RoiKind, RoiModel, SliceImage, ThresholdOverlay, ThresholdOverlayMode, ToolId, UiState,
-        ViewerFrameBuffer, ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry,
-        ViewerUiState, ZoomCommand, add_selection_to_overlay, adjust_histogram,
-        apply_overlay_visibility, apply_zoom_command, auto_contrast_range,
-        binary_morphology_params, build_frame, canonical_json, centered_circular_roi,
-        color_threshold_auto_ranges, color_threshold_macro_text, combine_stack_datasets,
-        compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
-        coordinates_dialog_is_stack, create_circular_masks_dataset, dominant_scroll_component,
-        effective_scroll_delta, first_report_line, flatten_overlay_slice, format_launcher_status,
-        full_image_rect_roi, function_key_for_macro_shortcut, image_draw_rect,
-        image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
-        images_to_stack_dataset, init_coordinates_dialog, initialize_view_to_open_state,
-        insert_stack_dataset, install_macro_file_to_dir, installed_macro_file_name,
+        LauncherStatusModel, LookupTable, OpRunMode, OverlayVisibility, ProgressState,
+        RepaintDecisionInputs, RoiKind, RoiModel, SliceImage, ThresholdOverlay,
+        ThresholdOverlayMode, ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest,
+        ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState, ZoomCommand,
+        add_selection_to_overlay, adjust_histogram, apply_overlay_visibility, apply_zoom_command,
+        auto_contrast_range, binary_morphology_params, build_frame, canonical_json,
+        centered_circular_roi, color_threshold_auto_ranges, color_threshold_macro_text,
+        combine_stack_datasets, compute_initial_viewport_size, compute_viewer_frame,
+        concatenate_stack_datasets, coordinates_dialog_is_stack, create_circular_masks_dataset,
+        dominant_scroll_component, effective_scroll_delta, first_report_line,
+        flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
+        function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
+        imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
+        init_coordinates_dialog, initialize_view_to_open_state, insert_stack_dataset,
+        install_macro_file_to_dir, installed_macro_file_name,
         installed_macro_menu_entry_from_block, interpolate_roi_kind, line_width_from_params,
         list_installed_macro_files_in_dir, lookup_table_color, lookup_table_from_command,
         lookup_table_slice_to_rgb, macro_display_name, macro_name_shortcut,
@@ -15457,10 +15523,10 @@ mod tests {
         overlay_element_rows, overlay_from_roi_manager, overlay_label_for_roi,
         overlay_to_roi_manager, parse_macro_command_line, preview_cache_key,
         remove_stack_slice_labels_dataset, renamed_image_path,
-        reset_color_threshold_bands_for_space, results_distribution, results_rows_to_dataset,
-        results_summary_rows, roi_kind_bbox, roi_label_anchor, roi_stroke_width,
-        sample_color_threshold_ranges, sanitize_image_title, selection_properties_row,
-        set_selected_roi_spline_fit, set_stack_slice_label_dataset,
+        reset_color_threshold_bands_for_space, resize_op_mode_from_params, results_distribution,
+        results_rows_to_dataset, results_summary_rows, roi_kind_bbox, roi_label_anchor,
+        roi_stroke_width, sample_color_threshold_ranges, sanitize_image_title,
+        selection_properties_row, set_selected_roi_spline_fit, set_stack_slice_label_dataset,
         set_threshold_sixteen_bit_histogram, should_request_periodic_repaint,
         should_request_repaint_now, source_ptr_eq, spline_fit_roi_points, stack_measurement_rows,
         stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
@@ -18452,6 +18518,12 @@ mod tests {
         assert_eq!(app.resize_dialog.x_scale, 1.0);
         assert_eq!(app.resize_dialog.y_scale, 1.0);
         assert_eq!(app.resize_dialog.z_scale, 1.0);
+        assert!(app.resize_dialog.create_new_window);
+        assert_eq!(app.resize_dialog.title, "scale-dialog");
+        assert_eq!(
+            resize_op_mode_from_params(&json!({"create_new_window": true})),
+            OpRunMode::NewWindow
+        );
     }
 
     #[test]
