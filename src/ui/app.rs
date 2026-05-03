@@ -7,7 +7,7 @@ use super::state::{
     save_desktop_state, save_startup_macro, startup_macro_path,
 };
 use super::toolbar::*;
-use super::{command_registry, interaction};
+use super::{command_registry, interaction, menu};
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -19,6 +19,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use super::image_plus::*;
 use super::interaction::roi::{RoiKind, RoiModel, RoiStore};
 use super::interaction::tooling::{
     LineMode, OvalMode, PointMode, RectMode, ToolId, ToolOptionsState, ToolState,
@@ -26,7 +27,7 @@ use super::interaction::tooling::{
 use super::interaction::transform::{ViewerTransformState, zoom_level_down, zoom_level_up};
 use super::lut::*;
 use crate::commands::MeasurementTable;
-use crate::formats::{NativeRasterImage, supported_formats};
+use crate::formats::supported_formats;
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
 use crate::runtime::AppContext;
 use eframe::egui;
@@ -50,25 +51,6 @@ const BINARY_MAX_COUNT: usize = 8;
 const SLICE_LABELS_KEY: &str = "slice_labels";
 const CURRENT_SLICE_LABEL_KEY: &str = "Slice_Label";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MenuManifestTopLevel {
-    id: String,
-    label: String,
-    items: Vec<MenuManifestItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MenuManifestItem {
-    #[serde(rename = "type")]
-    kind: String,
-    id: Option<String>,
-    label: Option<String>,
-    command: Option<String>,
-    shortcut: Option<String>,
-    enabled: Option<bool>,
-    items: Option<Vec<MenuManifestItem>>,
-}
-
 #[derive(Debug)]
 struct UiState {
     app: AppContext,
@@ -78,24 +60,6 @@ struct UiState {
     label_to_session: HashMap<String, ViewerSession>,
     next_window_id: u64,
     next_job_id: u64,
-}
-
-#[derive(Debug, Clone)]
-enum ViewerImageSource {
-    Native(Arc<NativeRasterImage>),
-    Dataset(Arc<DatasetF32>),
-}
-
-impl ViewerImageSource {
-    fn to_dataset(&self) -> Result<Arc<DatasetF32>, String> {
-        match self {
-            Self::Native(image) => image
-                .to_dataset()
-                .map(Arc::new)
-                .map_err(|error: crate::formats::IoError| error.to_string()),
-            Self::Dataset(dataset) => Ok(dataset.clone()),
-        }
-    }
 }
 
 impl UiState {
@@ -318,16 +282,6 @@ struct PreviewRequest {
     params: Value,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
-struct ViewerFrameRequest {
-    #[serde(default)]
-    z: usize,
-    #[serde(default)]
-    t: usize,
-    #[serde(default)]
-    channel: usize,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ViewerOpRequest {
     op: String,
@@ -357,18 +311,6 @@ struct JobTicket {
     job_id: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct ImageSummary {
-    shape: Vec<usize>,
-    axes: Vec<String>,
-    channels: usize,
-    z_slices: usize,
-    times: usize,
-    min: f32,
-    max: f32,
-    source: String,
-}
-
 #[derive(Debug, Clone, Serialize, Default)]
 struct OpenResult {
     opened: Vec<String>,
@@ -381,24 +323,6 @@ struct OpenResult {
 enum OpenOutcome {
     Opened { label: String },
     Focused { label: String },
-}
-
-#[derive(Debug, Clone)]
-struct SliceImage {
-    width: usize,
-    height: usize,
-    pixel_type: PixelType,
-    values: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-struct ViewerFrameBuffer {
-    width: usize,
-    height: usize,
-    values: Vec<f32>,
-    pixels_u8: Vec<u8>,
-    min: f32,
-    max: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -686,7 +610,7 @@ fn binary_morphology_params(
 struct ImageUiApp {
     state: UiState,
     desktop_state: DesktopState,
-    menus: Vec<MenuManifestTopLevel>,
+    menus: Vec<menu::MenuManifestTopLevel>,
     command_catalog: command_registry::CommandCatalog,
     launcher_ui: LauncherUiState,
     tool_state: ToolState,
@@ -727,9 +651,7 @@ struct ImageUiApp {
 
 impl ImageUiApp {
     fn new(_cc: &eframe::CreationContext<'_>, startup_input: Option<PathBuf>) -> Self {
-        let menus: Vec<MenuManifestTopLevel> =
-            serde_json::from_str(include_str!("menu/imagej-menu-manifest.json"))
-                .expect("failed to parse menu manifest");
+        let menus = menu::manifest().clone();
         let command_catalog = command_registry::command_catalog();
         let (worker_tx, worker_rx) = mpsc::channel();
         let desktop_state = load_desktop_state();
@@ -6162,7 +6084,7 @@ impl ImageUiApp {
         &self,
         ui: &mut egui::Ui,
         window_label: &str,
-        items: &[MenuManifestItem],
+        items: &[menu::MenuManifestItem],
         actions: &mut Vec<UiAction>,
     ) {
         for item in items {
@@ -11749,301 +11671,6 @@ fn canonical_json(value: &Value) -> Value {
     }
 }
 
-fn build_frame(
-    source: &ViewerImageSource,
-    request: &ViewerFrameRequest,
-    display_range: Option<(f32, f32)>,
-) -> Result<ViewerFrameBuffer, String> {
-    match source {
-        ViewerImageSource::Native(image) => {
-            build_native_frame(image.as_ref(), request, display_range)
-        }
-        ViewerImageSource::Dataset(dataset) => {
-            build_dataset_frame(dataset.as_ref(), request, display_range)
-        }
-    }
-}
-
-fn build_dataset_frame(
-    dataset: &DatasetF32,
-    request: &ViewerFrameRequest,
-    display_range: Option<(f32, f32)>,
-) -> Result<ViewerFrameBuffer, String> {
-    let slice = extract_slice(dataset, request.z, request.t, request.channel)?;
-    let pixels_u8 = to_u8_samples(&slice.values, dataset.metadata.pixel_type, display_range);
-    let (min, max) = min_max(&slice.values);
-
-    Ok(ViewerFrameBuffer {
-        width: slice.width,
-        height: slice.height,
-        values: slice.values.clone(),
-        pixels_u8,
-        min,
-        max,
-    })
-}
-
-fn build_native_frame(
-    image: &NativeRasterImage,
-    request: &ViewerFrameRequest,
-    display_range: Option<(f32, f32)>,
-) -> Result<ViewerFrameBuffer, String> {
-    if request.z > 0 || request.t > 0 {
-        return Err("native rasters expose only a single Z/T plane".to_string());
-    }
-
-    match image {
-        NativeRasterImage::Gray8 {
-            width,
-            height,
-            pixels,
-            ..
-        } => {
-            let (min, max) = image.min_max();
-            Ok(ViewerFrameBuffer {
-                width: *width,
-                height: *height,
-                values: pixels.iter().map(|value| f32::from(*value)).collect(),
-                pixels_u8: to_u8_samples(
-                    &pixels
-                        .iter()
-                        .map(|value| f32::from(*value))
-                        .collect::<Vec<_>>(),
-                    PixelType::U8,
-                    display_range,
-                ),
-                min,
-                max,
-            })
-        }
-        NativeRasterImage::Gray16 {
-            width,
-            height,
-            pixels,
-            ..
-        } => {
-            let (min, max) = image.min_max();
-            Ok(ViewerFrameBuffer {
-                width: *width,
-                height: *height,
-                values: pixels.iter().map(|value| f32::from(*value)).collect(),
-                pixels_u8: to_u8_samples(
-                    &pixels
-                        .iter()
-                        .map(|value| f32::from(*value))
-                        .collect::<Vec<_>>(),
-                    PixelType::U16,
-                    display_range,
-                ),
-                min,
-                max,
-            })
-        }
-        NativeRasterImage::Rgb8 {
-            width,
-            height,
-            pixels,
-            ..
-        } => {
-            let channel = request.channel.min(2);
-            let mut pixels_u8 = Vec::with_capacity(width * height);
-            let mut min_sample = u8::MAX;
-            let mut max_sample = u8::MIN;
-            for chunk in pixels.chunks_exact(3) {
-                let sample = chunk[channel];
-                min_sample = min_sample.min(sample);
-                max_sample = max_sample.max(sample);
-                pixels_u8.push(sample);
-            }
-            let values = pixels_u8
-                .iter()
-                .map(|value| f32::from(*value))
-                .collect::<Vec<_>>();
-            Ok(ViewerFrameBuffer {
-                width: *width,
-                height: *height,
-                pixels_u8: to_u8_samples(&values, PixelType::U8, display_range),
-                values,
-                min: f32::from(min_sample),
-                max: f32::from(max_sample),
-            })
-        }
-    }
-}
-
-fn summarize_source(source: &ViewerImageSource, path: &Path) -> ImageSummary {
-    match source {
-        ViewerImageSource::Native(image) => summarize_native_image(image.as_ref(), path),
-        ViewerImageSource::Dataset(dataset) => summarize_dataset(dataset.as_ref(), path),
-    }
-}
-
-fn summarize_dataset(dataset: &DatasetF32, source: &Path) -> ImageSummary {
-    let (min, max) = dataset.min_max().unwrap_or((0.0, 0.0));
-    summarize_metadata(dataset.shape(), &dataset.metadata.dims, min, max, source)
-}
-
-fn summarize_native_image(image: &NativeRasterImage, source: &Path) -> ImageSummary {
-    let metadata = image.metadata();
-    let shape = if image.channel_count() > 1 {
-        vec![image.height(), image.width(), image.channel_count()]
-    } else {
-        vec![image.height(), image.width()]
-    };
-    let (min, max) = image.min_max();
-    summarize_metadata(&shape, &metadata.dims, min, max, source)
-}
-
-fn summarize_metadata(
-    shape: &[usize],
-    dims: &[Dim],
-    min: f32,
-    max: f32,
-    source: &Path,
-) -> ImageSummary {
-    let channel_axis = dims
-        .iter()
-        .position(|dimension| dimension.axis == AxisKind::Channel);
-    let z_axis = dims
-        .iter()
-        .position(|dimension| dimension.axis == AxisKind::Z);
-    let t_axis = dims
-        .iter()
-        .position(|dimension| dimension.axis == AxisKind::Time);
-
-    ImageSummary {
-        shape: shape.to_vec(),
-        axes: dims
-            .iter()
-            .map(|dimension| format!("{:?}", dimension.axis))
-            .collect(),
-        channels: channel_axis.map(|index| shape[index]).unwrap_or(1),
-        z_slices: z_axis.map(|index| shape[index]).unwrap_or(1),
-        times: t_axis.map(|index| shape[index]).unwrap_or(1),
-        min,
-        max,
-        source: source.display().to_string(),
-    }
-}
-
-fn extract_slice(
-    dataset: &DatasetF32,
-    z: usize,
-    t: usize,
-    channel: usize,
-) -> Result<SliceImage, String> {
-    if dataset.ndim() < 2 {
-        return Err("dataset must have at least two dimensions".to_string());
-    }
-
-    let y_axis = dataset
-        .axis_index(AxisKind::Y)
-        .unwrap_or(0)
-        .min(dataset.ndim() - 1);
-    let x_axis = dataset
-        .axis_index(AxisKind::X)
-        .unwrap_or(1.min(dataset.ndim() - 1));
-    if y_axis == x_axis {
-        return Err("could not infer distinct X/Y axes".to_string());
-    }
-
-    let mut index = vec![0usize; dataset.ndim()];
-    if let Some(axis) = dataset.axis_index(AxisKind::Z) {
-        index[axis] = z.min(dataset.shape()[axis].saturating_sub(1));
-    }
-    if let Some(axis) = dataset.axis_index(AxisKind::Time) {
-        index[axis] = t.min(dataset.shape()[axis].saturating_sub(1));
-    }
-    if let Some(axis) = dataset.axis_index(AxisKind::Channel) {
-        index[axis] = channel.min(dataset.shape()[axis].saturating_sub(1));
-    }
-
-    let height = dataset.shape()[y_axis];
-    let width = dataset.shape()[x_axis];
-    let mut values = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            index[y_axis] = y;
-            index[x_axis] = x;
-            values.push(dataset.data[IxDyn(&index)]);
-        }
-    }
-
-    Ok(SliceImage {
-        width,
-        height,
-        pixel_type: dataset.metadata.pixel_type,
-        values,
-    })
-}
-
-fn extract_slice_from_source(
-    source: &ViewerImageSource,
-    z: usize,
-    t: usize,
-    channel: usize,
-) -> Result<SliceImage, String> {
-    match source {
-        ViewerImageSource::Native(image) => {
-            extract_slice_from_native(image.as_ref(), z, t, channel)
-        }
-        ViewerImageSource::Dataset(dataset) => extract_slice(dataset.as_ref(), z, t, channel),
-    }
-}
-
-fn extract_slice_from_native(
-    image: &NativeRasterImage,
-    z: usize,
-    t: usize,
-    channel: usize,
-) -> Result<SliceImage, String> {
-    if z > 0 || t > 0 {
-        return Err("native rasters expose only a single Z/T plane".to_string());
-    }
-
-    match image {
-        NativeRasterImage::Gray8 {
-            width,
-            height,
-            pixels,
-            ..
-        } => Ok(SliceImage {
-            width: *width,
-            height: *height,
-            pixel_type: PixelType::U8,
-            values: pixels.iter().map(|value| f32::from(*value)).collect(),
-        }),
-        NativeRasterImage::Gray16 {
-            width,
-            height,
-            pixels,
-            ..
-        } => Ok(SliceImage {
-            width: *width,
-            height: *height,
-            pixel_type: PixelType::U16,
-            values: pixels.iter().map(|value| f32::from(*value)).collect(),
-        }),
-        NativeRasterImage::Rgb8 {
-            width,
-            height,
-            pixels,
-            ..
-        } => {
-            let selected = channel.min(2);
-            Ok(SliceImage {
-                width: *width,
-                height: *height,
-                pixel_type: PixelType::U8,
-                values: pixels
-                    .chunks_exact(3)
-                    .map(|chunk| f32::from(chunk[selected]))
-                    .collect(),
-            })
-        }
-    }
-}
-
 fn draw_adjust_histogram(
     ui: &mut egui::Ui,
     histogram: Option<&AdjustHistogram>,
@@ -12206,48 +11833,6 @@ fn draw_imagej_viewer_popup_menu(
     }
 }
 
-fn to_u8_samples(
-    values: &[f32],
-    pixel_type: PixelType,
-    display_range: Option<(f32, f32)>,
-) -> Vec<u8> {
-    if let Some((low, high)) = display_range
-        && high > low
-    {
-        return values
-            .iter()
-            .map(|value| (((*value - low) / (high - low)).clamp(0.0, 1.0) * 255.0).round() as u8)
-            .collect();
-    }
-
-    match pixel_type {
-        PixelType::U8 => values
-            .iter()
-            .map(|value| value.clamp(0.0, 255.0).round() as u8)
-            .collect(),
-        PixelType::U16 => values
-            .iter()
-            .map(|value| (value.clamp(0.0, 65_535.0) / 257.0).round() as u8)
-            .collect(),
-        PixelType::F32 => values
-            .iter()
-            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
-            .collect(),
-    }
-}
-
-fn min_max(values: &[f32]) -> (f32, f32) {
-    let mut iter = values.iter().copied();
-    let first = iter.next().unwrap_or(0.0);
-    let mut min = first;
-    let mut max = first;
-    for value in iter {
-        min = min.min(value);
-        max = max.max(value);
-    }
-    (min, max)
-}
-
 fn lookup_table_slice_to_rgb(slice: &SliceImage, lut: LookupTable) -> Result<DatasetF32, String> {
     let mut values = Vec::with_capacity(slice.width * slice.height * 3);
     for gray in to_u8_samples(&slice.values, slice.pixel_type, None) {
@@ -12272,15 +11857,6 @@ fn lookup_table_slice_to_rgb(slice: &SliceImage, lut: LookupTable) -> Result<Dat
         .extras
         .insert("applied_lut".to_string(), json!(lut.label()));
     Dataset::new(data, metadata).map_err(|error| error.to_string())
-}
-
-fn to_color_image(frame: &ViewerFrameBuffer, lut: LookupTable) -> egui::ColorImage {
-    let mut rgba = Vec::with_capacity(frame.pixels_u8.len() * 4);
-    for gray in &frame.pixels_u8 {
-        let color = lookup_table_color(lut, *gray);
-        rgba.extend_from_slice(&[color.r(), color.g(), color.b(), 255]);
-    }
-    egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &rgba)
 }
 
 fn fit_to_rect(viewer: &mut ViewerUiState, rect: egui::Rect, width: usize, height: usize) {
@@ -12484,6 +12060,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use crate::formats::NativeRasterImage;
     use crate::model::{AxisKind, DatasetF32, Dim, Metadata, PixelType};
     use crate::ui::interaction::roi::{RoiPosition, RoiStore};
     use crate::ui::interaction::transform::ViewerTransformState;
@@ -12493,10 +12070,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        HoverInfo, ImageSummary, LauncherStatusModel, LookupTable, NativeRasterImage,
-        OverlayVisibility, ProgressState, RepaintDecisionInputs, RoiKind, RoiModel, SliceImage,
-        ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest, ViewerImageSource, ViewerSession,
-        ViewerTelemetry, ViewerUiState, ZoomCommand, add_selection_to_overlay, adjust_histogram,
+        HoverInfo, ImageSummary, LauncherStatusModel, LookupTable, OverlayVisibility,
+        ProgressState, RepaintDecisionInputs, RoiKind, RoiModel, SliceImage, ToolId, UiState,
+        ViewerFrameBuffer, ViewerFrameRequest, ViewerImageSource, ViewerSession, ViewerTelemetry,
+        ViewerUiState, ZoomCommand, add_selection_to_overlay, adjust_histogram,
         apply_overlay_visibility, apply_zoom_command, binary_morphology_params, build_frame,
         canonical_json, centered_circular_roi, combine_stack_datasets,
         compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,

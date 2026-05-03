@@ -1,6 +1,6 @@
+use super::menu::{self, MenuManifestCommand};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, from_str, json};
-use std::sync::OnceLock;
+use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -110,33 +110,6 @@ impl CommandExecuteResult {
             payload: None,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct MenuManifestTopLevel {
-    #[serde(rename = "id")]
-    _id: String,
-    items: Vec<MenuManifestItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MenuManifestItem {
-    #[serde(rename = "type")]
-    kind: String,
-    id: Option<String>,
-    label: Option<String>,
-    command: Option<String>,
-    shortcut: Option<String>,
-    enabled: Option<bool>,
-    items: Option<Vec<MenuManifestItem>>,
-}
-
-#[derive(Debug, Clone)]
-struct MenuManifestCommand {
-    id: String,
-    label: String,
-    shortcut: Option<String>,
-    enabled: bool,
 }
 
 impl CommandMetadata {
@@ -1690,54 +1663,7 @@ pub fn command_catalog() -> CommandCatalog {
 }
 
 fn manifest_commands() -> &'static Vec<MenuManifestCommand> {
-    static COMMANDS: OnceLock<Vec<MenuManifestCommand>> = OnceLock::new();
-    COMMANDS.get_or_init(|| {
-        let raw: Vec<MenuManifestTopLevel> =
-            from_str(include_str!("menu/imagej-menu-manifest.json"))
-                .expect("failed to parse menu manifest");
-
-        let mut entries = Vec::new();
-        for top in raw {
-            append_items(&top.items, &mut entries);
-        }
-        entries
-    })
-}
-
-fn append_items(items: &[MenuManifestItem], output: &mut Vec<MenuManifestCommand>) {
-    for item in items {
-        match item.kind.as_str() {
-            "item" => {
-                let id = item
-                    .command
-                    .clone()
-                    .or_else(|| item.id.clone())
-                    .unwrap_or_else(|| String::from(""));
-                let label = item.label.clone().unwrap_or_else(|| id.clone());
-                if id.is_empty() {
-                    continue;
-                }
-
-                output.push(MenuManifestCommand {
-                    id,
-                    label,
-                    shortcut: item.shortcut.clone(),
-                    enabled: item.enabled.unwrap_or(true),
-                });
-            }
-            "submenu" => {
-                if let Some(children) = item.items.as_deref() {
-                    append_items(children, output);
-                }
-            }
-            "separator" => {}
-            _ => {
-                if let Some(children) = item.items.as_deref() {
-                    append_items(children, output);
-                }
-            }
-        }
-    }
+    menu::manifest_commands()
 }
 
 pub fn merge_params(command_id: &str, params: Option<Value>) -> Value {
