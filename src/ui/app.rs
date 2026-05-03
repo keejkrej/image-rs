@@ -323,6 +323,7 @@ struct ActiveJob {
     generation: u64,
     mode: OpRunMode,
     op: String,
+    overlay_translation: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -970,11 +971,16 @@ impl ImageUiApp {
                     let mut status = format!("{op} failed");
                     let mut measurements = None;
                     let mut new_window_dataset = None;
+                    let mut overlay_translation = None;
                     if let Some(session) = self.state.label_to_session.get_mut(&window_label) {
                         if !session.is_active_job(job_id, generation) {
                             continue;
                         }
                         state_changed = true;
+                        let active_overlay_translation = session
+                            .active_job
+                            .as_ref()
+                            .and_then(|job| job.overlay_translation);
 
                         match result {
                             Ok(output) => {
@@ -989,6 +995,7 @@ impl ImageUiApp {
                                     }
                                     OpRunMode::Apply => {
                                         session.commit_dataset(output.dataset);
+                                        overlay_translation = active_overlay_translation;
                                         measurements = output.measurements;
                                     }
                                     OpRunMode::NewWindow => {
@@ -1005,6 +1012,12 @@ impl ImageUiApp {
                                 status = error;
                             }
                         }
+                    }
+
+                    if let Some((dx, dy)) = overlay_translation
+                        && let Some(viewer) = self.viewers_ui.get_mut(&window_label)
+                    {
+                        translate_roi_store(&mut viewer.rois, dx, dy);
                     }
 
                     if let Some((dataset, title)) = new_window_dataset {
@@ -7198,6 +7211,15 @@ impl ImageUiApp {
             .get("title")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let overlay_translation =
+            if request.op == "image.canvas_resize" && request.mode == OpRunMode::Apply {
+                canvas_resize_overlay_offset(
+                    self.state.label_to_session.get(window_label),
+                    &request.params,
+                )
+            } else {
+                None
+            };
 
         if let Some(key) = &preview_key
             && let Some(session) = self.state.label_to_session.get_mut(window_label)
@@ -7231,6 +7253,7 @@ impl ImageUiApp {
                 generation,
                 mode: request.mode.clone(),
                 op: request.op.clone(),
+                overlay_translation,
             });
             (session.ensure_committed_dataset()?, generation)
         };
@@ -12831,6 +12854,96 @@ fn selected_roi_bbox(viewer: &ViewerUiState) -> Option<(usize, usize, usize, usi
         .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
         .or(viewer.rois.active_roi.as_ref())?;
     roi_kind_bbox(&roi.kind)
+}
+
+fn canvas_resize_overlay_offset(
+    session: Option<&ViewerSession>,
+    params: &Value,
+) -> Option<(f32, f32)> {
+    let session = session?;
+    let width = params.get("width")?.as_u64()? as usize;
+    let height = params.get("height")?.as_u64()? as usize;
+    let shape = &session.committed_summary.shape;
+    let source_width = shape.get(1).copied().unwrap_or(1);
+    let source_height = shape.first().copied().unwrap_or(1);
+    let position = params
+        .get("position")
+        .and_then(Value::as_str)
+        .unwrap_or("Center");
+    let (dx, dy) =
+        canvas_resize_position_offsets(width, height, source_width, source_height, position);
+    Some((dx as f32, dy as f32))
+}
+
+fn canvas_resize_position_offsets(
+    width: usize,
+    height: usize,
+    source_width: usize,
+    source_height: usize,
+    position: &str,
+) -> (isize, isize) {
+    let x_center = (width as isize - source_width as isize) / 2;
+    let x_right = width as isize - source_width as isize;
+    let y_center = (height as isize - source_height as isize) / 2;
+    let y_bottom = height as isize - source_height as isize;
+    match position
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-")
+        .as_str()
+    {
+        "top-left" => (0, 0),
+        "top-center" => (x_center, 0),
+        "top-right" => (x_right, 0),
+        "center-left" => (0, y_center),
+        "center-right" => (x_right, y_center),
+        "bottom-left" => (0, y_bottom),
+        "bottom-center" => (x_center, y_bottom),
+        "bottom-right" => (x_right, y_bottom),
+        _ => (x_center, y_center),
+    }
+}
+
+fn translate_roi_store(rois: &mut RoiStore, dx: f32, dy: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    if let Some(roi) = &mut rois.active_roi {
+        translate_roi_kind(&mut roi.kind, dx, dy);
+    }
+    for roi in &mut rois.overlay_rois {
+        translate_roi_kind(&mut roi.kind, dx, dy);
+    }
+}
+
+fn translate_roi_kind(kind: &mut RoiKind, dx: f32, dy: f32) {
+    match kind {
+        RoiKind::Rect { start, end, .. }
+        | RoiKind::Oval { start, end, .. }
+        | RoiKind::Line { start, end, .. } => {
+            translate_pos(start, dx, dy);
+            translate_pos(end, dx, dy);
+        }
+        RoiKind::Polygon { points, .. }
+        | RoiKind::Freehand { points }
+        | RoiKind::Point { points, .. }
+        | RoiKind::WandTrace { points } => {
+            for point in points {
+                translate_pos(point, dx, dy);
+            }
+        }
+        RoiKind::Angle { a, b, c } => {
+            translate_pos(a, dx, dy);
+            translate_pos(b, dx, dy);
+            translate_pos(c, dx, dy);
+        }
+        RoiKind::Text { at, .. } => translate_pos(at, dx, dy),
+    }
+}
+
+fn translate_pos(pos: &mut egui::Pos2, dx: f32, dy: f32) {
+    pos.x += dx;
+    pos.y += dy;
 }
 
 fn selected_roi_model(viewer: &ViewerUiState) -> Option<&RoiModel> {
@@ -19257,6 +19370,75 @@ mod tests {
         assert_eq!(app.resize_dialog.original_depth, 2);
         assert!(app.resize_dialog.process_stack_available);
         assert!(app.resize_dialog.process_stack);
+    }
+
+    #[test]
+    fn adjust_canvas_resize_translates_overlay_like_imagej() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/canvas-overlay.tif"),
+                ViewerImageSource::Dataset(dataset_2x2([0.0, 1.0, 2.0, 3.0])),
+            ),
+        );
+        let mut viewer = ViewerUiState::new(&label, "canvas-overlay".to_string());
+        viewer.rois.overlay_rois.push(RoiModel {
+            id: 1,
+            name: "ROI 1".to_string(),
+            kind: RoiKind::Rect {
+                start: egui::pos2(1.0, 1.0),
+                end: egui::pos2(2.0, 2.0),
+                rounded: false,
+                rotated: false,
+            },
+            position: RoiPosition::default(),
+            visible: true,
+            locked: false,
+        });
+        viewer.rois.selected_roi_id = Some(1);
+        app.viewers_ui.insert(label.clone(), viewer);
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.canvas",
+            Some(json!({
+                "width": 4,
+                "height": 6,
+                "position": "Center",
+                "fill": 0.0,
+                "zero": true
+            })),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        for _ in 0..50 {
+            if app.poll_worker_events() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.state.label_to_session[&label].active_job.is_none(),
+            "canvas resize job did not finish"
+        );
+        assert_eq!(
+            app.state.label_to_session[&label].committed_summary.shape,
+            vec![6, 4]
+        );
+
+        let roi = &app.viewers_ui[&label].rois.overlay_rois[0];
+        match &roi.kind {
+            RoiKind::Rect { start, end, .. } => {
+                assert_eq!(*start, egui::pos2(2.0, 3.0));
+                assert_eq!(*end, egui::pos2(3.0, 4.0));
+            }
+            other => panic!("unexpected ROI kind: {other:?}"),
+        }
     }
 
     #[test]
