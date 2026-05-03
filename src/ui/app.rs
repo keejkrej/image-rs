@@ -3359,6 +3359,7 @@ impl ImageUiApp {
             .viewers_ui
             .get(&target)
             .is_some_and(selected_roi_spline_fit);
+        self.adjust_dialog.color_balance_lut_color = false;
         self.adjust_dialog.contrast_auto_threshold = 0;
 
         if let Some(session) = self.state.label_to_session.get(&target) {
@@ -3381,6 +3382,12 @@ impl ImageUiApp {
             self.adjust_dialog.max = display_max;
             if display_min.is_finite() && display_max.is_finite() {
                 self.adjust_dialog.threshold = (display_min + display_max) * 0.5;
+            }
+            if kind == AdjustDialogKind::ColorBalance {
+                self.adjust_dialog.color_balance_lut_color = color_balance_uses_lut_color(session);
+                self.adjust_dialog.color_balance_channel =
+                    color_balance_channel_labels(self.adjust_dialog.color_balance_lut_color)[0]
+                        .to_string();
             }
             sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
             let width = session.committed_summary.shape.get(1).copied().unwrap_or(1) as f32;
@@ -8745,13 +8752,13 @@ impl ImageUiApp {
                     egui::ComboBox::from_id_salt("color_balance_channel_choice")
                         .selected_text(&self.adjust_dialog.color_balance_channel)
                         .show_ui(ui, |ui| {
-                            for channel in
-                                ["Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "All"]
-                            {
+                            for channel in color_balance_channel_labels(
+                                self.adjust_dialog.color_balance_lut_color,
+                            ) {
                                 ui.selectable_value(
                                     &mut self.adjust_dialog.color_balance_channel,
                                     channel.to_string(),
-                                    channel,
+                                    *channel,
                                 );
                             }
                         });
@@ -12396,6 +12403,9 @@ fn draw_simple_window(
 }
 
 fn adjust_dialog_window_title(dialog: &AdjustDialogState) -> String {
+    if dialog.kind == AdjustDialogKind::ColorBalance && dialog.color_balance_lut_color {
+        return "LUT Color".to_string();
+    }
     if dialog.kind != AdjustDialogKind::Coordinates {
         return dialog.kind.title().to_string();
     }
@@ -14430,6 +14440,18 @@ fn color_balance_channel_index(channel: &str) -> Option<usize> {
     }
 }
 
+fn color_balance_channel_labels(lut_color: bool) -> &'static [&'static str] {
+    if lut_color {
+        &["LUT level"]
+    } else {
+        &["Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "All"]
+    }
+}
+
+fn color_balance_uses_lut_color(session: &ViewerSession) -> bool {
+    session.committed_summary.channels <= 1
+}
+
 fn to_color_image_with_threshold(
     frame: &ViewerFrameBuffer,
     lut: LookupTable,
@@ -15547,17 +15569,18 @@ mod tests {
         RepaintDecisionInputs, RoiKind, RoiModel, SliceImage, ThresholdOverlay,
         ThresholdOverlayMode, ToolId, UiState, ViewerFrameBuffer, ViewerFrameRequest,
         ViewerImageSource, ViewerSession, ViewerTelemetry, ViewerUiState, ZoomCommand,
-        add_selection_to_overlay, adjust_histogram, apply_overlay_visibility, apply_zoom_command,
-        auto_contrast_range, binary_morphology_params, build_frame, canonical_json,
-        centered_circular_roi, color_threshold_auto_ranges, color_threshold_choice_labels,
-        color_threshold_macro_text, combine_stack_datasets, compute_initial_viewport_size,
-        compute_viewer_frame, concatenate_stack_datasets, coordinates_dialog_is_stack,
-        create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
-        first_report_line, flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
-        function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
-        imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
-        init_coordinates_dialog, initialize_view_to_open_state, insert_stack_dataset,
-        install_macro_file_to_dir, installed_macro_file_name,
+        add_selection_to_overlay, adjust_dialog_window_title, adjust_histogram,
+        apply_overlay_visibility, apply_zoom_command, auto_contrast_range,
+        binary_morphology_params, build_frame, canonical_json, centered_circular_roi,
+        color_balance_channel_labels, color_balance_uses_lut_color, color_threshold_auto_ranges,
+        color_threshold_choice_labels, color_threshold_macro_text, combine_stack_datasets,
+        compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
+        coordinates_dialog_is_stack, create_circular_masks_dataset, dominant_scroll_component,
+        effective_scroll_delta, first_report_line, flatten_overlay_slice, format_launcher_status,
+        full_image_rect_roi, function_key_for_macro_shortcut, image_draw_rect,
+        image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
+        images_to_stack_dataset, init_coordinates_dialog, initialize_view_to_open_state,
+        insert_stack_dataset, install_macro_file_to_dir, installed_macro_file_name,
         installed_macro_menu_entry_from_block, interpolate_roi_kind, line_width_from_params,
         list_installed_macro_files_in_dir, lookup_table_color, lookup_table_from_command,
         lookup_table_slice_to_rgb, macro_display_name, macro_name_shortcut,
@@ -18537,6 +18560,35 @@ mod tests {
         assert_eq!(session.channel_display_ranges.get(&0), Some(&(5.0, 25.0)));
         assert_eq!(session.channel_display_ranges.get(&1), Some(&(5.0, 25.0)));
         assert_eq!(session.channel_display_ranges.get(&2), Some(&(5.0, 25.0)));
+    }
+
+    #[test]
+    fn color_balance_uses_lut_color_for_grayscale_like_imagej() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        let session = ViewerSession::new(
+            PathBuf::from("/tmp/lut-color.tif"),
+            ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                [0.0, 1.0, 2.0, 3.0],
+                PixelType::U8,
+            )),
+        );
+        assert!(color_balance_uses_lut_color(&session));
+        app.state.label_to_session.insert(label.clone(), session);
+
+        let result = app.dispatch_command(&label, "image.adjust.color_balance", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert!(app.adjust_dialog.color_balance_lut_color);
+        assert_eq!(app.adjust_dialog.color_balance_channel, "LUT level");
+        assert_eq!(
+            color_balance_channel_labels(true),
+            &["LUT level"] as &[&str]
+        );
+        assert_eq!(adjust_dialog_window_title(&app.adjust_dialog), "LUT Color");
     }
 
     #[test]
