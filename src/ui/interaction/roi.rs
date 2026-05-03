@@ -26,6 +26,7 @@ pub enum RoiKind {
     Polygon {
         points: Vec<egui::Pos2>,
         closed: bool,
+        spline_fit: bool,
     },
     Freehand {
         points: Vec<egui::Pos2>,

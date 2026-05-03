@@ -306,8 +306,8 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             true,
             false,
-            Some(json!({"width": 1.0})),
-            Some("Set the default ImageJ-style line selection width."),
+            Some(json!({"width": 1.0, "spline_fit": false})),
+            Some("Set the default ImageJ-style line selection width and polygon spline fit."),
         ),
         "edit.selection.all" | "edit.selection.none" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -617,8 +617,8 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             true,
             true,
             false,
-            Some(json!({"width": 1.0})),
-            Some("Set the default ImageJ-style line selection width."),
+            Some(json!({"width": 1.0, "spline_fit": false})),
+            Some("Set the default ImageJ-style line selection width and polygon spline fit."),
         ),
         "image.adjust.coordinates" => CommandMetadata::with(
             CommandScope::Viewer,

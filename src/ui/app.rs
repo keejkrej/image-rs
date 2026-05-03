@@ -3128,6 +3128,7 @@ impl ImageUiApp {
             RoiKind::Polygon {
                 points,
                 closed: !selection_type.contains("line"),
+                spline_fit: false,
             }
         };
         viewer.rois.begin_active(kind, position);
@@ -3327,6 +3328,10 @@ impl ImageUiApp {
         self.adjust_dialog.open = true;
         self.adjust_dialog.histogram = histogram;
         self.adjust_dialog.line_width = self.tool_options.line_width_px;
+        self.adjust_dialog.spline_fit = self
+            .viewers_ui
+            .get(&target)
+            .is_some_and(selected_roi_spline_fit);
         self.adjust_dialog.contrast_auto_threshold = 0;
 
         if let Some(session) = self.state.label_to_session.get(&target) {
@@ -4458,6 +4463,13 @@ impl ImageUiApp {
             return Some(match line_width_from_params(&params) {
                 Ok(width) => {
                     self.tool_options.line_width_px = width;
+                    if let Some(spline_fit) = params.get("spline_fit").and_then(Value::as_bool)
+                        && let Some(viewer_label) =
+                            self.current_viewer_label(window_label).map(str::to_string)
+                        && let Some(viewer) = self.viewers_ui.get_mut(&viewer_label)
+                    {
+                        set_selected_roi_spline_fit(viewer, spline_fit);
+                    }
                     command_registry::CommandExecuteResult::with_payload(
                         "line width updated",
                         json!({ "width": width }),
@@ -9230,6 +9242,29 @@ impl ImageUiApp {
                             })),
                         });
                     }
+                    let can_spline_fit = self
+                        .viewers_ui
+                        .get(&self.adjust_dialog.window_label)
+                        .is_some_and(selected_roi_can_spline_fit);
+                    if !can_spline_fit {
+                        self.adjust_dialog.spline_fit = false;
+                    }
+                    if ui
+                        .add_enabled(
+                            can_spline_fit,
+                            egui::Checkbox::new(&mut self.adjust_dialog.spline_fit, "Spline fit"),
+                        )
+                        .changed()
+                    {
+                        actions.push(UiAction::Command {
+                            window_label: self.adjust_dialog.window_label.clone(),
+                            command_id: "image.adjust.line_width".to_string(),
+                            params: Some(json!({
+                                "width": self.adjust_dialog.line_width,
+                                "spline_fit": self.adjust_dialog.spline_fit
+                            })),
+                        });
+                    }
                 }
                 AdjustDialogKind::Coordinates => {
                     let is_stack = coordinates_dialog_is_stack(&self.adjust_dialog);
@@ -10854,6 +10889,7 @@ impl ImageUiApp {
                                     RoiKind::Polygon {
                                         points: viewer.active_polygon_points.clone(),
                                         closed: true,
+                                        spline_fit: false,
                                     },
                                     interaction::roi::RoiPosition {
                                         channel: viewer.channel,
@@ -11585,7 +11621,7 @@ fn interpolate_roi_kind(
     }
     let (points, closed, output) = match kind {
         RoiKind::Line { start, end, .. } => (vec![*start, *end], false, "freehand"),
-        RoiKind::Polygon { points, closed } => (points.clone(), *closed, "polygon"),
+        RoiKind::Polygon { points, closed, .. } => (points.clone(), *closed, "polygon"),
         RoiKind::Freehand { points } => (points.clone(), false, "freehand"),
         RoiKind::WandTrace { points } => (points.clone(), points.len() > 2, "wand"),
         _ => {
@@ -11602,7 +11638,11 @@ fn interpolate_roi_kind(
     };
 
     Ok(match output {
-        "polygon" => RoiKind::Polygon { points, closed },
+        "polygon" => RoiKind::Polygon {
+            points,
+            closed,
+            spline_fit: false,
+        },
         "wand" => RoiKind::WandTrace { points },
         _ => RoiKind::Freehand { points },
     })
@@ -11704,6 +11744,59 @@ fn smooth_roi_points(points: &[egui::Pos2], closed: bool) -> Vec<egui::Pos2> {
     smoothed
 }
 
+fn spline_fit_roi_points(points: &[egui::Pos2], closed: bool) -> Vec<egui::Pos2> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+    let segment_count = if closed {
+        points.len()
+    } else {
+        points.len().saturating_sub(1)
+    };
+    let mut output = Vec::with_capacity(segment_count.saturating_mul(8) + 1);
+    for index in 0..segment_count {
+        let p0 = if index == 0 {
+            if closed {
+                points[points.len() - 1]
+            } else {
+                points[0]
+            }
+        } else {
+            points[index - 1]
+        };
+        let p1 = points[index];
+        let p2 = points[(index + 1) % points.len()];
+        let p3 = if index + 2 < points.len() {
+            points[index + 2]
+        } else if closed {
+            points[(index + 2) % points.len()]
+        } else {
+            points[points.len() - 1]
+        };
+
+        for step in 0..8 {
+            let t = step as f32 / 8.0;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let x = 0.5
+                * ((2.0 * p1.x)
+                    + (-p0.x + p2.x) * t
+                    + (2.0 * p0.x - 5.0 * p1.x + 4.0 * p2.x - p3.x) * t2
+                    + (-p0.x + 3.0 * p1.x - 3.0 * p2.x + p3.x) * t3);
+            let y = 0.5
+                * ((2.0 * p1.y)
+                    + (-p0.y + p2.y) * t
+                    + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
+                    + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3);
+            output.push(egui::pos2(x, y));
+        }
+    }
+    if !closed {
+        output.push(*points.last().expect("points checked"));
+    }
+    output
+}
+
 fn drag_roi_for_tool(
     tool: ToolId,
     options: &ToolOptionsState,
@@ -11802,8 +11895,17 @@ fn draw_rois(
                     painter.line_segment([p2, p2 + (direction - left) * 8.0], stroke);
                 }
             }
-            RoiKind::Polygon { points, closed } => {
-                let mut line_points = points
+            RoiKind::Polygon {
+                points,
+                closed,
+                spline_fit,
+            } => {
+                let display_points = if *spline_fit {
+                    spline_fit_roi_points(points, *closed)
+                } else {
+                    points.clone()
+                };
+                let mut line_points = display_points
                     .iter()
                     .map(|point| viewer.transform.image_to_screen(canvas_rect, *point))
                     .collect::<Vec<_>>();
@@ -12218,6 +12320,40 @@ fn selected_roi_model(viewer: &ViewerUiState) -> Option<&RoiModel> {
         .selected_roi_id
         .and_then(|id| viewer.rois.overlay_rois.iter().find(|roi| roi.id == id))
         .or(viewer.rois.active_roi.as_ref())
+}
+
+fn selected_roi_model_mut(viewer: &mut ViewerUiState) -> Option<&mut RoiModel> {
+    if let Some(id) = viewer.rois.selected_roi_id
+        && let Some(index) = viewer.rois.overlay_rois.iter().position(|roi| roi.id == id)
+    {
+        return viewer.rois.overlay_rois.get_mut(index);
+    }
+    viewer.rois.active_roi.as_mut()
+}
+
+fn selected_roi_can_spline_fit(viewer: &ViewerUiState) -> bool {
+    matches!(
+        selected_roi_model(viewer).map(|roi| &roi.kind),
+        Some(RoiKind::Polygon { .. })
+    )
+}
+
+fn selected_roi_spline_fit(viewer: &ViewerUiState) -> bool {
+    match selected_roi_model(viewer).map(|roi| &roi.kind) {
+        Some(RoiKind::Polygon { spline_fit, .. }) => *spline_fit,
+        _ => false,
+    }
+}
+
+fn set_selected_roi_spline_fit(viewer: &mut ViewerUiState, enabled: bool) -> bool {
+    let Some(roi) = selected_roi_model_mut(viewer) else {
+        return false;
+    };
+    let RoiKind::Polygon { spline_fit, .. } = &mut roi.kind else {
+        return false;
+    };
+    *spline_fit = enabled;
+    true
 }
 
 fn init_coordinates_dialog(
@@ -13239,17 +13375,26 @@ fn rasterize_roi_outline(
         RoiKind::Line { start, end, .. } => {
             draw_flatten_line(values, width, height, *start, *end, draw_value);
         }
-        RoiKind::Polygon { points, closed } => {
-            for pair in points.windows(2) {
+        RoiKind::Polygon {
+            points,
+            closed,
+            spline_fit,
+        } => {
+            let display_points = if *spline_fit {
+                spline_fit_roi_points(points, *closed)
+            } else {
+                points.clone()
+            };
+            for pair in display_points.windows(2) {
                 draw_flatten_line(values, width, height, pair[0], pair[1], draw_value);
             }
-            if *closed && points.len() > 2 {
+            if *closed && display_points.len() > 2 {
                 draw_flatten_line(
                     values,
                     width,
                     height,
-                    *points.last().unwrap(),
-                    points[0],
+                    *display_points.last().unwrap(),
+                    display_points[0],
                     draw_value,
                 );
             }
@@ -14334,6 +14479,7 @@ fn mask_foreground_roi(slice: &SliceImage) -> Option<RoiKind> {
         Some(RoiKind::Polygon {
             points: outline,
             closed: true,
+            spline_fit: false,
         })
     } else {
         let (min_x, min_y, max_x, max_y) = mask_foreground_bbox(slice)?;
@@ -15314,13 +15460,14 @@ mod tests {
         reset_color_threshold_bands_for_space, results_distribution, results_rows_to_dataset,
         results_summary_rows, roi_kind_bbox, roi_label_anchor, roi_stroke_width,
         sample_color_threshold_ranges, sanitize_image_title, selection_properties_row,
-        set_stack_slice_label_dataset, set_threshold_sixteen_bit_histogram,
-        should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
-        stack_measurement_rows, stack_position_from_params, stack_slice_label, stack_slice_path,
-        stack_to_image_datasets, stack_xy_profile_rows, startup_auto_run_macro_block,
-        strip_macro_line_comment, threshold_method_labels, threshold_method_param,
-        to_color_image_with_threshold, tool_from_command_id, tool_shortcut_command,
-        viewer_sort_key, xy_coordinate_rows, zoom_set_params,
+        set_selected_roi_spline_fit, set_stack_slice_label_dataset,
+        set_threshold_sixteen_bit_histogram, should_request_periodic_repaint,
+        should_request_repaint_now, source_ptr_eq, spline_fit_roi_points, stack_measurement_rows,
+        stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
+        stack_xy_profile_rows, startup_auto_run_macro_block, strip_macro_line_comment,
+        threshold_method_labels, threshold_method_param, to_color_image_with_threshold,
+        tool_from_command_id, tool_shortcut_command, viewer_sort_key, xy_coordinate_rows,
+        zoom_set_params,
     };
     use tempfile::tempdir;
 
@@ -16038,6 +16185,44 @@ mod tests {
     }
 
     #[test]
+    fn line_width_spline_fit_toggles_selected_polygon_roi_like_imagej() {
+        let mut viewer = ViewerUiState::new("viewer-1", "test".to_string());
+        viewer.rois.begin_active(
+            RoiKind::Polygon {
+                points: vec![
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(5.0, 10.0),
+                    egui::pos2(10.0, 0.0),
+                ],
+                closed: false,
+                spline_fit: false,
+            },
+            RoiPosition::default(),
+        );
+        viewer.rois.commit_active(false);
+
+        assert!(set_selected_roi_spline_fit(&mut viewer, true));
+        let RoiKind::Polygon { spline_fit, .. } = &viewer.rois.overlay_rois[0].kind else {
+            panic!("expected polygon");
+        };
+        assert!(*spline_fit);
+    }
+
+    #[test]
+    fn spline_fit_roi_points_preserves_endpoints_for_open_polygons() {
+        let points = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(5.0, 10.0),
+            egui::pos2(10.0, 0.0),
+        ];
+        let fitted = spline_fit_roi_points(&points, false);
+
+        assert_eq!(fitted.first().copied(), Some(points[0]));
+        assert_eq!(fitted.last().copied(), Some(points[2]));
+        assert!(fitted.len() > points.len());
+    }
+
+    #[test]
     fn coordinates_dialog_defaults_to_selection_bounds_like_imagej() {
         let mut metadata = Metadata::from_shape(&[10, 10], PixelType::F32);
         metadata.dims[1].spacing = Some(2.0);
@@ -16252,6 +16437,7 @@ mod tests {
                 egui::pos2(3.0, 10.0),
             ],
             closed: true,
+            spline_fit: false,
         };
         assert_eq!(roi_label_anchor(&polygon), Some(egui::pos2(4.0, 6.0)));
     }
@@ -18558,7 +18744,7 @@ mod tests {
         };
 
         let roi = mask_foreground_roi(&slice).expect("roi");
-        let RoiKind::Polygon { points, closed } = roi else {
+        let RoiKind::Polygon { points, closed, .. } = roi else {
             panic!("expected traced polygon");
         };
 
@@ -18567,6 +18753,7 @@ mod tests {
         let bounds = roi_kind_bbox(&RoiKind::Polygon {
             points: points.clone(),
             closed,
+            spline_fit: false,
         })
         .expect("bounds");
         assert_eq!(bounds, (1, 1, 3, 3));
