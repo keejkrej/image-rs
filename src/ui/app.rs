@@ -3385,9 +3385,14 @@ impl ImageUiApp {
             }
             if kind == AdjustDialogKind::ColorBalance {
                 self.adjust_dialog.color_balance_lut_color = color_balance_uses_lut_color(session);
-                self.adjust_dialog.color_balance_channel =
-                    color_balance_channel_labels(self.adjust_dialog.color_balance_lut_color)[0]
-                        .to_string();
+                self.adjust_dialog.color_balance_channel_labels =
+                    color_balance_channel_labels_for_session(session);
+                self.adjust_dialog.color_balance_channel = self
+                    .adjust_dialog
+                    .color_balance_channel_labels
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "Red".to_string());
             }
             sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
             let width = session.committed_summary.shape.get(1).copied().unwrap_or(1) as f32;
@@ -8752,13 +8757,11 @@ impl ImageUiApp {
                     egui::ComboBox::from_id_salt("color_balance_channel_choice")
                         .selected_text(&self.adjust_dialog.color_balance_channel)
                         .show_ui(ui, |ui| {
-                            for channel in color_balance_channel_labels(
-                                self.adjust_dialog.color_balance_lut_color,
-                            ) {
+                            for channel in &self.adjust_dialog.color_balance_channel_labels {
                                 ui.selectable_value(
                                     &mut self.adjust_dialog.color_balance_channel,
-                                    channel.to_string(),
-                                    *channel,
+                                    channel.clone(),
+                                    channel,
                                 );
                             }
                         });
@@ -14436,15 +14439,39 @@ fn color_balance_channel_index(channel: &str) -> Option<usize> {
         "Red" | "Cyan" | "red" | "cyan" => Some(0),
         "Green" | "Magenta" | "green" | "magenta" => Some(1),
         "Blue" | "Yellow" | "blue" | "yellow" => Some(2),
-        _ => None,
+        _ => channel
+            .strip_prefix("Channel ")
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(|value| value.checked_sub(1)),
     }
 }
 
-fn color_balance_channel_labels(lut_color: bool) -> &'static [&'static str] {
-    if lut_color {
-        &["LUT level"]
+fn color_balance_color_labels() -> Vec<String> {
+    ["Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "All"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn color_balance_channel_labels(channel_count: usize) -> Vec<String> {
+    let mut labels = (1..=channel_count.max(1))
+        .map(|channel| format!("Channel {channel}"))
+        .collect::<Vec<_>>();
+    if channel_count > 1 {
+        labels.push("All".to_string());
+    }
+    labels
+}
+
+fn color_balance_channel_labels_for_session(session: &ViewerSession) -> Vec<String> {
+    if color_balance_uses_lut_color(session) {
+        return vec!["LUT level".to_string()];
+    }
+    let channel_count = session.committed_summary.channels.max(1);
+    if channel_count == 3 {
+        color_balance_color_labels()
     } else {
-        &["Red", "Green", "Blue", "Cyan", "Magenta", "Yellow", "All"]
+        color_balance_channel_labels(channel_count)
     }
 }
 
@@ -15572,15 +15599,16 @@ mod tests {
         add_selection_to_overlay, adjust_dialog_window_title, adjust_histogram,
         apply_overlay_visibility, apply_zoom_command, auto_contrast_range,
         binary_morphology_params, build_frame, canonical_json, centered_circular_roi,
-        color_balance_channel_labels, color_balance_uses_lut_color, color_threshold_auto_ranges,
-        color_threshold_choice_labels, color_threshold_macro_text, combine_stack_datasets,
-        compute_initial_viewport_size, compute_viewer_frame, concatenate_stack_datasets,
-        coordinates_dialog_is_stack, create_circular_masks_dataset, dominant_scroll_component,
-        effective_scroll_delta, first_report_line, flatten_overlay_slice, format_launcher_status,
-        full_image_rect_roi, function_key_for_macro_shortcut, image_draw_rect,
-        image_slice_to_results_rows, imagej_color_from_name, imagej_color_to_string,
-        images_to_stack_dataset, init_coordinates_dialog, initialize_view_to_open_state,
-        insert_stack_dataset, install_macro_file_to_dir, installed_macro_file_name,
+        color_balance_channel_index, color_balance_channel_labels_for_session,
+        color_balance_uses_lut_color, color_threshold_auto_ranges, color_threshold_choice_labels,
+        color_threshold_macro_text, combine_stack_datasets, compute_initial_viewport_size,
+        compute_viewer_frame, concatenate_stack_datasets, coordinates_dialog_is_stack,
+        create_circular_masks_dataset, dominant_scroll_component, effective_scroll_delta,
+        first_report_line, flatten_overlay_slice, format_launcher_status, full_image_rect_roi,
+        function_key_for_macro_shortcut, image_draw_rect, image_slice_to_results_rows,
+        imagej_color_from_name, imagej_color_to_string, images_to_stack_dataset,
+        init_coordinates_dialog, initialize_view_to_open_state, insert_stack_dataset,
+        install_macro_file_to_dir, installed_macro_file_name,
         installed_macro_menu_entry_from_block, interpolate_roi_kind, line_width_from_params,
         list_installed_macro_files_in_dir, lookup_table_color, lookup_table_from_command,
         lookup_table_slice_to_rgb, macro_display_name, macro_name_shortcut,
@@ -18585,10 +18613,66 @@ mod tests {
         assert!(app.adjust_dialog.color_balance_lut_color);
         assert_eq!(app.adjust_dialog.color_balance_channel, "LUT level");
         assert_eq!(
-            color_balance_channel_labels(true),
-            &["LUT level"] as &[&str]
+            app.adjust_dialog.color_balance_channel_labels,
+            vec!["LUT level".to_string()]
+        );
+        assert_eq!(
+            color_balance_channel_labels_for_session(&app.state.label_to_session[&label]),
+            vec!["LUT level".to_string()]
         );
         assert_eq!(adjust_dialog_window_title(&app.adjust_dialog), "LUT Color");
+    }
+
+    #[test]
+    fn color_balance_uses_channel_labels_for_multichannel_images_like_imagej() {
+        let label = "viewer-1".to_string();
+        let data =
+            Array::from_shape_vec(IxDyn(&[1, 1, 4]), vec![1.0, 2.0, 3.0, 4.0]).expect("shape");
+        let dataset = Arc::new(
+            DatasetF32::new(
+                data,
+                Metadata {
+                    dims: vec![
+                        Dim::new(AxisKind::Y, 1),
+                        Dim::new(AxisKind::X, 1),
+                        Dim::new(AxisKind::Channel, 4),
+                    ],
+                    pixel_type: PixelType::F32,
+                    ..Metadata::default()
+                },
+            )
+            .expect("dataset"),
+        );
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/composite-color-balance.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+
+        let result = app.dispatch_command(&label, "image.adjust.color_balance", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert!(!app.adjust_dialog.color_balance_lut_color);
+        assert_eq!(adjust_dialog_window_title(&app.adjust_dialog), "Color");
+        assert_eq!(app.adjust_dialog.color_balance_channel, "Channel 1");
+        assert_eq!(
+            app.adjust_dialog.color_balance_channel_labels,
+            vec![
+                "Channel 1".to_string(),
+                "Channel 2".to_string(),
+                "Channel 3".to_string(),
+                "Channel 4".to_string(),
+                "All".to_string(),
+            ]
+        );
+        assert_eq!(color_balance_channel_index("Channel 4"), Some(3));
+        assert_eq!(color_balance_channel_index("All"), None);
     }
 
     #[test]
