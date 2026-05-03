@@ -3859,7 +3859,6 @@ impl ImageUiApp {
             .state
             .label_to_session
             .get(&target)
-            .filter(|session| session.committed_summary.channels <= 1)
             .map(|session| session.committed_summary.z_slices.max(1))
             .unwrap_or(1);
         let mut slice_params = params.clone();
@@ -18453,6 +18452,51 @@ mod tests {
         assert_eq!(state.stack_slices, 2);
         assert_eq!(state.params.get("slice"), None);
         assert_eq!(state.slice_params.get("slice"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn adjust_apply_lut_rgb_stack_prompts_like_imagej() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(
+            IxDyn(&[1, 1, 2, 3]),
+            vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        )
+        .expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Z, 2),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/apply-lut-rgb-stack.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        let mut viewer = ViewerUiState::new(&label, "apply-lut-rgb-stack".to_string());
+        viewer.z = 1;
+        viewer.channel = 2;
+        app.viewers_ui.insert(label.clone(), viewer);
+
+        let state = app.apply_lut_dialog_state(
+            label.clone(),
+            "image.adjust.color_balance".to_string(),
+            json!({"min": 10.0, "max": 60.0, "channel": "Blue", "apply": true}),
+        );
+
+        assert!(state.open);
+        assert_eq!(state.stack_slices, 2);
+        assert_eq!(state.params.get("slice"), None);
+        assert_eq!(state.slice_params.get("slice"), Some(&json!(1)));
+        assert_eq!(state.slice_params.get("channel"), Some(&json!("Blue")));
     }
 
     #[test]
