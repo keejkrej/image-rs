@@ -38,6 +38,9 @@ pub(super) struct ResizeDialogState {
     pub(super) height: usize,
     pub(super) original_width: usize,
     pub(super) original_height: usize,
+    pub(super) x_scale: f32,
+    pub(super) y_scale: f32,
+    pub(super) z_scale: f32,
     pub(super) depth: usize,
     pub(super) frames: usize,
     pub(super) constrain_aspect: bool,
@@ -56,6 +59,9 @@ impl Default for ResizeDialogState {
             height: 512,
             original_width: 512,
             original_height: 512,
+            x_scale: 1.0,
+            y_scale: 1.0,
+            z_scale: 1.0,
             depth: 1,
             frames: 1,
             constrain_aspect: true,
@@ -248,6 +254,43 @@ impl Default for ApplyLutDialogState {
             window_label: String::new(),
             command_id: String::new(),
             params: serde_json::Value::Null,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SetDisplayRangeDialogState {
+    pub(super) open: bool,
+    pub(super) window_label: String,
+    pub(super) command_id: String,
+    pub(super) low_key: String,
+    pub(super) high_key: String,
+    pub(super) minimum: f32,
+    pub(super) maximum: f32,
+    pub(super) unsigned_16bit_range: String,
+    pub(super) propagate: bool,
+    pub(super) all_channels: bool,
+    pub(super) show_all_channels: bool,
+    pub(super) channel: String,
+    pub(super) channel_count: usize,
+}
+
+impl Default for SetDisplayRangeDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            command_id: String::new(),
+            low_key: "min".to_string(),
+            high_key: "max".to_string(),
+            minimum: 0.0,
+            maximum: 1.0,
+            unsigned_16bit_range: "Automatic".to_string(),
+            propagate: false,
+            all_channels: false,
+            show_all_channels: false,
+            channel: String::new(),
+            channel_count: 1,
         }
     }
 }

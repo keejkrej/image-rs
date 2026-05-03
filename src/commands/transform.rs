@@ -400,13 +400,7 @@ impl Operation for ImageScaleOp {
         let height = ((dataset.shape()[y_axis] as f32) * y_scale)
             .round()
             .max(1.0) as usize;
-        let mut output = resize_xy(dataset, width, height, ResizeInterpolation::Bilinear, false)?;
-        if let Some(spacing) = &mut output.metadata.dims[x_axis].spacing {
-            *spacing /= x_scale;
-        }
-        if let Some(spacing) = &mut output.metadata.dims[y_axis].spacing {
-            *spacing /= y_scale;
-        }
+        let output = resize_xy(dataset, width, height, ResizeInterpolation::Bilinear, false)?;
         Ok(OpOutput::dataset_only(output))
     }
 }
@@ -2831,6 +2825,12 @@ fn resize_xy(
     let mut metadata = dataset.metadata.clone();
     metadata.dims[x_axis].size = width;
     metadata.dims[y_axis].size = height;
+    if let Some(spacing) = &mut metadata.dims[x_axis].spacing {
+        *spacing *= input_w as f32 / width as f32;
+    }
+    if let Some(spacing) = &mut metadata.dims[y_axis].spacing {
+        *spacing *= input_h as f32 / height as f32;
+    }
     Ok(Dataset::new(data, metadata)?)
 }
 
@@ -3010,9 +3010,9 @@ impl CanvasPosition {
         source_w: usize,
         source_h: usize,
     ) -> (isize, isize) {
-        let x_center = output_w as isize / 2 - source_w as isize / 2;
+        let x_center = (output_w as isize - source_w as isize) / 2;
         let x_right = output_w as isize - source_w as isize;
-        let y_center = output_h as isize / 2 - source_h as isize / 2;
+        let y_center = (output_h as isize - source_h as isize) / 2;
         let y_bottom = output_h as isize - source_h as isize;
         match self {
             Self::TopLeft => (0, 0),

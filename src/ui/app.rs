@@ -675,6 +675,7 @@ struct ImageUiApp {
     adjust_dialog: AdjustDialogState,
     threshold_apply_dialog: ThresholdApplyDialogState,
     apply_lut_dialog: ApplyLutDialogState,
+    set_display_range_dialog: SetDisplayRangeDialogState,
     resize_dialog: ResizeDialogState,
     canvas_dialog: ResizeDialogState,
     stack_position_dialog: StackPositionDialogState,
@@ -729,6 +730,7 @@ impl ImageUiApp {
             adjust_dialog: AdjustDialogState::default(),
             threshold_apply_dialog: ThresholdApplyDialogState::default(),
             apply_lut_dialog: ApplyLutDialogState::default(),
+            set_display_range_dialog: SetDisplayRangeDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
@@ -784,6 +786,7 @@ impl ImageUiApp {
             adjust_dialog: AdjustDialogState::default(),
             threshold_apply_dialog: ThresholdApplyDialogState::default(),
             apply_lut_dialog: ApplyLutDialogState::default(),
+            set_display_range_dialog: SetDisplayRangeDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
             canvas_dialog: ResizeDialogState::default(),
             stack_position_dialog: StackPositionDialogState::default(),
@@ -3369,6 +3372,42 @@ impl ImageUiApp {
         command_registry::CommandExecuteResult::ok(format!("{} dialog opened", kind.title()))
     }
 
+    fn open_set_display_range_dialog_from_adjust(
+        &mut self,
+        command_id: &str,
+        low_key: &str,
+        high_key: &str,
+    ) {
+        let channel_count = self
+            .state
+            .label_to_session
+            .get(&self.adjust_dialog.window_label)
+            .map(|session| session.committed_summary.channels.max(1))
+            .unwrap_or(1);
+        let channel = if self.adjust_dialog.kind == AdjustDialogKind::ColorBalance {
+            self.adjust_dialog.color_balance_channel.clone()
+        } else {
+            String::new()
+        };
+        self.set_display_range_dialog = SetDisplayRangeDialogState {
+            open: true,
+            window_label: self.adjust_dialog.window_label.clone(),
+            command_id: command_id.to_string(),
+            low_key: low_key.to_string(),
+            high_key: high_key.to_string(),
+            minimum: self.adjust_dialog.min,
+            maximum: self.adjust_dialog.max,
+            unsigned_16bit_range: "Automatic".to_string(),
+            propagate: false,
+            all_channels: false,
+            show_all_channels: self.adjust_dialog.kind == AdjustDialogKind::ColorBalance
+                && channel_count > 1
+                && channel != "All",
+            channel,
+            channel_count,
+        };
+    }
+
     fn apply_display_range(
         &mut self,
         window_label: &str,
@@ -3380,22 +3419,28 @@ impl ImageUiApp {
             .current_viewer_label(window_label)
             .unwrap_or(window_label)
             .to_string();
-        let session = self
-            .state
-            .label_to_session
-            .get_mut(&target)
-            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
-
         let low = params
             .get(low_key)
             .and_then(Value::as_f64)
             .map(|value| value as f32)
-            .unwrap_or(session.committed_summary.min);
+            .unwrap_or_else(|| {
+                self.state
+                    .label_to_session
+                    .get(&target)
+                    .map(|session| session.committed_summary.min)
+                    .unwrap_or(0.0)
+            });
         let high = params
             .get(high_key)
             .and_then(Value::as_f64)
             .map(|value| value as f32)
-            .unwrap_or(session.committed_summary.max);
+            .unwrap_or_else(|| {
+                self.state
+                    .label_to_session
+                    .get(&target)
+                    .map(|session| session.committed_summary.max)
+                    .unwrap_or(1.0)
+            });
 
         if !low.is_finite() || !high.is_finite() || high <= low {
             return Err(format!(
@@ -3407,22 +3452,70 @@ impl ImageUiApp {
             .get("channel")
             .and_then(Value::as_str)
             .and_then(color_balance_channel_index);
-        if let Some(channel) = channel {
-            session.set_channel_display_range(channel, Some((low, high)));
-        } else {
-            session.set_display_range(Some((low, high)));
+        let all_channels = params
+            .get("all_channels")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let propagate = params
+            .get("propagate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let channel_count = {
+            let session = self
+                .state
+                .label_to_session
+                .get_mut(&target)
+                .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+            if all_channels {
+                let channel_count = session.committed_summary.channels.max(1);
+                for channel in 0..channel_count {
+                    session.set_channel_display_range(channel, Some((low, high)));
+                }
+                channel_count
+            } else if let Some(channel) = channel {
+                session.set_channel_display_range(channel, Some((low, high)));
+                session.committed_summary.channels.max(1)
+            } else {
+                session.set_display_range(Some((low, high)));
+                session.committed_summary.channels.max(1)
+            }
+        };
+
+        if propagate {
+            let labels = self
+                .state
+                .label_to_session
+                .keys()
+                .filter(|label| *label != &target)
+                .cloned()
+                .collect::<Vec<_>>();
+            for label in labels {
+                if let Some(session) = self.state.label_to_session.get_mut(&label) {
+                    session.set_display_range(Some((low, high)));
+                }
+                if let Some(viewer) = self.viewers_ui.get_mut(&label) {
+                    viewer.last_generation = 0;
+                    viewer.last_request = None;
+                    viewer.status_message = format!("Display range {low:.4}..{high:.4}");
+                }
+            }
         }
         if let Some(viewer) = self.viewers_ui.get_mut(&target) {
             viewer.last_generation = 0;
             viewer.last_request = None;
-            viewer.status_message = if let Some(channel) = channel {
+            viewer.status_message = if all_channels {
+                format!("All channel display ranges {low:.4}..{high:.4}")
+            } else if let Some(channel) = channel {
                 format!("Channel {} display range {low:.4}..{high:.4}", channel + 1)
             } else {
                 format!("Display range {low:.4}..{high:.4}")
             };
         }
 
-        Ok(if let Some(channel) = channel {
+        Ok(if all_channels {
+            format!("{channel_count} channel display ranges set to {low:.4}..{high:.4}")
+        } else if let Some(channel) = channel {
             format!(
                 "channel {} display range set to {low:.4}..{high:.4}",
                 channel + 1
@@ -5808,6 +5901,9 @@ impl ImageUiApp {
                     self.resize_dialog.height = session.committed_summary.shape[0];
                     self.resize_dialog.original_width = session.committed_summary.shape[1];
                     self.resize_dialog.original_height = session.committed_summary.shape[0];
+                    self.resize_dialog.x_scale = 1.0;
+                    self.resize_dialog.y_scale = 1.0;
+                    self.resize_dialog.z_scale = 1.0;
                     self.resize_dialog.depth = session.committed_summary.z_slices.max(1);
                     self.resize_dialog.frames = session.committed_summary.times.max(1);
                 }
@@ -5846,6 +5942,9 @@ impl ImageUiApp {
                     self.canvas_dialog.height = session.committed_summary.shape[0];
                     self.canvas_dialog.original_width = session.committed_summary.shape[1];
                     self.canvas_dialog.original_height = session.committed_summary.shape[0];
+                    self.canvas_dialog.x_scale = 1.0;
+                    self.canvas_dialog.y_scale = 1.0;
+                    self.canvas_dialog.z_scale = 1.0;
                     self.canvas_dialog.depth = session.committed_summary.z_slices.max(1);
                     self.canvas_dialog.frames = session.committed_summary.times.max(1);
                 }
@@ -7619,6 +7718,7 @@ impl ImageUiApp {
         self.draw_adjust_dialog(ctx, actions);
         self.draw_threshold_apply_dialog(ctx, actions);
         self.draw_apply_lut_dialog(ctx, actions);
+        self.draw_set_display_range_dialog(ctx, actions);
         self.draw_resize_dialog(ctx, actions, false);
         self.draw_resize_dialog(ctx, actions, true);
         self.draw_stack_position_dialog(ctx, actions);
@@ -8321,14 +8421,11 @@ impl ImageUiApp {
                             }
                             ui.end_row();
                             if ui.button("Set").clicked() {
-                                actions.push(UiAction::Command {
-                                    window_label: self.adjust_dialog.window_label.clone(),
-                                    command_id: "image.adjust.brightness".to_string(),
-                                    params: Some(json!({
-                                        "min": self.adjust_dialog.min,
-                                        "max": self.adjust_dialog.max,
-                                    })),
-                                });
+                                self.open_set_display_range_dialog_from_adjust(
+                                    "image.adjust.brightness",
+                                    "min",
+                                    "max",
+                                );
                             }
                             if ui.button("Apply").clicked() {
                                 let window_label = self.adjust_dialog.window_label.clone();
@@ -8446,14 +8543,11 @@ impl ImageUiApp {
                             }
                             ui.end_row();
                             if ui.button("Set").clicked() {
-                                actions.push(UiAction::Command {
-                                    window_label: self.adjust_dialog.window_label.clone(),
-                                    command_id: "image.adjust.window_level".to_string(),
-                                    params: Some(json!({
-                                        "low": self.adjust_dialog.min,
-                                        "high": self.adjust_dialog.max,
-                                    })),
-                                });
+                                self.open_set_display_range_dialog_from_adjust(
+                                    "image.adjust.window_level",
+                                    "low",
+                                    "high",
+                                );
                             }
                             if ui.button("Apply").clicked() {
                                 let window_label = self.adjust_dialog.window_label.clone();
@@ -8557,11 +8651,11 @@ impl ImageUiApp {
                             }
                             ui.end_row();
                             if ui.button("Set").clicked() {
-                                actions.push(UiAction::Command {
-                                    window_label: self.adjust_dialog.window_label.clone(),
-                                    command_id: "image.adjust.color_balance".to_string(),
-                                    params: Some(json!(color_balance_params(&self.adjust_dialog))),
-                                });
+                                self.open_set_display_range_dialog_from_adjust(
+                                    "image.adjust.color_balance",
+                                    "min",
+                                    "max",
+                                );
                             }
                             if ui.button("Apply").clicked() {
                                 let mut params = color_balance_params(&self.adjust_dialog);
@@ -9248,6 +9342,132 @@ impl ImageUiApp {
         }
     }
 
+    fn draw_set_display_range_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.set_display_range_dialog.open {
+            return;
+        }
+
+        let mut open = self.set_display_range_dialog.open;
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("Set Display Range")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("set_display_range_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label("Minimum displayed value:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.set_display_range_dialog.minimum)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+
+                        ui.label("Maximum displayed value:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.set_display_range_dialog.maximum)
+                                .speed(0.1),
+                        );
+                        ui.end_row();
+                    });
+
+                egui::ComboBox::from_label("Unsigned 16-bit range:")
+                    .selected_text(&self.set_display_range_dialog.unsigned_16bit_range)
+                    .show_ui(ui, |ui| {
+                        for range in [
+                            "Automatic",
+                            "8-bit (0-255)",
+                            "10-bit (0-1023)",
+                            "12-bit (0-4095)",
+                            "14-bit (0-16383)",
+                            "15-bit (0-32767)",
+                            "16-bit (0-65535)",
+                        ] {
+                            ui.selectable_value(
+                                &mut self.set_display_range_dialog.unsigned_16bit_range,
+                                range.to_string(),
+                                range,
+                            );
+                        }
+                    });
+
+                let propagate_label = if self.set_display_range_dialog.channel_count > 1 {
+                    format!(
+                        "Propagate to all other {} channel images",
+                        self.set_display_range_dialog.channel_count
+                    )
+                } else {
+                    "Propagate to all other open images".to_string()
+                };
+                ui.checkbox(
+                    &mut self.set_display_range_dialog.propagate,
+                    propagate_label,
+                );
+                if self.set_display_range_dialog.show_all_channels {
+                    let count = self.set_display_range_dialog.channel_count;
+                    let label = if count == 2 {
+                        "Propagate to the other channel of this image".to_string()
+                    } else {
+                        format!(
+                            "Propagate to the other {} channels of this image",
+                            count - 1
+                        )
+                    };
+                    ui.checkbox(&mut self.set_display_range_dialog.all_channels, label);
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        ok = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ok {
+            let mut params = Map::new();
+            params.insert(
+                self.set_display_range_dialog.low_key.clone(),
+                json!(self.set_display_range_dialog.minimum),
+            );
+            params.insert(
+                self.set_display_range_dialog.high_key.clone(),
+                json!(self.set_display_range_dialog.maximum),
+            );
+            params.insert(
+                "unsigned_16bit_range".to_string(),
+                json!(self.set_display_range_dialog.unsigned_16bit_range.clone()),
+            );
+            params.insert(
+                "propagate".to_string(),
+                json!(self.set_display_range_dialog.propagate),
+            );
+            if !self.set_display_range_dialog.channel.is_empty() {
+                params.insert(
+                    "channel".to_string(),
+                    json!(self.set_display_range_dialog.channel.clone()),
+                );
+            }
+            if self.set_display_range_dialog.all_channels {
+                params.insert("all_channels".to_string(), json!(true));
+            }
+            actions.push(UiAction::Command {
+                window_label: self.set_display_range_dialog.window_label.clone(),
+                command_id: self.set_display_range_dialog.command_id.clone(),
+                params: Some(Value::Object(params)),
+            });
+            self.set_display_range_dialog.open = false;
+        } else if cancel {
+            self.set_display_range_dialog.open = false;
+        } else {
+            self.set_display_range_dialog.open = open;
+        }
+    }
+
     fn draw_resize_dialog(
         &mut self,
         ctx: &egui::Context,
@@ -9267,6 +9487,10 @@ impl ImageUiApp {
         let mut close = false;
         let old_width = dialog.width;
         let old_height = dialog.height;
+        let old_x_scale = dialog.x_scale;
+        let old_y_scale = dialog.y_scale;
+        let old_z_scale = dialog.z_scale;
+        let old_depth = dialog.depth;
         let title = if canvas {
             if dialog.depth > 1 || dialog.frames > 1 {
                 "Resize Stack Canvas"
@@ -9274,7 +9498,7 @@ impl ImageUiApp {
                 "Resize Image Canvas"
             }
         } else {
-            "Resize"
+            "Scale"
         };
         egui::Window::new(title).open(&mut open).show(ctx, |ui| {
             egui::Grid::new(if canvas {
@@ -9285,6 +9509,34 @@ impl ImageUiApp {
             .num_columns(2)
             .spacing(egui::vec2(8.0, 4.0))
             .show(ui, |ui| {
+                if !canvas {
+                    ui.label("X Scale:");
+                    ui.add(
+                        egui::DragValue::new(&mut dialog.x_scale)
+                            .range(0.0001..=f32::MAX)
+                            .speed(0.01),
+                    );
+                    ui.end_row();
+
+                    ui.label("Y Scale:");
+                    ui.add(
+                        egui::DragValue::new(&mut dialog.y_scale)
+                            .range(0.0001..=f32::MAX)
+                            .speed(0.01),
+                    );
+                    ui.end_row();
+
+                    if dialog.depth > 1 {
+                        ui.label("Z Scale:");
+                        ui.add(
+                            egui::DragValue::new(&mut dialog.z_scale)
+                                .range(0.0001..=f32::MAX)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                    }
+                }
+
                 ui.label(if canvas { "Width:" } else { "Width (pixels):" });
                 ui.add(egui::DragValue::new(&mut dialog.width).range(1..=usize::MAX));
                 ui.end_row();
@@ -9335,12 +9587,45 @@ impl ImageUiApp {
                 ui.checkbox(&mut dialog.zero_fill, "Zero Fill");
             } else {
                 ui.checkbox(&mut dialog.constrain_aspect, "Constrain aspect ratio");
-                if dialog.constrain_aspect && dialog.width != old_width && dialog.original_width > 0
+                if dialog.x_scale != old_x_scale && dialog.original_width > 0 {
+                    dialog.width = ((dialog.original_width as f32) * dialog.x_scale)
+                        .round()
+                        .max(1.0) as usize;
+                    if dialog.constrain_aspect && dialog.original_height > 0 {
+                        dialog.y_scale = dialog.x_scale;
+                        dialog.height = ((dialog.original_height as f32) * dialog.y_scale)
+                            .round()
+                            .max(1.0) as usize;
+                    }
+                } else if dialog.y_scale != old_y_scale && dialog.original_height > 0 {
+                    dialog.height = ((dialog.original_height as f32) * dialog.y_scale)
+                        .round()
+                        .max(1.0) as usize;
+                    if dialog.constrain_aspect && dialog.original_width > 0 {
+                        dialog.x_scale = dialog.y_scale;
+                        dialog.width = ((dialog.original_width as f32) * dialog.x_scale)
+                            .round()
+                            .max(1.0) as usize;
+                    }
+                } else if dialog.z_scale != old_z_scale && old_depth > 0 {
+                    let original_depth = if old_z_scale > 0.0 {
+                        old_depth as f32 / old_z_scale
+                    } else {
+                        old_depth as f32
+                    };
+                    dialog.depth = (original_depth * dialog.z_scale).round().max(1.0) as usize;
+                } else if dialog.constrain_aspect
+                    && dialog.width != old_width
+                    && dialog.original_width > 0
                 {
                     dialog.height = ((dialog.width as f32)
                         * (dialog.original_height as f32 / dialog.original_width as f32))
                         .round()
                         .max(1.0) as usize;
+                    dialog.x_scale = dialog.width as f32 / dialog.original_width as f32;
+                    if dialog.original_height > 0 {
+                        dialog.y_scale = dialog.height as f32 / dialog.original_height as f32;
+                    }
                 } else if dialog.constrain_aspect
                     && dialog.height != old_height
                     && dialog.original_height > 0
@@ -9349,6 +9634,25 @@ impl ImageUiApp {
                         * (dialog.original_width as f32 / dialog.original_height as f32))
                         .round()
                         .max(1.0) as usize;
+                    dialog.y_scale = dialog.height as f32 / dialog.original_height as f32;
+                    if dialog.original_width > 0 {
+                        dialog.x_scale = dialog.width as f32 / dialog.original_width as f32;
+                    }
+                } else {
+                    if dialog.width != old_width && dialog.original_width > 0 {
+                        dialog.x_scale = dialog.width as f32 / dialog.original_width as f32;
+                    }
+                    if dialog.height != old_height && dialog.original_height > 0 {
+                        dialog.y_scale = dialog.height as f32 / dialog.original_height as f32;
+                    }
+                    if dialog.depth != old_depth && old_depth > 0 {
+                        let original_depth = if old_z_scale > 0.0 {
+                            old_depth as f32 / old_z_scale
+                        } else {
+                            old_depth as f32
+                        };
+                        dialog.z_scale = dialog.depth as f32 / original_depth;
+                    }
                 }
                 ui.checkbox(
                     &mut dialog.average_when_downsizing,
@@ -17502,6 +17806,140 @@ mod tests {
 
         assert!(app.apply_lut_needs_confirmation(&byte_label));
         assert!(!app.apply_lut_needs_confirmation(&float_label));
+    }
+
+    #[test]
+    fn adjust_set_opens_imagej_set_display_range_dialog_state() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/set-range.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U16,
+                )),
+            ),
+        );
+
+        app.open_adjust_dialog(&label, super::AdjustDialogKind::BrightnessContrast);
+        app.adjust_dialog.min = 10.0;
+        app.adjust_dialog.max = 200.0;
+        app.open_set_display_range_dialog_from_adjust("image.adjust.brightness", "min", "max");
+
+        assert!(app.set_display_range_dialog.open);
+        assert_eq!(app.set_display_range_dialog.window_label, label);
+        assert_eq!(
+            app.set_display_range_dialog.command_id,
+            "image.adjust.brightness"
+        );
+        assert_eq!(app.set_display_range_dialog.minimum, 10.0);
+        assert_eq!(app.set_display_range_dialog.maximum, 200.0);
+        assert_eq!(
+            app.set_display_range_dialog.unsigned_16bit_range,
+            "Automatic"
+        );
+    }
+
+    #[test]
+    fn adjust_set_display_range_propagates_to_other_open_images() {
+        let first = "viewer-1".to_string();
+        let second = "viewer-2".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        for label in [&first, &second] {
+            app.state.label_to_session.insert(
+                label.clone(),
+                ViewerSession::new(
+                    PathBuf::from(format!("/tmp/{label}.tif")),
+                    ViewerImageSource::Dataset(dataset_2x2([0.0, 1.0, 2.0, 3.0])),
+                ),
+            );
+        }
+
+        let result = app.dispatch_command(
+            &first,
+            "image.adjust.brightness",
+            Some(json!({"min": 0.5, "max": 2.5, "propagate": true})),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert_eq!(
+            app.state.label_to_session[&first].display_range,
+            Some((0.5, 2.5))
+        );
+        assert_eq!(
+            app.state.label_to_session[&second].display_range,
+            Some((0.5, 2.5))
+        );
+    }
+
+    #[test]
+    fn adjust_set_display_range_can_propagate_to_other_channels() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![10.0, 20.0, 30.0]).expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/channel-set-range.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+
+        let result = app.dispatch_command(
+            &label,
+            "image.adjust.color_balance",
+            Some(json!({"min": 5.0, "max": 25.0, "channel": "Red", "all_channels": true})),
+        );
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        let session = &app.state.label_to_session[&label];
+        assert_eq!(session.channel_display_ranges.get(&0), Some(&(5.0, 25.0)));
+        assert_eq!(session.channel_display_ranges.get(&1), Some(&(5.0, 25.0)));
+        assert_eq!(session.channel_display_ranges.get(&2), Some(&(5.0, 25.0)));
+    }
+
+    #[test]
+    fn adjust_size_dialog_initializes_imagej_scale_fields() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/scale-dialog.tif"),
+                ViewerImageSource::Dataset(dataset_2x2([0.0, 1.0, 2.0, 3.0])),
+            ),
+        );
+
+        let result = app.dispatch_command(&label, "image.adjust.size", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert!(app.resize_dialog.open);
+        assert_eq!(app.resize_dialog.width, 2);
+        assert_eq!(app.resize_dialog.height, 2);
+        assert_eq!(app.resize_dialog.x_scale, 1.0);
+        assert_eq!(app.resize_dialog.y_scale, 1.0);
+        assert_eq!(app.resize_dialog.z_scale, 1.0);
     }
 
     #[test]

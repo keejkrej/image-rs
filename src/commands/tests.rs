@@ -514,6 +514,34 @@ fn image_resize_derives_missing_constrained_dimension() {
 }
 
 #[test]
+fn image_resize_scales_xy_spacing_like_imagej_scaler() {
+    let mut dataset = test_dataset(
+        vec![
+            0.0, 1.0, 2.0, 3.0, //
+            4.0, 5.0, 6.0, 7.0,
+        ],
+        (2, 4),
+    );
+    dataset.metadata.dims[1].spacing = Some(2.0);
+    dataset.metadata.dims[0].spacing = Some(4.0);
+
+    let output = execute_operation(
+        "image.resize",
+        &dataset,
+        &json!({
+            "width": 8,
+            "height": 1,
+            "average_when_downsizing": false
+        }),
+    )
+    .expect("resize");
+
+    assert_eq!(output.dataset.shape(), &[1, 8]);
+    assert_eq!(output.dataset.metadata.dims[1].spacing, Some(1.0));
+    assert_eq!(output.dataset.metadata.dims[0].spacing, Some(8.0));
+}
+
+#[test]
 fn image_resize_scales_stack_depth_and_spacing() {
     let data = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![0.0, 10.0, 20.0]).expect("shape");
     let metadata = Metadata {
@@ -602,6 +630,34 @@ fn image_canvas_resize_uses_imagej_position_anchor() {
             -1.0, -1.0, -1.0, -1.0, //
             -1.0, -1.0, 1.0, 2.0, //
             -1.0, -1.0, 3.0, 4.0,
+        ]
+    );
+}
+
+#[test]
+fn image_canvas_resize_centers_odd_source_in_even_canvas_like_imagej() {
+    let dataset = test_dataset(vec![9.0], (1, 1));
+
+    let output = execute_operation(
+        "image.canvas_resize",
+        &dataset,
+        &json!({
+            "width": 4,
+            "height": 4,
+            "fill": -1.0,
+            "position": "Center"
+        }),
+    )
+    .expect("canvas resize");
+
+    assert_eq!(output.dataset.shape(), &[4, 4]);
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![
+            -1.0, -1.0, -1.0, -1.0, //
+            -1.0, 9.0, -1.0, -1.0, //
+            -1.0, -1.0, -1.0, -1.0, //
+            -1.0, -1.0, -1.0, -1.0,
         ]
     );
 }
