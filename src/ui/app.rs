@@ -108,6 +108,14 @@ impl ThresholdOverlayMode {
             _ => Self::Red,
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::BlackAndWhite => "B&W",
+            Self::OverUnder => "Over/Under",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3361,6 +3369,7 @@ impl ImageUiApp {
             .is_some_and(selected_roi_spline_fit);
         self.adjust_dialog.color_balance_lut_color = false;
         self.adjust_dialog.contrast_auto_threshold = 0;
+        let mut existing_threshold = None;
 
         if let Some(session) = self.state.label_to_session.get(&target) {
             self.adjust_dialog.default_min = self
@@ -3394,6 +3403,9 @@ impl ImageUiApp {
                     .cloned()
                     .unwrap_or_else(|| "Red".to_string());
             }
+            if kind == AdjustDialogKind::Threshold {
+                existing_threshold = session.threshold_overlay;
+            }
             sync_brightness_contrast_from_min_max(&mut self.adjust_dialog);
             let width = session.committed_summary.shape.get(1).copied().unwrap_or(1) as f32;
             let height = session
@@ -3415,6 +3427,27 @@ impl ImageUiApp {
                         width,
                         height,
                     );
+                }
+            }
+        }
+
+        if kind == AdjustDialogKind::Threshold {
+            if let Some(threshold) = existing_threshold {
+                self.adjust_dialog.min = threshold.low;
+                self.adjust_dialog.max = threshold.high;
+                self.adjust_dialog.threshold_mode = threshold.mode.label().to_string();
+            } else {
+                if let Err(error) = self.set_threshold_overlay(
+                    &target,
+                    &json!({
+                        "method": threshold_method_param(&self.adjust_dialog.threshold_method),
+                        "mode": self.adjust_dialog.threshold_mode,
+                        "stack": self.adjust_dialog.threshold_stack_histogram,
+                        "sixteen_bit": self.adjust_dialog.threshold_sixteen_bit_histogram,
+                        "background": threshold_background_param(self.adjust_dialog.dark_background),
+                    }),
+                ) {
+                    return command_registry::CommandExecuteResult::blocked(error);
                 }
             }
         }
@@ -19531,6 +19564,87 @@ mod tests {
         ));
         assert!(result.message.contains("grayscale"));
         assert!(result.message.contains("Color Threshold"));
+    }
+
+    #[test]
+    fn threshold_dialog_open_auto_thresholds_like_imagej() {
+        let label = "viewer-1".to_string();
+        let dataset = dataset_2x2_with_pixel_type([0.0, 0.0, 100.0, 100.0], PixelType::U8);
+        let mut app = ImageUiApp::new_for_test();
+        app.adjust_dialog.threshold_method = "Mean".to_string();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/threshold-open.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "threshold-open".to_string()),
+        );
+
+        let result = app.dispatch_command(&label, "image.adjust.threshold", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert!(app.adjust_dialog.open);
+        assert_eq!(app.adjust_dialog.kind, super::AdjustDialogKind::Threshold);
+        let threshold = app
+            .state
+            .label_to_session
+            .get(&label)
+            .and_then(|session| session.threshold_overlay)
+            .expect("threshold overlay");
+        assert_eq!(app.adjust_dialog.min, threshold.low);
+        assert_eq!(app.adjust_dialog.max, threshold.high);
+        assert!(threshold.low > 0.0, "threshold low was {}", threshold.low);
+        assert_eq!(threshold.high, 100.0);
+    }
+
+    #[test]
+    fn threshold_dialog_open_reuses_existing_threshold_like_imagej() {
+        let label = "viewer-1".to_string();
+        let dataset = dataset_2x2_with_pixel_type([0.0, 5.0, 10.0, 20.0], PixelType::U8);
+        let mut session = ViewerSession::new(
+            PathBuf::from("/tmp/threshold-existing.tif"),
+            ViewerImageSource::Dataset(dataset),
+        );
+        session.set_threshold_overlay(Some(ThresholdOverlay {
+            low: 5.0,
+            high: 10.0,
+            mode: ThresholdOverlayMode::OverUnder,
+        }));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(label.clone(), session);
+        app.viewers_ui.insert(
+            label.clone(),
+            ViewerUiState::new(&label, "threshold-existing".to_string()),
+        );
+
+        let result = app.dispatch_command(&label, "image.adjust.threshold", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Ok
+        ));
+        assert!(app.adjust_dialog.open);
+        assert_eq!(app.adjust_dialog.min, 5.0);
+        assert_eq!(app.adjust_dialog.max, 10.0);
+        assert_eq!(app.adjust_dialog.threshold_mode, "Over/Under");
+        assert_eq!(
+            app.state
+                .label_to_session
+                .get(&label)
+                .and_then(|session| session.threshold_overlay),
+            Some(ThresholdOverlay {
+                low: 5.0,
+                high: 10.0,
+                mode: ThresholdOverlayMode::OverUnder,
+            })
+        );
     }
 
     #[test]
