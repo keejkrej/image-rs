@@ -2714,9 +2714,15 @@ fn rgb_to_hsb_255(r: f32, g: f32, b: f32) -> [f32; 3] {
 
 fn rgb_to_yuv_255(r: f32, g: f32, b: f32) -> [f32; 3] {
     let y = 0.299 * r + 0.587 * g + 0.114 * b;
-    let u = (0.492 * (b - y) + 128.0).clamp(0.0, 255.0);
-    let v = (0.877 * (r - y) + 128.0).clamp(0.0, 255.0);
-    [y.clamp(0.0, 255.0), u, v]
+    [
+        imagej_byte_value((y + 0.5).floor() as i32),
+        imagej_byte_value(128 + (0.493 * (b - y) + 0.5).floor() as i32),
+        imagej_byte_value(128 + (0.877 * (r - y) + 0.5).floor() as i32),
+    ]
+}
+
+fn imagej_byte_value(value: i32) -> f32 {
+    value.rem_euclid(256) as f32
 }
 
 fn rgb_to_lab_255(r: f32, g: f32, b: f32) -> [f32; 3] {

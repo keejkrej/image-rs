@@ -1339,6 +1339,45 @@ fn image_color_threshold_accepts_cie_lab_alias() {
 }
 
 #[test]
+fn image_color_threshold_yuv_matches_imagej_byte_wrapping() {
+    let data = Array::from_shape_vec(
+        IxDyn(&[1, 2, 3]),
+        vec![
+            255.0, 0.0, 0.0, //
+            0.0, 0.0, 255.0,
+        ],
+    )
+    .expect("shape");
+    let metadata = Metadata {
+        dims: vec![
+            Dim::new(AxisKind::Y, 1),
+            Dim::new(AxisKind::X, 2),
+            Dim::new(AxisKind::Channel, 3),
+        ],
+        pixel_type: PixelType::U8,
+        ..Metadata::default()
+    };
+    let dataset = Dataset::new(data, metadata).expect("dataset");
+
+    let output = execute_operation(
+        "image.color_threshold",
+        &dataset,
+        &json!({
+            "color_space": "YUV",
+            "hue": {"min": 0.0, "max": 255.0, "pass": true},
+            "saturation": {"min": 0.0, "max": 255.0, "pass": true},
+            "brightness": {"min": 29.0, "max": 29.0, "pass": true}
+        }),
+    )
+    .expect("color threshold yuv");
+
+    assert_eq!(
+        output.dataset.data.iter().copied().collect::<Vec<_>>(),
+        vec![255.0, 0.0]
+    );
+}
+
+#[test]
 fn image_convert_pixel_types_use_raw_integer_ranges() {
     let dataset = test_dataset(vec![0.0, 1.0, 0.5, 0.25], (2, 2));
     let u8_output =

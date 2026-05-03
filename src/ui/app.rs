@@ -15433,9 +15433,15 @@ fn rgb_to_hsb_255_local(r: f32, g: f32, b: f32) -> [f32; 3] {
 
 fn rgb_to_yuv_255_local(r: f32, g: f32, b: f32) -> [f32; 3] {
     let y = 0.299 * r + 0.587 * g + 0.114 * b;
-    let u = (0.492 * (b - y) + 128.0).clamp(0.0, 255.0);
-    let v = (0.877 * (r - y) + 128.0).clamp(0.0, 255.0);
-    [y.clamp(0.0, 255.0), u, v]
+    [
+        imagej_byte_value_local((y + 0.5).floor() as i32),
+        imagej_byte_value_local(128 + (0.493 * (b - y) + 0.5).floor() as i32),
+        imagej_byte_value_local(128 + (0.877 * (r - y) + 0.5).floor() as i32),
+    ]
+}
+
+fn imagej_byte_value_local(value: i32) -> f32 {
+    value.rem_euclid(256) as f32
 }
 
 fn rgb_to_lab_255_local(r: f32, g: f32, b: f32) -> [f32; 3] {
@@ -19754,6 +19760,30 @@ mod tests {
 
         assert_eq!(sample.ranges[0], (1.0, 254.0));
         assert_eq!(sample.passes, [false, true, true]);
+    }
+
+    #[test]
+    fn color_threshold_sample_yuv_uses_imagej_byte_wrapping() {
+        let data = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![255.0, 0.0, 0.0]).expect("shape");
+        let dataset = DatasetF32::new(
+            data,
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 1),
+                    Dim::new(AxisKind::X, 1),
+                    Dim::new(AxisKind::Channel, 3),
+                ],
+                pixel_type: PixelType::U8,
+                ..Metadata::default()
+            },
+        )
+        .expect("dataset");
+
+        let sample = sample_color_threshold_ranges_with_passes(&dataset, (0, 0, 0, 0), 0, 0, "YUV")
+            .expect("sample ranges");
+
+        assert_eq!(sample.ranges, [(76.0, 76.0), (90.0, 90.0), (29.0, 29.0)]);
+        assert_eq!(sample.passes, [true, true, true]);
     }
 
     #[test]
