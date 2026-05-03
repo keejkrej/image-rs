@@ -674,6 +674,7 @@ struct ImageUiApp {
     new_image_dialog: NewImageDialogState,
     adjust_dialog: AdjustDialogState,
     threshold_apply_dialog: ThresholdApplyDialogState,
+    threshold_set_dialog: ThresholdSetDialogState,
     apply_lut_dialog: ApplyLutDialogState,
     set_display_range_dialog: SetDisplayRangeDialogState,
     resize_dialog: ResizeDialogState,
@@ -729,6 +730,7 @@ impl ImageUiApp {
             new_image_dialog: NewImageDialogState::default(),
             adjust_dialog: AdjustDialogState::default(),
             threshold_apply_dialog: ThresholdApplyDialogState::default(),
+            threshold_set_dialog: ThresholdSetDialogState::default(),
             apply_lut_dialog: ApplyLutDialogState::default(),
             set_display_range_dialog: SetDisplayRangeDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
@@ -785,6 +787,7 @@ impl ImageUiApp {
             new_image_dialog: NewImageDialogState::default(),
             adjust_dialog: AdjustDialogState::default(),
             threshold_apply_dialog: ThresholdApplyDialogState::default(),
+            threshold_set_dialog: ThresholdSetDialogState::default(),
             apply_lut_dialog: ApplyLutDialogState::default(),
             set_display_range_dialog: SetDisplayRangeDialogState::default(),
             resize_dialog: ResizeDialogState::default(),
@@ -3372,6 +3375,25 @@ impl ImageUiApp {
         command_registry::CommandExecuteResult::ok(format!("{} dialog opened", kind.title()))
     }
 
+    fn threshold_adjuster_supports_viewer(&self, window_label: &str) -> Result<(), String> {
+        let target = self
+            .current_viewer_label(window_label)
+            .unwrap_or(window_label)
+            .to_string();
+        let session = self
+            .state
+            .label_to_session
+            .get(&target)
+            .ok_or_else(|| format!("no viewer session for `{target}`"))?;
+        if session.committed_summary.channels >= 3 {
+            return Err(
+                "Image>Adjust>Threshold only works with grayscale images; use Image>Adjust>Color Threshold for RGB images"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     fn open_set_display_range_dialog_from_adjust(
         &mut self,
         command_id: &str,
@@ -3405,6 +3427,17 @@ impl ImageUiApp {
                 && channel != "All",
             channel,
             channel_count,
+        };
+    }
+
+    fn open_threshold_set_dialog_from_adjust(&mut self) {
+        self.threshold_set_dialog = ThresholdSetDialogState {
+            open: true,
+            window_label: self.adjust_dialog.window_label.clone(),
+            min: self.adjust_dialog.min,
+            max: self.adjust_dialog.max,
+            mode: self.adjust_dialog.threshold_mode.clone(),
+            dark_background: self.adjust_dialog.dark_background,
         };
     }
 
@@ -6104,6 +6137,9 @@ impl ImageUiApp {
             }
             "image.adjust.threshold" => {
                 if request.params.is_none() {
+                    if let Err(error) = self.threshold_adjuster_supports_viewer(window_label) {
+                        return command_registry::CommandExecuteResult::blocked(error);
+                    }
                     return self.open_adjust_dialog(window_label, AdjustDialogKind::Threshold);
                 }
                 let params = command_registry::merge_params(&request.command_id, request.params);
@@ -7717,6 +7753,7 @@ impl ImageUiApp {
         self.draw_new_image_dialog(ctx, actions);
         self.draw_adjust_dialog(ctx, actions);
         self.draw_threshold_apply_dialog(ctx, actions);
+        self.draw_threshold_set_dialog(ctx, actions);
         self.draw_apply_lut_dialog(ctx, actions);
         self.draw_set_display_range_dialog(ctx, actions);
         self.draw_resize_dialog(ctx, actions, false);
@@ -8953,18 +8990,7 @@ impl ImageUiApp {
                             });
                         }
                         if ui.button("Set").clicked() {
-                            actions.push(UiAction::Command {
-                                window_label: self.adjust_dialog.window_label.clone(),
-                                command_id: "image.adjust.threshold".to_string(),
-                                params: Some(json!({
-                                    "min": self.adjust_dialog.min,
-                                    "max": self.adjust_dialog.max,
-                                    "mode": self.adjust_dialog.threshold_mode,
-                                    "background": threshold_background_param(
-                                        self.adjust_dialog.dark_background
-                                    ),
-                                })),
-                            });
+                            self.open_threshold_set_dialog_from_adjust();
                         }
                     });
                 }
@@ -9042,6 +9068,9 @@ impl ImageUiApp {
                     let dark_background_changed = ui
                         .checkbox(&mut self.adjust_dialog.dark_background, "Dark background")
                         .changed();
+                    if color_space_changed {
+                        reset_color_threshold_bands_for_space(&mut self.adjust_dialog);
+                    }
                     if color_space_changed || method_changed || dark_background_changed {
                         let mut params = color_threshold_params(&self.adjust_dialog);
                         if let Value::Object(map) = &mut params {
@@ -9302,6 +9331,65 @@ impl ImageUiApp {
             self.threshold_apply_dialog.open = false;
         } else {
             self.threshold_apply_dialog.open = open;
+        }
+    }
+
+    fn draw_threshold_set_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if !self.threshold_set_dialog.open {
+            return;
+        }
+
+        let mut open = self.threshold_set_dialog.open;
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("Set Threshold Levels")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                egui::Grid::new("set_threshold_levels_grid")
+                    .num_columns(2)
+                    .spacing(egui::vec2(8.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label("Lower threshold level:");
+                        ui.add(egui::DragValue::new(&mut self.threshold_set_dialog.min).speed(0.1));
+                        ui.end_row();
+
+                        ui.label("Upper threshold level:");
+                        ui.add(egui::DragValue::new(&mut self.threshold_set_dialog.max).speed(0.1));
+                        ui.end_row();
+                    });
+
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        ok = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if ok {
+            if self.threshold_set_dialog.max < self.threshold_set_dialog.min {
+                self.threshold_set_dialog.max = self.threshold_set_dialog.min;
+            }
+            actions.push(UiAction::Command {
+                window_label: self.threshold_set_dialog.window_label.clone(),
+                command_id: "image.adjust.threshold".to_string(),
+                params: Some(json!({
+                    "min": self.threshold_set_dialog.min,
+                    "max": self.threshold_set_dialog.max,
+                    "mode": self.threshold_set_dialog.mode,
+                    "background": threshold_background_param(
+                        self.threshold_set_dialog.dark_background
+                    ),
+                })),
+            });
+            self.threshold_set_dialog.open = false;
+        } else if cancel {
+            self.threshold_set_dialog.open = false;
+        } else {
+            self.threshold_set_dialog.open = open;
         }
     }
 
@@ -14042,6 +14130,18 @@ fn color_threshold_params(dialog: &AdjustDialogState) -> Value {
     })
 }
 
+fn reset_color_threshold_bands_for_space(dialog: &mut AdjustDialogState) {
+    dialog.hue_min = 0.0;
+    dialog.hue_max = 255.0;
+    dialog.saturation_min = 0.0;
+    dialog.saturation_max = 255.0;
+    dialog.brightness_min = 0.0;
+    dialog.brightness_max = 255.0;
+    dialog.hue_pass = true;
+    dialog.saturation_pass = true;
+    dialog.brightness_pass = true;
+}
+
 fn color_threshold_space_key(space: &str) -> String {
     match space
         .chars()
@@ -15059,17 +15159,17 @@ mod tests {
         macro_source_named_blocks, mask_foreground_bbox, mask_foreground_roi, new_image_dataset,
         overlay_element_rows, overlay_from_roi_manager, overlay_label_for_roi,
         overlay_to_roi_manager, parse_macro_command_line, preview_cache_key,
-        remove_stack_slice_labels_dataset, renamed_image_path, results_distribution,
-        results_rows_to_dataset, results_summary_rows, roi_kind_bbox, roi_label_anchor,
-        roi_stroke_width, sample_color_threshold_ranges, sanitize_image_title,
-        selection_properties_row, set_stack_slice_label_dataset,
-        set_threshold_sixteen_bit_histogram, should_request_periodic_repaint,
-        should_request_repaint_now, source_ptr_eq, stack_measurement_rows,
-        stack_position_from_params, stack_slice_label, stack_slice_path, stack_to_image_datasets,
-        stack_xy_profile_rows, startup_auto_run_macro_block, strip_macro_line_comment,
-        threshold_method_labels, threshold_method_param, to_color_image_with_threshold,
-        tool_from_command_id, tool_shortcut_command, viewer_sort_key, xy_coordinate_rows,
-        zoom_set_params,
+        remove_stack_slice_labels_dataset, renamed_image_path,
+        reset_color_threshold_bands_for_space, results_distribution, results_rows_to_dataset,
+        results_summary_rows, roi_kind_bbox, roi_label_anchor, roi_stroke_width,
+        sample_color_threshold_ranges, sanitize_image_title, selection_properties_row,
+        set_stack_slice_label_dataset, set_threshold_sixteen_bit_histogram,
+        should_request_periodic_repaint, should_request_repaint_now, source_ptr_eq,
+        stack_measurement_rows, stack_position_from_params, stack_slice_label, stack_slice_path,
+        stack_to_image_datasets, stack_xy_profile_rows, startup_auto_run_macro_block,
+        strip_macro_line_comment, threshold_method_labels, threshold_method_param,
+        to_color_image_with_threshold, tool_from_command_id, tool_shortcut_command,
+        viewer_sort_key, xy_coordinate_rows, zoom_set_params,
     };
     use tempfile::tempdir;
 
@@ -18014,6 +18114,69 @@ mod tests {
     }
 
     #[test]
+    fn threshold_set_opens_imagej_threshold_levels_dialog_state() {
+        let label = "viewer-1".to_string();
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/threshold-set.tif"),
+                ViewerImageSource::Dataset(dataset_2x2_with_pixel_type(
+                    [0.0, 64.0, 128.0, 255.0],
+                    PixelType::U8,
+                )),
+            ),
+        );
+
+        app.open_adjust_dialog(&label, super::AdjustDialogKind::Threshold);
+        app.adjust_dialog.min = 64.0;
+        app.adjust_dialog.max = 192.0;
+        app.adjust_dialog.threshold_mode = "Over/Under".to_string();
+        app.adjust_dialog.dark_background = false;
+        app.open_threshold_set_dialog_from_adjust();
+
+        assert!(app.threshold_set_dialog.open);
+        assert_eq!(app.threshold_set_dialog.window_label, label);
+        assert_eq!(app.threshold_set_dialog.min, 64.0);
+        assert_eq!(app.threshold_set_dialog.max, 192.0);
+        assert_eq!(app.threshold_set_dialog.mode, "Over/Under");
+        assert!(!app.threshold_set_dialog.dark_background);
+    }
+
+    #[test]
+    fn threshold_adjuster_rejects_rgb_images_like_imagej() {
+        let label = "viewer-1".to_string();
+        let data = Array::from_shape_vec(IxDyn(&[1, 1, 3]), vec![10.0, 20.0, 30.0]).expect("shape");
+        let metadata = Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 1),
+                Dim::new(AxisKind::X, 1),
+                Dim::new(AxisKind::Channel, 3),
+            ],
+            pixel_type: PixelType::U8,
+            ..Metadata::default()
+        };
+        let dataset = Arc::new(DatasetF32::new(data, metadata).expect("dataset"));
+        let mut app = ImageUiApp::new_for_test();
+        app.state.label_to_session.insert(
+            label.clone(),
+            ViewerSession::new(
+                PathBuf::from("/tmp/rgb-threshold.tif"),
+                ViewerImageSource::Dataset(dataset),
+            ),
+        );
+
+        let result = app.dispatch_command(&label, "image.adjust.threshold", None);
+
+        assert!(matches!(
+            result.status,
+            crate::ui::command_registry::CommandExecuteStatus::Blocked
+        ));
+        assert!(result.message.contains("grayscale"));
+        assert!(result.message.contains("Color Threshold"));
+    }
+
+    #[test]
     fn threshold_overlay_renders_without_committing_pixels() {
         let original = dataset_2x2_with_pixel_type([0.0, 5.0, 10.0, 20.0], PixelType::U8);
         let mut session = ViewerSession::new(
@@ -18283,6 +18446,34 @@ mod tests {
         assert_eq!(ranges[0], (0.0, 255.0));
         assert_eq!(ranges[1], (0.0, 255.0));
         assert!(ranges[2].0 > 100.0 && ranges[2].1 == 255.0);
+    }
+
+    #[test]
+    fn color_threshold_space_change_resets_bands_like_imagej() {
+        let mut dialog = AdjustDialogState {
+            hue_min: 10.0,
+            hue_max: 20.0,
+            saturation_min: 30.0,
+            saturation_max: 40.0,
+            brightness_min: 50.0,
+            brightness_max: 60.0,
+            hue_pass: false,
+            saturation_pass: false,
+            brightness_pass: false,
+            ..AdjustDialogState::default()
+        };
+
+        reset_color_threshold_bands_for_space(&mut dialog);
+
+        assert_eq!(dialog.hue_min, 0.0);
+        assert_eq!(dialog.hue_max, 255.0);
+        assert_eq!(dialog.saturation_min, 0.0);
+        assert_eq!(dialog.saturation_max, 255.0);
+        assert_eq!(dialog.brightness_min, 0.0);
+        assert_eq!(dialog.brightness_max, 255.0);
+        assert!(dialog.hue_pass);
+        assert!(dialog.saturation_pass);
+        assert!(dialog.brightness_pass);
     }
 
     #[test]

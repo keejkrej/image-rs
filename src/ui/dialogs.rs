@@ -240,6 +240,29 @@ impl Default for ThresholdApplyDialogState {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct ThresholdSetDialogState {
+    pub(super) open: bool,
+    pub(super) window_label: String,
+    pub(super) min: f32,
+    pub(super) max: f32,
+    pub(super) mode: String,
+    pub(super) dark_background: bool,
+}
+
+impl Default for ThresholdSetDialogState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            window_label: String::new(),
+            min: 0.0,
+            max: 255.0,
+            mode: "Red".to_string(),
+            dark_background: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ApplyLutDialogState {
     pub(super) open: bool,
     pub(super) window_label: String,
