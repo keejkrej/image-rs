@@ -2276,6 +2276,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2356,6 +2357,7 @@ dependencies = [
 [[package]]
 name = "gpui_ce_util"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "anyhow",
  "log",
@@ -2364,6 +2366,7 @@ dependencies = [
 [[package]]
 name = "gpui_collections"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "indexmap",
  "rustc-hash 2.1.1",
@@ -2372,6 +2375,7 @@ dependencies = [
 [[package]]
 name = "gpui_derive_refineable"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2381,6 +2385,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -2430,6 +2435,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2473,6 +2479,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2483,6 +2490,7 @@ dependencies = [
 [[package]]
 name = "gpui_media"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -2497,6 +2505,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
@@ -2509,6 +2518,7 @@ dependencies = [
 [[package]]
 name = "gpui_refineable"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "gpui_derive_refineable",
 ]
@@ -2516,6 +2526,7 @@ dependencies = [
 [[package]]
 name = "gpui_scheduler"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "async-task",
  "backtrace",
@@ -2530,6 +2541,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "schemars",
  "serde",
@@ -2539,6 +2551,7 @@ dependencies = [
 [[package]]
 name = "gpui_sum_tree"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "heapless",
  "log",
@@ -2549,6 +2562,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -2571,6 +2585,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2599,6 +2614,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -2625,6 +2641,7 @@ dependencies = [
 [[package]]
 name = "gpui_zed_util"
 version = "0.2.2"
+source = "git+https://github.com/keejkrej/gpui-ce.git?rev=60436515630ef254bfa17d51d1bb717a51d66f37#60436515630ef254bfa17d51d1bb717a51d66f37"
 dependencies = [
  "anyhow",
  "async-fs",
