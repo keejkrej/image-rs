@@ -590,7 +590,7 @@ impl ImageViewerWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         let weak_app = app.downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             let Some(app) = weak_app.upgrade() else {
@@ -636,7 +636,7 @@ impl MenuPopupWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         cx.observe_window_activation(window, |popup, window, cx| {
             if popup.ready && !window.is_window_active() {
                 let app = popup.app.downgrade();
@@ -663,7 +663,7 @@ impl MenuPopupWindow {
 impl AppDialogWindow {
     fn new(app: gpui::Entity<ImageJApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
         Self {
             app,
@@ -676,7 +676,7 @@ impl AppDialogWindow {
 impl ResultsWindow {
     fn new(app: gpui::Entity<ImageJApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
         Self {
             app,
@@ -689,7 +689,7 @@ impl ResultsWindow {
 impl RoiManagerWindow {
     fn new(app: gpui::Entity<ImageJApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
         Self {
             app,
@@ -702,7 +702,7 @@ impl RoiManagerWindow {
 impl DisplayAdjustWindow {
     fn new(app: gpui::Entity<ImageJApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         cx.observe(&app, |_, _, cx| cx.notify()).detach();
         Self {
             app,
@@ -715,7 +715,7 @@ impl DisplayAdjustWindow {
 impl ImageJApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle, cx);
+        window.focus(&focus_handle);
         let weak_app = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             let Some(app) = weak_app.upgrade() else {
@@ -931,7 +931,7 @@ impl ImageJApp {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(420.0), px(200.0))),
-            kind: WindowKind::Dialog,
+            kind: WindowKind::Floating,
             titlebar: Some(TitlebarOptions {
                 title: Some(SharedString::from(title)),
                 appears_transparent: false,
@@ -1264,6 +1264,25 @@ impl ImageJApp {
             self.status = format!("Closed {}", closed.title);
         }
         cx.notify();
+    }
+
+    fn tracked_window_ids(&self) -> Vec<WindowId> {
+        let mut ids = Vec::with_capacity(self.viewer_windows.len() + 6);
+        ids.push(self.launcher_window.window_id());
+        ids.extend(self.viewer_windows.keys().copied());
+        ids.extend(
+            [
+                self.menu_popup,
+                self.dialog_window,
+                self.results_window,
+                self.roi_manager_window,
+                self.display_adjust_window,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|handle| handle.window_id()),
+        );
+        ids
     }
 
     fn open_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>, cx: &mut Context<Self>) {
@@ -6463,7 +6482,6 @@ impl ImageJApp {
         window.set_window_title(&title);
         if let Some(tab) = viewer_id.and_then(|id| self.tab(id)) {
             window.set_window_edited(tab.dirty);
-            window.set_document_path(tab.path.as_deref());
         }
 
         let mut root = div()
@@ -8177,12 +8195,11 @@ fn install_key_bindings(cx: &mut App) {
 }
 
 pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui::Application::new().run(move |cx: &mut App| {
         install_key_bindings(cx);
         cx.set_menus(vec![
             Menu {
                 name: "File".into(),
-                disabled: false,
                 items: vec![
                     MenuItem::action("New", NewImage),
                     MenuItem::action("Open…", OpenImage),
@@ -8195,7 +8212,6 @@ pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
             },
             Menu {
                 name: "Edit".into(),
-                disabled: false,
                 items: vec![
                     MenuItem::action("Undo", Undo),
                     MenuItem::action("Redo", Redo),
@@ -8233,11 +8249,23 @@ pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
                 cx.quit();
             }
         });
-        cx.on_window_closed(move |cx, window_id| {
+        cx.on_window_closed(move |cx| {
+            let open_window_ids = cx
+                .windows()
+                .into_iter()
+                .map(|handle| handle.window_id())
+                .collect::<HashSet<_>>();
             let weak_app = weak_app.clone();
             cx.defer(move |cx| {
                 if let Some(app) = weak_app.upgrade() {
-                    app.update(cx, |app, cx| app.handle_window_closed(window_id, cx));
+                    let closed_window_id = app
+                        .read(cx)
+                        .tracked_window_ids()
+                        .into_iter()
+                        .find(|window_id| !open_window_ids.contains(window_id));
+                    if let Some(window_id) = closed_window_id {
+                        app.update(cx, |app, cx| app.handle_window_closed(window_id, cx));
+                    }
                 }
             });
         })

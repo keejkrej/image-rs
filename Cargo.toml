@@ -17,8 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-gpui = { git = "https://github.com/keejkrej/gpui-ce.git", rev = "60436515630ef254bfa17d51d1bb717a51d66f37" }
-gpui_platform = { git = "https://github.com/keejkrej/gpui-ce.git", rev = "60436515630ef254bfa17d51d1bb717a51d66f37" }
+gpui = { package = "gpui-ce", version = "0.3.3" }
 image = "0.25"
 morpholib-rs = { git = "https://github.com/keejkrej/morpholib-rs", optional = true }
 ndarray = { version = "0.16", features = ["rayon"] }
