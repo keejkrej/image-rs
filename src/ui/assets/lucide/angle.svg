@@ -1,0 +1,2 @@
+<!-- ImageJ-specific companion icon, styled to match Lucide -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#334155" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 19 10 7l11 10"/><circle cx="3" cy="19" r="1" fill="#334155"/><circle cx="10" cy="7" r="1" fill="#334155"/><circle cx="21" cy="17" r="1" fill="#334155"/></svg>

@@ -5,25 +5,25 @@ use crate::model::DatasetF32;
 use serde_json::Value;
 
 use super::{
-    ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCalibrateOp, ImageCanvasResizeOp,
-    ImageColorThresholdOp, ImageConvertOp, ImageConvolveOp, ImageCoordinatesOp, ImageCropOp,
-    ImageFftBandpassOp, ImageFftPowerSpectrumOp, ImageFindEdgesOp, ImageFindMaximaOp, ImageFlipOp,
-    ImageHyperstackReduceDimensionalityOp, ImageHyperstackSubsetOp, ImageHyperstackToStackOp,
-    ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp, ImageRemoveNaNsOp,
-    ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp, ImageScaleOp,
-    ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp, ImageStackAddSliceOp,
-    ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp, ImageStackMontageOp,
-    ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp, ImageStackStatisticsOp,
-    ImageStackSubstackOp, ImageStackToHyperstackOp, ImageStackZProfileOp, ImageStackZProjectOp,
-    ImageSubtractBackgroundOp, ImageSurfacePlotOp, ImageSwapQuadrantsOp, ImageTranslateOp,
-    ImageUnsharpMaskOp, IntensityEnhanceContrastOp, IntensityInvertOp, IntensityMathOp,
-    IntensityNaNBackgroundOp, IntensityNormalizeOp, IntensityWindowOp, MeasurementsHistogramOp,
-    MeasurementsProfileOp, MeasurementsSummaryOp, MorphologyBinaryMedianOp, MorphologyCloseOp,
-    MorphologyDilateOp, MorphologyDistanceMapOp, MorphologyErodeOp, MorphologyFillHolesOp,
-    MorphologyOpenOp, MorphologyOutlineOp, MorphologySkeletonizeOp, MorphologyUltimatePointsOp,
-    MorphologyVoronoiOp, MorphologyWatershedOp, NoiseGaussianOp, NoiseSaltAndPepperOp, OpOutput,
-    OpSchema, Operation, OpsError, Result, ThresholdFixedOp, ThresholdMakeBinaryOp,
-    ThresholdOtsuOp,
+    AnalyzeParticlesOp, ComponentsLabelOp, GaussianBlurOp, ImageBinOp, ImageCalibrateOp,
+    ImageCanvasResizeOp, ImageColorThresholdOp, ImageConvertOp, ImageConvolveOp,
+    ImageCoordinatesOp, ImageCropOp, ImageFftBandpassOp, ImageFftPowerSpectrumOp, ImageFindEdgesOp,
+    ImageFindMaximaOp, ImageFlipOp, ImageHyperstackReduceDimensionalityOp, ImageHyperstackSubsetOp,
+    ImageHyperstackToStackOp, ImageMedianFilterOp, ImageRankFilter3dOp, ImageRankFilterOp,
+    ImageRemoveNaNsOp, ImageRemoveOutliersOp, ImageResizeOp, ImageRotate90Op, ImageRotateOp,
+    ImageScaleOp, ImageSetScaleOp, ImageShadowDemoOp, ImageShadowOp, ImageSharpenOp,
+    ImageStackAddSliceOp, ImageStackDeleteSliceOp, ImageStackGroupedZProjectOp,
+    ImageStackMontageOp, ImageStackMontageToStackOp, ImageStackReduceOp, ImageStackResliceOp,
+    ImageStackStatisticsOp, ImageStackSubstackOp, ImageStackToHyperstackOp, ImageStackZProfileOp,
+    ImageStackZProjectOp, ImageSubtractBackgroundOp, ImageSurfacePlotOp, ImageSwapQuadrantsOp,
+    ImageTranslateOp, ImageUnsharpMaskOp, IntensityEnhanceContrastOp, IntensityInvertOp,
+    IntensityMathOp, IntensityNaNBackgroundOp, IntensityNormalizeOp, IntensityWindowOp,
+    MeasurementsHistogramOp, MeasurementsProfileOp, MeasurementsSummaryOp,
+    MorphologyBinaryMedianOp, MorphologyCloseOp, MorphologyDilateOp, MorphologyDistanceMapOp,
+    MorphologyErodeOp, MorphologyFillHolesOp, MorphologyOpenOp, MorphologyOutlineOp,
+    MorphologySkeletonizeOp, MorphologyUltimatePointsOp, MorphologyVoronoiOp,
+    MorphologyWatershedOp, NoiseGaussianOp, NoiseSaltAndPepperOp, OpOutput, OpSchema, Operation,
+    OpsError, Result, ThresholdFixedOp, ThresholdMakeBinaryOp, ThresholdOtsuOp,
 };
 #[cfg(feature = "morpholib")]
 use super::{
@@ -118,6 +118,7 @@ fn registry() -> &'static Registry {
         register(&mut map, MorphologySkeletonizeOp);
         register(&mut map, NoiseGaussianOp);
         register(&mut map, NoiseSaltAndPepperOp);
+        register(&mut map, AnalyzeParticlesOp);
         register(&mut map, ComponentsLabelOp);
         #[cfg(feature = "morpholib")]
         register(&mut map, MorpholibjChamferDistanceOp);

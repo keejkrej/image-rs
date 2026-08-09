@@ -80,6 +80,7 @@ fn contains_required_operations() {
     assert!(names.contains(&"threshold.otsu".to_string()));
     assert!(names.contains(&"measurements.histogram".to_string()));
     assert!(names.contains(&"measurements.profile".to_string()));
+    assert!(names.contains(&"measurements.particles".to_string()));
     assert!(names.contains(&"components.label".to_string()));
     assert!(names.contains(&"noise.gaussian".to_string()));
     assert!(names.contains(&"noise.salt_and_pepper".to_string()));
@@ -4290,6 +4291,188 @@ fn connected_components_reports_regions() {
         .and_then(|value| value.as_u64())
         .expect("count");
     assert_eq!(count, 2);
+}
+
+#[test]
+fn analyze_particles_reports_imagej_style_rows() {
+    let mut dataset = test_dataset(
+        vec![
+            0.0, 0.0, 0.0, 0.0, //
+            0.0, 2.0, 4.0, 0.0, //
+            0.0, 6.0, 8.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, //
+        ],
+        (4, 4),
+    );
+    dataset.metadata.dims[0].spacing = Some(3.0);
+    dataset.metadata.dims[0].unit = Some("um".to_string());
+    dataset.metadata.dims[1].spacing = Some(2.0);
+    dataset.metadata.dims[1].unit = Some("um".to_string());
+
+    let output = execute_operation(
+        "measurements.particles",
+        &dataset,
+        &json!({"threshold": 1.0}),
+    )
+    .expect("analyze particles");
+    assert_eq!(output.dataset.data, dataset.data);
+    assert_eq!(output.dataset.metadata, dataset.metadata);
+
+    let measurements = output.measurements.expect("measurements");
+    assert_eq!(measurements.values.get("particle_count"), Some(&json!(1)));
+    assert_eq!(measurements.values.get("total_area"), Some(&json!(24.0)));
+    assert_eq!(measurements.values.get("area_unit"), Some(&json!("um^2")));
+    let rows = measurements
+        .values
+        .get("rows")
+        .and_then(|value| value.as_array())
+        .expect("particle rows");
+    let row = rows[0].as_object().expect("particle row");
+    assert_eq!(row.get("Label"), Some(&json!(1)));
+    assert_eq!(row.get("Area"), Some(&json!(24.0)));
+    assert_eq!(row.get("Mean"), Some(&json!(5.0)));
+    assert_eq!(row.get("X"), Some(&json!(4.0)));
+    assert_eq!(row.get("Y"), Some(&json!(6.0)));
+    assert_eq!(row.get("Perim."), Some(&json!(20.0)));
+    assert_eq!(row.get("Pixels"), Some(&json!(4)));
+    let circularity = row
+        .get("Circ.")
+        .and_then(|value| value.as_f64())
+        .expect("circularity");
+    assert!((circularity - 0.7539822368615503).abs() < 1.0e-12);
+}
+
+#[test]
+fn analyze_particles_honors_coordinate_origins_inversion_and_crop_offsets() {
+    let mut values = vec![0.0; 4 * 4];
+    values[2 * 4 + 1] = 1.0;
+    let dataset = test_dataset(values, (4, 4));
+    let calibrated = execute_operation(
+        "image.coordinates",
+        &dataset,
+        &json!({
+            "left": 10.0,
+            "right": 18.0,
+            "top": 20.0,
+            "bottom": 8.0,
+            "x_unit": "um",
+            "y_unit": "<same as x unit>"
+        }),
+    )
+    .expect("coordinate calibration")
+    .dataset;
+
+    let measure_particle = |dataset: &Dataset<f32>| {
+        execute_operation("measurements.particles", dataset, &json!({}))
+            .expect("analyze calibrated particle")
+            .measurements
+            .expect("measurements")
+            .values["rows"][0]
+            .clone()
+    };
+    let row = measure_particle(&calibrated);
+    assert_eq!(row["Area"], json!(6.0));
+    assert_eq!(row["X"], json!(13.0));
+    assert_eq!(row["Y"], json!(12.5));
+    assert_eq!(row["BX"], json!(12.0));
+    assert_eq!(row["BY"], json!(14.0));
+    assert_eq!(row["Width"], json!(2.0));
+    assert_eq!(row["Height"], json!(3.0));
+
+    let cropped = execute_operation(
+        "image.crop",
+        &calibrated,
+        &json!({"x": 1, "y": 1, "width": 2, "height": 3}),
+    )
+    .expect("crop calibrated image")
+    .dataset;
+    let cropped_row = measure_particle(&cropped);
+    for column in ["X", "Y", "BX", "BY"] {
+        assert_eq!(cropped_row[column], row[column], "{column}");
+    }
+}
+
+#[test]
+fn analyze_particles_filters_size_circularity_and_edge_particles() {
+    let mut values = vec![0.0; 8 * 10];
+    for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+        values[y * 10 + x] = 1.0;
+    }
+    for x in 5..9 {
+        values[2 * 10 + x] = 1.0;
+    }
+    for (x, y) in [(0, 6), (1, 6), (0, 7), (1, 7)] {
+        values[y * 10 + x] = 1.0;
+    }
+    let dataset = test_dataset(values, (8, 10));
+
+    let all = execute_operation("measurements.particles", &dataset, &json!({}))
+        .expect("all particles")
+        .measurements
+        .expect("measurements");
+    assert_eq!(all.values.get("particle_count"), Some(&json!(3)));
+
+    let filtered = execute_operation(
+        "measurements.particles",
+        &dataset,
+        &json!({
+            "min_size": 4.0,
+            "max_size": 4.0,
+            "min_circularity": 0.7,
+            "exclude_edges": true
+        }),
+    )
+    .expect("filtered particles")
+    .measurements
+    .expect("measurements");
+    assert_eq!(filtered.values.get("particle_count"), Some(&json!(1)));
+    let rows = filtered.values["rows"].as_array().expect("rows");
+    assert_eq!(rows[0]["BX"], json!(1.0));
+    assert_eq!(rows[0]["BY"], json!(1.0));
+}
+
+#[test]
+fn analyze_particles_honors_connectivity_and_requires_one_plane() {
+    let dataset = test_dataset(
+        vec![
+            1.0, 0.0, //
+            0.0, 1.0, //
+        ],
+        (2, 2),
+    );
+    let eight = execute_operation("measurements.particles", &dataset, &json!({}))
+        .expect("eight-connected")
+        .measurements
+        .expect("measurements");
+    let four = execute_operation(
+        "measurements.particles",
+        &dataset,
+        &json!({"connectivity": 4}),
+    )
+    .expect("four-connected")
+    .measurements
+    .expect("measurements");
+    assert_eq!(eight.values.get("particle_count"), Some(&json!(1)));
+    assert_eq!(four.values.get("particle_count"), Some(&json!(2)));
+
+    let stack = Dataset::new(
+        Array::from_shape_vec((2, 2, 2), vec![1.0; 8])
+            .expect("shape")
+            .into_dyn(),
+        Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Y, 2),
+                Dim::new(AxisKind::X, 2),
+                Dim::new(AxisKind::Z, 2),
+            ],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        },
+    )
+    .expect("stack");
+    let error = execute_operation("measurements.particles", &stack, &json!({}))
+        .expect_err("must select a plane");
+    assert!(error.to_string().contains("one X/Y plane"));
 }
 
 #[test]

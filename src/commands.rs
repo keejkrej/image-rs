@@ -20,7 +20,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-pub use components::ComponentsLabelOp;
+pub use components::{AnalyzeParticlesOp, ComponentsLabelOp};
 pub use error::{OpsError, Result};
 pub use gaussian::GaussianBlurOp;
 pub use intensity::{

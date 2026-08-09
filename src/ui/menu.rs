@@ -22,6 +22,7 @@ pub struct MenuManifestItem {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MenuManifestCommand {
     pub id: String,
     pub label: String,

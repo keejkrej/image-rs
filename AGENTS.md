@@ -2,6 +2,6 @@
 
 ## UI Architecture
 
-The native egui UI intentionally uses a single application window. The startup launcher remains the main window, and every opened image is represented as an in-window tab with its own viewer session. Opening another image must create or focus a tab in that same window, not spawn another OS window.
+The native GPUI UI follows ImageJ's multi-window desktop model. The persistent launcher owns the shared menu bar and tool palette, while every opened image is shown in its own native viewer window. Opening an already-loaded path focuses its existing viewer instead of duplicating it.
 
-This differs from the upstream ImageJ-style multi-window desktop model. The divergence is deliberate: egui works best when one `eframe` window owns the shared menu, toolbar, utility dialogs, command routing, and image canvas state. Keep ImageJ-compatible labels such as `viewer-1` as internal image/session identifiers for macros and commands, but render them as tabs in the main window.
+Shared command routing, selected-tool state, macros, and ImageJ-compatible identifiers such as `viewer-1` remain application-level state. Closing a viewer closes that image session; closing the launcher exits the application and its viewers. Preserve this workflow while presenting it with the modern zinc/blue visual system used by the GPUI implementation.

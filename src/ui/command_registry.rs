@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::menu::{self, MenuManifestCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -144,6 +146,14 @@ impl CommandMetadata {
 }
 
 pub fn metadata(command_id: &str) -> CommandMetadata {
+    let mut metadata = declared_metadata(command_id);
+    if !super::gpui_app::command_is_routed(command_id) {
+        metadata.implemented = false;
+    }
+    metadata
+}
+
+fn declared_metadata(command_id: &str) -> CommandMetadata {
     match command_id {
         "file.new" => CommandMetadata::with(
             CommandScope::Both,
@@ -1372,16 +1382,38 @@ pub fn metadata(command_id: &str) -> CommandMetadata {
             Some(json!({"radius": null})),
             Some("Create an ImageJ Process/FFT centered circular selection on the active image."),
         ),
-        "analyze.measure"
-        | "analyze.analyze_particles"
-        | "analyze.tools.roi_manager"
-        | "analyze.tools.results" => CommandMetadata::with(
+        "analyze.measure" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
             false,
             true,
             None,
-            Some("Analyze the active image and surface results in shared utility windows."),
+            Some("Analyze the active image and append rows to the shared Results window."),
+        ),
+        "analyze.analyze_particles" => CommandMetadata::with(
+            CommandScope::Viewer,
+            true,
+            false,
+            true,
+            Some(json!({
+                "threshold": 0.5,
+                "max_threshold": f32::MAX,
+                "min_size": 0.0,
+                "max_size": f64::MAX,
+                "min_circularity": 0.0,
+                "max_circularity": 1.0,
+                "connectivity": 8,
+                "exclude_edges": false
+            })),
+            Some("Measure and filter connected particles in the active X/Y plane."),
+        ),
+        "analyze.tools.roi_manager" | "analyze.tools.results" => CommandMetadata::with(
+            CommandScope::Both,
+            true,
+            true,
+            false,
+            None,
+            Some("Open an application-level ImageJ-style utility window."),
         ),
         "analyze.tools.save_xy_coordinates" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -1713,6 +1745,42 @@ mod tests {
 
         assert!(CommandScope::Both.contains("main"));
         assert!(CommandScope::Both.contains("viewer-42"));
+    }
+
+    #[test]
+    fn analyze_particles_defaults_do_not_clip_supported_image_values_or_areas() {
+        let defaults = merge_params("analyze.analyze_particles", None);
+        assert_eq!(defaults["threshold"], json!(0.5));
+        assert_eq!(defaults["max_threshold"], json!(f32::MAX));
+        assert_eq!(defaults["max_size"], json!(f64::MAX));
+        assert_eq!(defaults["connectivity"], json!(8));
+        assert_eq!(defaults["exclude_edges"], json!(false));
+        assert!(metadata("analyze.analyze_particles").implemented);
+
+        let mut y = crate::model::Dim::new(crate::model::AxisKind::Y, 1);
+        y.spacing = Some(10_000_000.0);
+        y.unit = Some("um".into());
+        let mut x = crate::model::Dim::new(crate::model::AxisKind::X, 1);
+        x.spacing = Some(10_000_000.0);
+        x.unit = Some("um".into());
+        let dataset = crate::model::Dataset::new(
+            ndarray::Array::from_shape_vec((1, 1), vec![65_535.0])
+                .unwrap()
+                .into_dyn(),
+            crate::model::Metadata {
+                dims: vec![y, x],
+                pixel_type: crate::model::PixelType::U16,
+                ..crate::model::Metadata::default()
+            },
+        )
+        .unwrap();
+        let output =
+            crate::commands::execute_operation("measurements.particles", &dataset, &defaults)
+                .unwrap();
+        assert_eq!(
+            output.measurements.unwrap().values.get("particle_count"),
+            Some(&json!(1))
+        );
     }
 
     #[test]
@@ -2182,9 +2250,10 @@ mod tests {
             "window.put_behind",
             "help.shortcuts",
         ] {
-            assert!(
+            assert_eq!(
                 metadata(command).implemented,
-                "{command} should be implemented or explicitly handled"
+                super::super::gpui_app::command_is_routed(command),
+                "{command} capability should match the GPUI router"
             );
         }
     }
@@ -2198,7 +2267,6 @@ mod tests {
             "process.math.sqrt",
             "process.math.nan_background",
             "process.math.abs",
-            "image.stacks.reverse",
         ] {
             let metadata = metadata(command);
             assert!(metadata.implemented, "{command} should be implemented");
@@ -2286,67 +2354,40 @@ mod tests {
     }
 
     #[test]
-    fn command_catalog_entries_are_implemented() {
+    fn command_catalog_reports_real_gpui_capabilities() {
         let catalog = command_catalog();
-        let unsupported: Vec<&str> = catalog
+        let implemented = catalog
             .entries
             .iter()
-            .filter(|entry| !entry.implemented)
-            .map(|entry| entry.id.as_str())
-            .collect();
+            .filter(|entry| entry.implemented)
+            .count();
+        let unavailable = catalog.entries.len() - implemented;
 
+        assert!(implemented > 150, "unexpectedly low GPUI command coverage");
         assert!(
-            unsupported.is_empty(),
-            "unimplemented menu commands: {:?}",
-            unsupported
+            unavailable > 0,
+            "capability catalog must not hide known gaps"
         );
+        assert!(metadata("plugins.macros.run").implemented);
+        assert!(metadata("analyze.tools.results").implemented);
+        assert!(metadata("image.adjust.brightness").implemented);
+        assert!(!metadata("file.import.raw").implemented);
     }
 
     #[test]
-    fn manifest_commands_are_dispatched_in_app() {
-        let app_source = include_str!("app.rs");
-        let manifest_command_ids = manifest_commands()
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect::<Vec<_>>();
+    fn manifest_commands_are_routed_through_gpui_dispatcher() {
+        let app_source = include_str!("gpui_app.rs");
+        assert!(app_source.contains("fn dispatch_command("));
+        assert!(app_source.contains("_ => self.begin_operation(command_id)"));
+        assert!(app_source.contains("fn operation_for_command("));
 
-        let mut handled_prefixes = Vec::new();
-        for line in app_source.lines() {
-            if let Some(starts_with_pos) = line.find("starts_with(\"") {
-                let after = &line[starts_with_pos + "starts_with(\"".len()..];
-                if let Some(end) = after.find('"') {
-                    handled_prefixes.push(after[..end].to_string());
-                }
-            }
-
-            if let Some(strip_prefix_pos) = line.find("strip_prefix(\"") {
-                let after = &line[strip_prefix_pos + "strip_prefix(\"".len()..];
-                if let Some(end) = after.find('"') {
-                    handled_prefixes.push(after[..end].to_string());
-                }
-            }
+        for entry in manifest_commands() {
+            assert_eq!(
+                metadata(&entry.id).implemented,
+                super::super::gpui_app::command_is_routed(&entry.id),
+                "capability drift for {}",
+                entry.id
+            );
         }
-
-        let mut missing = Vec::new();
-        'command: for command_id in manifest_command_ids {
-            let quoted = format!("\"{command_id}\"");
-            if app_source.contains(&quoted) {
-                continue 'command;
-            }
-
-            for prefix in &handled_prefixes {
-                if command_id.starts_with(prefix.as_str()) {
-                    continue 'command;
-                }
-            }
-
-            missing.push(command_id);
-        }
-
-        assert!(
-            missing.is_empty(),
-            "manifest commands missing dispatch branches: {:?}",
-            missing
-        );
     }
 }

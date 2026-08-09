@@ -1,13 +1,7 @@
-mod app;
 mod command_registry;
-mod dialogs;
-mod image_plus;
-mod interaction;
-mod lut;
+mod gpui_app;
 mod macros;
 mod menu;
-mod repaint;
-mod state;
 mod toolbar;
 
-pub use app::run;
+pub use gpui_app::run;
