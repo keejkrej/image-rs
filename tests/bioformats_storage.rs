@@ -1,11 +1,14 @@
 #![cfg(feature = "bioformats")]
 
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use image_rs::formats::{
-    AssetSnapshot, BioFormatsError, BioformatsPixelType, IoError, PlaneCoordinates, RangeStorage,
-    ReadRequest, Rect, Region, StorageResult, materialize_bioformats_plane, open_bioformats_asset,
+    AssetSnapshot, BioFormatsError, BioformatsPixelType, IoError, PixelLayout, PlaneCoordinates,
+    RangeStorage, ReadRequest, Rect, Region, StorageResult, materialize_bioformats_plane,
+    open_bioformats_asset,
 };
 use image_rs::model::{AxisKind, PixelType};
 
@@ -13,6 +16,8 @@ use image_rs::model::{AxisKind, PixelType};
 struct MemoryRangeStorage {
     bytes: HashMap<String, Arc<[u8]>>,
     fail_at_or_after: HashMap<String, u64>,
+    named_failure: Option<&'static str>,
+    siblings_failure: Option<&'static str>,
     named: HashMap<(String, String), AssetSnapshot>,
     siblings: HashMap<String, Vec<AssetSnapshot>>,
     ranges: Mutex<Vec<(String, u64, usize)>>,
@@ -26,6 +31,16 @@ impl MemoryRangeStorage {
 
     fn failing_at_or_after(mut self, identity: &str, offset: u64) -> Self {
         self.fail_at_or_after.insert(identity.to_owned(), offset);
+        self
+    }
+
+    fn failing_named_resolution(mut self, operation: &'static str) -> Self {
+        self.named_failure = Some(operation);
+        self
+    }
+
+    fn failing_sibling_resolution(mut self, operation: &'static str) -> Self {
+        self.siblings_failure = Some(operation);
         self
     }
 
@@ -105,6 +120,9 @@ impl RangeStorage for MemoryRangeStorage {
         from: &AssetSnapshot,
         logical_name: &str,
     ) -> StorageResult<Option<AssetSnapshot>> {
+        if let Some(operation) = self.named_failure {
+            return Err(Box::new(InjectedCompanionError::new(operation)));
+        }
         Ok(self
             .named
             .get(&(from.identity().to_owned(), logical_name.to_owned()))
@@ -112,11 +130,41 @@ impl RangeStorage for MemoryRangeStorage {
     }
 
     fn siblings(&self, from: &AssetSnapshot) -> StorageResult<Vec<AssetSnapshot>> {
+        if let Some(operation) = self.siblings_failure {
+            return Err(Box::new(InjectedCompanionError::new(operation)));
+        }
         Ok(self
             .siblings
             .get(from.identity())
             .cloned()
             .unwrap_or_default())
+    }
+}
+
+#[derive(Debug)]
+struct InjectedCompanionError {
+    operation: &'static str,
+    source: std::io::Error,
+}
+
+impl InjectedCompanionError {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            operation,
+            source: std::io::Error::other("companion index unavailable"),
+        }
+    }
+}
+
+impl fmt::Display for InjectedCompanionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "injected {} failure", self.operation)
+    }
+}
+
+impl StdError for InjectedCompanionError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -167,6 +215,99 @@ fn range_storage_opens_tiff_lazily_and_keeps_native_region_requests() {
 }
 
 #[test]
+fn range_storage_preserves_nonzero_pyramid_resolution_lazily() {
+    const ROOT_PIXEL_OFFSET: usize = 64 * 1024;
+    const SUBRESOLUTION_PIXEL_OFFSET: usize = 128 * 1024;
+    let bytes = pyramidal_tiff(ROOT_PIXEL_OFFSET, SUBRESOLUTION_PIXEL_OFFSET);
+    let source_len = bytes.len();
+    let storage =
+        Arc::new(MemoryRangeStorage::default().with_asset("asset:pyramid-tiff@v1", bytes));
+    let primary = AssetSnapshot::new("asset:pyramid-tiff@v1", "pyramid.tif", source_len as u64)
+        .expect("valid pyramidal TIFF asset");
+
+    let dataset = open_bioformats_asset(storage.clone(), primary).expect("open pyramidal TIFF");
+
+    assert_eq!(dataset.series().len(), 1);
+    assert_eq!(dataset.series()[0].resolutions().len(), 2);
+    assert_eq!(
+        (
+            dataset.series()[0].resolutions()[0].metadata().size_x,
+            dataset.series()[0].resolutions()[0].metadata().size_y,
+        ),
+        (4, 4)
+    );
+    assert_eq!(
+        (
+            dataset.series()[0].resolutions()[1].metadata().size_x,
+            dataset.series()[0].resolutions()[1].metadata().size_y,
+        ),
+        (2, 2)
+    );
+
+    let opening_ranges = storage.ranges();
+    assert!(!opening_ranges.is_empty());
+    assert!(opening_ranges.iter().all(|(_, offset, length)| {
+        let end = offset
+            .checked_add(*length as u64)
+            .expect("recorded opening range end");
+        end <= source_len as u64 && *length <= ROOT_PIXEL_OFFSET
+    }));
+    assert!(opening_ranges.iter().all(|(_, offset, length)| {
+        let end = offset + *length as u64;
+        end <= ROOT_PIXEL_OFFSET as u64 || *offset >= (ROOT_PIXEL_OFFSET + 16) as u64
+    }));
+    assert!(opening_ranges.iter().all(|(_, offset, length)| {
+        let end = offset + *length as u64;
+        end <= SUBRESOLUTION_PIXEL_OFFSET as u64
+            || *offset >= (SUBRESOLUTION_PIXEL_OFFSET + 4) as u64
+    }));
+
+    let request = ReadRequest::new(0, PlaneCoordinates::new(0, 0, 0)).with_resolution(1);
+    let info = dataset
+        .plane_info(request)
+        .expect("subresolution native plane info");
+    assert_eq!(info.resolution, 1);
+    assert_eq!((info.region.width, info.region.height), (2, 2));
+    assert_eq!(info.byte_len, 4);
+    assert_eq!(
+        info.layout,
+        PixelLayout {
+            pixel_type: BioformatsPixelType::Uint8,
+            significant_bits: 8,
+            samples_per_pixel: 1,
+            interleaved: true,
+            little_endian: true,
+        }
+    );
+
+    let plane = dataset
+        .read_plane(request)
+        .expect("read explicit subresolution");
+    assert_eq!(plane.bytes(), &[21, 22, 23, 24]);
+    assert_eq!(plane.info().layout, info.layout);
+
+    let read_ranges = storage.ranges();
+    assert!(read_ranges.iter().all(|(_, offset, length)| {
+        offset
+            .checked_add(*length as u64)
+            .is_some_and(|end| end <= source_len as u64 && *length <= ROOT_PIXEL_OFFSET)
+    }));
+    assert!(
+        read_ranges
+            .iter()
+            .skip(opening_ranges.len())
+            .any(|(_, offset, length)| {
+                *offset <= SUBRESOLUTION_PIXEL_OFFSET as u64
+                    && *offset + *length as u64 >= (SUBRESOLUTION_PIXEL_OFFSET + 4) as u64
+            })
+    );
+    assert!(read_ranges.iter().all(|(_, offset, length)| {
+        let end = offset + *length as u64;
+        end <= ROOT_PIXEL_OFFSET as u64 || *offset >= (ROOT_PIXEL_OFFSET + 16) as u64
+    }));
+}
+
+#[test]
 fn range_storage_resolves_detached_nrrd_by_logical_name() {
     let header =
         b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 3 2\nencoding: raw\ndata file: pixels.raw\n"
@@ -200,6 +341,49 @@ fn range_storage_resolves_detached_nrrd_by_logical_name() {
         .read_plane(ReadRequest::new(0, PlaneCoordinates::new(0, 0, 0)))
         .expect("read detached NRRD pixels");
     assert_eq!(plane.bytes(), &[1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn named_companion_failure_preserves_structured_nested_error() {
+    let header =
+        b"NRRD0004\ntype: uint8\ndimension: 2\nsizes: 3 2\nencoding: raw\ndata file: pixels.raw\n"
+            .to_vec();
+    let header_len = header.len();
+    let storage = Arc::new(
+        MemoryRangeStorage::default()
+            .with_asset("asset:failing-named-header@v1", header)
+            .failing_named_resolution("resolve_named"),
+    );
+    let primary = AssetSnapshot::new(
+        "asset:failing-named-header@v1",
+        "failing.nhdr",
+        header_len as u64,
+    )
+    .expect("valid failing NRRD header asset");
+
+    let error = open_bioformats_asset(storage, primary)
+        .err()
+        .expect("named companion resolution must fail");
+
+    let IoError::BioFormats(BioFormatsError::CompanionResolution {
+        identity,
+        reference,
+        source,
+    }) = error
+    else {
+        panic!("expected structured named companion error, got {error:?}");
+    };
+    assert_eq!(identity.as_str(), "asset:failing-named-header@v1");
+    assert_eq!(reference, "pixels.raw");
+    let injected = source
+        .downcast_ref::<InjectedCompanionError>()
+        .expect("custom storage error must remain downcastable");
+    assert_eq!(injected.operation, "resolve_named");
+    let nested = injected.source().expect("nested backend error");
+    let nested = nested
+        .downcast_ref::<std::io::Error>()
+        .expect("nested I/O error must not be stringified");
+    assert_eq!(nested.to_string(), "companion index unavailable");
 }
 
 #[test]
@@ -358,6 +542,47 @@ fn range_storage_supplies_complete_split_czi_sibling_set() {
         .expect("read CZI part plane");
     assert_eq!(first.bytes(), &[1, 2, 3, 4, 5, 6]);
     assert_eq!(second.bytes(), &[11, 12, 13, 14, 15, 16]);
+}
+
+#[test]
+fn sibling_companion_failure_preserves_structured_nested_error() {
+    let master = minimal_czi(0, [1, 2, 3, 4, 5, 6]);
+    let master_len = master.len();
+    let storage = Arc::new(
+        MemoryRangeStorage::default()
+            .with_asset("asset:failing-czi-master@v1", master)
+            .failing_sibling_resolution("siblings"),
+    );
+    let primary = AssetSnapshot::new(
+        "asset:failing-czi-master@v1",
+        "sample.czi",
+        master_len as u64,
+    )
+    .expect("valid failing CZI master asset");
+
+    let error = open_bioformats_asset(storage, primary)
+        .err()
+        .expect("sibling companion resolution must fail");
+
+    let IoError::BioFormats(BioFormatsError::CompanionResolution {
+        identity,
+        reference,
+        source,
+    }) = error
+    else {
+        panic!("expected structured sibling companion error, got {error:?}");
+    };
+    assert_eq!(identity.as_str(), "asset:failing-czi-master@v1");
+    assert_eq!(reference, "<siblings>");
+    let injected = source
+        .downcast_ref::<InjectedCompanionError>()
+        .expect("custom storage error must remain downcastable");
+    assert_eq!(injected.operation, "siblings");
+    let nested = injected.source().expect("nested backend error");
+    let nested = nested
+        .downcast_ref::<std::io::Error>()
+        .expect("nested I/O error must not be stringified");
+    assert_eq!(nested.to_string(), "companion index unavailable");
 }
 
 #[test]
@@ -523,6 +748,70 @@ encoding: raw\n\
 }
 
 #[test]
+fn materialization_casts_signed_float_and_wide_samples_to_f32_without_normalization() {
+    let signed_pixels = [-32_768_i16, -2, 12_345]
+        .into_iter()
+        .flat_map(i16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let float_pixels = [-1.5_f32, 0.25, 1024.5]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let wide_pixels = [0_u32, 16_777_217, u32::MAX]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+
+    let cases = [
+        (
+            "asset:signed-int16-tiff@v1",
+            "signed-int16.tif",
+            scalar_tiff(16, 2, signed_pixels, 3),
+            BioformatsPixelType::Int16,
+            vec![-32_768.0, -2.0, 12_345.0],
+        ),
+        (
+            "asset:float32-tiff@v1",
+            "float32.tif",
+            scalar_tiff(32, 3, float_pixels, 3),
+            BioformatsPixelType::Float32,
+            vec![-1.5, 0.25, 1024.5],
+        ),
+        (
+            "asset:uint32-tiff@v1",
+            "uint32.tif",
+            scalar_tiff(32, 1, wide_pixels, 3),
+            BioformatsPixelType::Uint32,
+            // Direct f32 casts retain magnitude without normalization. These
+            // two integers round because f32 cannot represent them exactly.
+            vec![0.0, 16_777_216.0, 4_294_967_296.0],
+        ),
+    ];
+
+    for (identity, logical_name, bytes, native_pixel_type, expected) in cases {
+        let len = bytes.len();
+        let storage = Arc::new(MemoryRangeStorage::default().with_asset(identity, bytes));
+        let primary =
+            AssetSnapshot::new(identity, logical_name, len as u64).expect("valid typed TIFF asset");
+        let dataset = open_bioformats_asset(storage, primary).expect("open typed TIFF");
+        let request = ReadRequest::new(0, PlaneCoordinates::new(0, 0, 0));
+
+        let info = dataset.plane_info(request).expect("typed native layout");
+        assert_eq!(info.layout.pixel_type, native_pixel_type);
+        let materialized =
+            materialize_bioformats_plane(&dataset, request).expect("materialize typed TIFF");
+
+        assert_eq!(materialized.metadata.pixel_type, PixelType::F32);
+        assert_eq!(materialized.shape(), &[1, 3]);
+        assert_eq!(
+            materialized.data.iter().copied().collect::<Vec<_>>(),
+            expected,
+            "conversion policy for {native_pixel_type:?}"
+        );
+    }
+}
+
+#[test]
 fn materialization_preserves_interleaved_sample_layout_as_channel_axis() {
     let mut bytes = b"NRRD0005\n\
 type: uint8\n\
@@ -553,8 +842,186 @@ encoding: raw\n\
     );
 }
 
+#[test]
+fn materialization_reorders_native_planar_samples_into_channel_axis() {
+    let bytes = planar_stripped_tiff();
+    let len = bytes.len();
+    let storage = Arc::new(MemoryRangeStorage::default().with_asset("asset:planar-tiff@v1", bytes));
+    let primary = AssetSnapshot::new("asset:planar-tiff@v1", "planar.tif", len as u64)
+        .expect("valid planar TIFF asset");
+    let dataset = open_bioformats_asset(storage, primary).expect("open planar TIFF");
+    let request = ReadRequest::new(0, PlaneCoordinates::new(0, 0, 0));
+
+    let plane = dataset
+        .read_plane(request)
+        .expect("read native planar plane");
+    assert_eq!(
+        (plane.info().region.width, plane.info().region.height),
+        (3, 2)
+    );
+    assert_eq!(
+        plane.info().layout,
+        PixelLayout {
+            pixel_type: BioformatsPixelType::Uint8,
+            significant_bits: 8,
+            samples_per_pixel: 2,
+            interleaved: false,
+            little_endian: true,
+        }
+    );
+    assert_eq!(plane.bytes(), &[1, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60]);
+
+    let materialized =
+        materialize_bioformats_plane(&dataset, request).expect("materialize planar TIFF");
+
+    assert_eq!(materialized.shape(), &[2, 3, 2]);
+    assert_eq!(materialized.metadata.axis_index(AxisKind::Y), Some(0));
+    assert_eq!(materialized.metadata.axis_index(AxisKind::X), Some(1));
+    assert_eq!(materialized.metadata.axis_index(AxisKind::Channel), Some(2));
+    assert_eq!(
+        materialized.data.iter().copied().collect::<Vec<_>>(),
+        [
+            1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0, 6.0, 60.0
+        ]
+    );
+    assert_eq!(
+        materialized.metadata.extras["bioformats_native_layout"],
+        serde_json::json!({
+            "pixel_type": "Uint8",
+            "significant_bits": 8,
+            "samples_per_pixel": 2,
+            "interleaved": false,
+            "little_endian": true,
+        })
+    );
+}
+
 fn padded_tiff(pixel_offset: usize) -> Vec<u8> {
     tiff_with_pixels_at(pixel_offset, [1, 2, 3, 4, 5, 6])
+}
+
+fn pyramidal_tiff(root_pixel_offset: usize, subresolution_pixel_offset: usize) -> Vec<u8> {
+    const ROOT_TAG_COUNT: u16 = 10;
+    const SUBRESOLUTION_TAG_COUNT: u16 = 9;
+    const ROOT_IFD_OFFSET: u32 = 8;
+    let root_ifd_size = 2 + usize::from(ROOT_TAG_COUNT) * 12 + 4;
+    let subresolution_ifd_offset = ROOT_IFD_OFFSET + root_ifd_size as u32;
+
+    assert!(root_pixel_offset >= subresolution_ifd_offset as usize + 2 + 9 * 12 + 4);
+    assert!(subresolution_pixel_offset >= root_pixel_offset + 16);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42_u16.to_le_bytes());
+    bytes.extend_from_slice(&ROOT_IFD_OFFSET.to_le_bytes());
+
+    bytes.extend_from_slice(&ROOT_TAG_COUNT.to_le_bytes());
+    push_tag(&mut bytes, 256, 4, 1, 4);
+    push_tag(&mut bytes, 257, 4, 1, 4);
+    push_tag(&mut bytes, 258, 3, 1, 8);
+    push_tag(&mut bytes, 259, 3, 1, 1);
+    push_tag(&mut bytes, 262, 3, 1, 1);
+    push_tag(&mut bytes, 273, 4, 1, root_pixel_offset as u32);
+    push_tag(&mut bytes, 277, 3, 1, 1);
+    push_tag(&mut bytes, 278, 4, 1, 4);
+    push_tag(&mut bytes, 279, 4, 1, 16);
+    push_tag(&mut bytes, 330, 13, 1, subresolution_ifd_offset);
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+
+    assert_eq!(bytes.len(), subresolution_ifd_offset as usize);
+    bytes.extend_from_slice(&SUBRESOLUTION_TAG_COUNT.to_le_bytes());
+    push_tag(&mut bytes, 256, 4, 1, 2);
+    push_tag(&mut bytes, 257, 4, 1, 2);
+    push_tag(&mut bytes, 258, 3, 1, 8);
+    push_tag(&mut bytes, 259, 3, 1, 1);
+    push_tag(&mut bytes, 262, 3, 1, 1);
+    push_tag(&mut bytes, 273, 4, 1, subresolution_pixel_offset as u32);
+    push_tag(&mut bytes, 277, 3, 1, 1);
+    push_tag(&mut bytes, 278, 4, 1, 2);
+    push_tag(&mut bytes, 279, 4, 1, 4);
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+
+    bytes.resize(root_pixel_offset, 0);
+    bytes.extend(1_u8..=16);
+    bytes.resize(subresolution_pixel_offset, 0);
+    bytes.extend_from_slice(&[21, 22, 23, 24]);
+    bytes
+}
+
+fn planar_stripped_tiff() -> Vec<u8> {
+    const TAG_COUNT: u16 = 12;
+    const IFD_OFFSET: u32 = 8;
+    const IFD_SIZE: u32 = 2 + TAG_COUNT as u32 * 12 + 4;
+    const OFFSETS_OFFSET: u32 = IFD_OFFSET + IFD_SIZE;
+    const COUNTS_OFFSET: u32 = OFFSETS_OFFSET + 2 * 4;
+    const PIXELS_OFFSET: u32 = COUNTS_OFFSET + 2 * 4;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42_u16.to_le_bytes());
+    bytes.extend_from_slice(&IFD_OFFSET.to_le_bytes());
+    bytes.extend_from_slice(&TAG_COUNT.to_le_bytes());
+    push_tag(&mut bytes, 256, 4, 1, 3);
+    push_tag(&mut bytes, 257, 4, 1, 2);
+    push_tag(&mut bytes, 258, 3, 2, 8 | (8 << 16));
+    push_tag(&mut bytes, 259, 3, 1, 1);
+    push_tag(&mut bytes, 262, 3, 1, 1);
+    push_tag(&mut bytes, 273, 4, 2, OFFSETS_OFFSET);
+    push_tag(&mut bytes, 277, 3, 1, 2);
+    push_tag(&mut bytes, 278, 4, 1, 2);
+    push_tag(&mut bytes, 279, 4, 2, COUNTS_OFFSET);
+    push_tag(&mut bytes, 284, 3, 1, 2);
+    push_tag(&mut bytes, 317, 3, 1, 2);
+    push_tag(&mut bytes, 338, 3, 1, 2);
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+
+    for offset in [PIXELS_OFFSET, PIXELS_OFFSET + 6] {
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+    for _ in 0..2 {
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+    }
+
+    // Horizontal predictor deltas, stored as one complete component plane per strip.
+    bytes.extend_from_slice(&[1, 1, 1, 4, 1, 1]);
+    bytes.extend_from_slice(&[10, 10, 10, 40, 10, 10]);
+    bytes
+}
+
+fn scalar_tiff(
+    bits_per_sample: u16,
+    sample_format: u16,
+    pixels: Vec<u8>,
+    sample_count: u32,
+) -> Vec<u8> {
+    const TAG_COUNT: u16 = 10;
+    const IFD_OFFSET: u32 = 8;
+    const IFD_SIZE: u32 = 2 + TAG_COUNT as u32 * 12 + 4;
+    const PIXEL_OFFSET: u32 = IFD_OFFSET + IFD_SIZE;
+
+    assert_eq!(
+        pixels.len(),
+        sample_count as usize * usize::from(bits_per_sample / 8)
+    );
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"II");
+    bytes.extend_from_slice(&42_u16.to_le_bytes());
+    bytes.extend_from_slice(&IFD_OFFSET.to_le_bytes());
+    bytes.extend_from_slice(&TAG_COUNT.to_le_bytes());
+    push_tag(&mut bytes, 256, 4, 1, sample_count);
+    push_tag(&mut bytes, 257, 4, 1, 1);
+    push_tag(&mut bytes, 258, 3, 1, u32::from(bits_per_sample));
+    push_tag(&mut bytes, 259, 3, 1, 1);
+    push_tag(&mut bytes, 262, 3, 1, 1);
+    push_tag(&mut bytes, 273, 4, 1, PIXEL_OFFSET);
+    push_tag(&mut bytes, 277, 3, 1, 1);
+    push_tag(&mut bytes, 278, 4, 1, 1);
+    push_tag(&mut bytes, 279, 4, 1, pixels.len() as u32);
+    push_tag(&mut bytes, 339, 3, 1, u32::from(sample_format));
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes.extend_from_slice(&pixels);
+    bytes
 }
 
 fn basic_tiff_with_pixels(pixels: [u8; 6]) -> Vec<u8> {

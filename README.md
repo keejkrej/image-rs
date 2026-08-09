@@ -53,17 +53,27 @@ The library checks ranges before forwarding them and retains the store for lazy
 pixel reads; it does not create temporary files, emulate a filesystem, or load
 an entire asset merely to open it.
 
-Companion lookup stays in the same application namespace:
+Companion lookup deliberately stays in the same application namespace:
 
 - `resolve_named` handles detached NRRD data and metadata-declared OME-TIFF members.
 - `siblings` supplies the complete candidate set for split CZI assets; bioformats-rs performs CZI-specific filtering, de-duplication, and ordering.
 
+The `RangeStorage` instance passed to `open_bioformats_asset` defines that one
+logical namespace: every returned companion snapshot must remain readable by
+the same instance, with a unique stable identity, for the dataset's lifetime.
+An application adapter may federate multiple physical providers internally.
+There is no separate companion-index seam because no supported companion flow
+currently requires independently owned providers; one should be introduced
+only for a concrete cross-provider use case.
+
 `materialize_bioformats_plane` is an explicitly eager image-rs conversion for
 one requested plane or region. It interprets native byte order and
 planar/interleaved samples without normalization, then creates a
-`Dataset<f32>`. Integer widths or floating-point precision not represented by
-the image-rs model are converted to `f32`, while the native layout is retained
-in metadata extras. Whole-series materialization is not implicit.
+`Dataset<f32>`. Numeric samples are converted directly without normalization,
+rescaling, or clamping: exactly representable values retain their value;
+`Int32`, `Uint32`, and `Float64` use Rust's `as f32` semantics and may round,
+with out-of-range floating-point values becoming infinities. The native layout
+is retained in metadata extras. Whole-series materialization is not implicit.
 
 Existing convenience paths remain unchanged. `read_dataset`,
 `read_native_image`, `DefaultImageCodec::read`, `IoService::read`, and the

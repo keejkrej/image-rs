@@ -86,6 +86,12 @@ impl AssetSnapshot {
 ///
 /// `read_exact_at` must fill the complete destination or return an error.
 /// Calls may arrive concurrently and in any order.
+///
+/// One `RangeStorage` instance defines one logical asset namespace. Every
+/// snapshot returned by `resolve_named` or `siblings` must have a unique stable
+/// identity in that namespace and remain readable through this same instance
+/// for as long as the opened dataset retains it. An implementation may
+/// federate multiple physical providers behind this interface.
 pub trait RangeStorage: Send + Sync + 'static {
     fn read_exact_at(
         &self,
@@ -194,9 +200,11 @@ pub fn open_bioformats_asset(
 
 /// Eagerly convert one explicit native plane or region into image-rs's f32 model.
 ///
-/// Values are converted without normalization. Wider integer and floating-point
-/// samples may lose precision in image-rs's `f32` model. This allocates only the
-/// selected plane/region; opening and native reads remain lazy.
+/// Values are converted directly without normalization, rescaling, or
+/// clamping. Exactly representable values retain their value; `Int32`,
+/// `Uint32`, and `Float64` use Rust's `as f32` semantics, so they may round and
+/// out-of-range floating-point values may become infinities. This allocates
+/// only the selected plane/region; opening and native reads remain lazy.
 pub fn materialize_bioformats_plane(
     dataset: &BioformatsDataset,
     request: ReadRequest,
