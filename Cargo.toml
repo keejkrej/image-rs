@@ -8,6 +8,7 @@ repository = "https://github.com/keejkrej/image-rs"
 
 [features]
 default = []
+bioformats = ["dep:bioformats-rs"]
 morpholib = ["dep:morpholib-rs"]
 thunderstorm = ["dep:thunderstorm-rs"]
 
@@ -16,6 +17,7 @@ name = "image"
 path = "src/main.rs"
 
 [dependencies]
+bioformats-rs = { git = "https://github.com/keejkrej/bioformats-rs.git", rev = "c6b6c072831294b2d11e8cc4a7991555a6f7f5ee", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 gpui = { package = "gpui", git = "https://github.com/gpui-ce/gpui-ce" }
 gpui_platform = { git = "https://github.com/gpui-ce/gpui-ce" }

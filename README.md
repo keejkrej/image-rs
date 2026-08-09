@@ -17,6 +17,77 @@ Rust-first core rewrite inspired by ImageJ, with a native GPUI desktop UI and de
 - Shared tools, macros, command routing, ROI clipboard edits, ROI Manager, undo/redo, and persistent Results across viewers
 - MorphoLibJ-style operations integrated via [`morpholib-rs`](https://github.com/keejkrej/morpholib-rs)
 
+## Application-owned Bio-Formats storage
+
+The optional `bioformats` feature opens TIFF/OME-TIFF, ND2, CZI, NRRD, MRC,
+and DCIMG datasets from image-rs-owned range storage. The returned
+`BioformatsDataset` is the native lazy dataset: callers keep the exact
+`PixelLayout` and issue explicit series, resolution, Z/C/T, and XY-region
+requests.
+
+```rust,ignore
+use std::sync::Arc;
+use image_rs::formats::{
+    AssetSnapshot, PlaneCoordinates, RangeStorage, ReadRequest, Rect, Region,
+    open_bioformats_asset,
+};
+
+let primary = AssetSnapshot::new(
+    "objects/acquisition-42@etag-9d2",
+    "sample.czi",
+    object_length,
+)?;
+let dataset = open_bioformats_asset(Arc::new(application_store), primary)?;
+let request = ReadRequest::new(0, PlaneCoordinates::new(4, 1, 2))
+    .with_resolution(0)
+    .with_region(Region::Rect(Rect::new(128, 64, 512, 256)?));
+let info = dataset.plane_info(request)?;
+let mut bytes = vec![0; info.byte_len];
+dataset.read_plane_into(request, &mut bytes)?;
+```
+
+`RangeStorage::read_exact_at` adapts the application's versioned object key,
+logical name, and length to `bioformats_rs::RandomAccessSource`. It must fill
+the requested range exactly and remain safe for unordered concurrent calls.
+The library checks ranges before forwarding them and retains the store for lazy
+pixel reads; it does not create temporary files, emulate a filesystem, or load
+an entire asset merely to open it.
+
+Companion lookup stays in the same application namespace:
+
+- `resolve_named` handles detached NRRD data and metadata-declared OME-TIFF members.
+- `siblings` supplies the complete candidate set for split CZI assets; bioformats-rs performs CZI-specific filtering, de-duplication, and ordering.
+
+`materialize_bioformats_plane` is an explicitly eager image-rs conversion for
+one requested plane or region. It interprets native byte order and
+planar/interleaved samples without normalization, then creates a
+`Dataset<f32>`. Integer widths or floating-point precision not represented by
+the image-rs model are converted to `f32`, while the native layout is retained
+in metadata extras. Whole-series materialization is not implicit.
+
+Existing convenience paths remain unchanged. `read_dataset`,
+`read_native_image`, `DefaultImageCodec::read`, `IoService::read`, and the
+CLI/UI open flows are filesystem-based and eager. `read_dataset_bytes`,
+`read_native_image_bytes`, and `IoService::read_bytes` remain eager
+whole-buffer helpers and cannot resolve companions. Writers and `source_path`
+also remain path-oriented.
+
+Enable and test the integration with:
+
+```bash
+cargo test --features bioformats --test bioformats_storage
+```
+
+This is not full Java Bio-Formats parity. Notable gaps include ND2 JPEG 2000;
+CZI JPEG-XR, pyramid exposure, complex pixels, and some axes/LUT behavior;
+DCIMG multi-file Z grouping and timestamps; and documented TIFF packed-sample,
+FillOrder 2, Predictor 3, CMYK/WhiteIsZero, and non-JPEG YCbCr variants. Some
+implemented compressed paths still need broader real-fixture verification.
+
+`bioformats-rs` is GPL-2.0-or-later. The feature is disabled by default so
+ordinary image-rs builds retain their existing dependency set, but distributing
+a build that enables it can carry GPL obligations.
+
 ## Quick start
 
 ```bash

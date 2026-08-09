@@ -5,6 +5,10 @@ pub type Result<T> = std::result::Result<T, IoError>;
 
 #[derive(Debug, Error)]
 pub enum IoError {
+    #[cfg(feature = "bioformats")]
+    #[error("invalid application-owned asset: {0}")]
+    InvalidAsset(String),
+
     #[error("unsupported image format: {0}")]
     UnsupportedFormat(String),
 
@@ -19,6 +23,10 @@ pub enum IoError {
 
     #[error("TIFF decode/encode failure: {0}")]
     Tiff(#[from] tiff::TiffError),
+
+    #[cfg(feature = "bioformats")]
+    #[error("Bio-Formats reader failure: {0}")]
+    BioFormats(#[from] bioformats_rs::BioFormatsError),
 
     #[error("core dataset/metadata failure: {0}")]
     Core(#[from] CoreError),
