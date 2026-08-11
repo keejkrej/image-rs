@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use crate::commands::{Operation, default_registry};
+use crate::commands::{OperationRegistry, default_registry};
 use crate::model::{AxisKind, Dataset, Dim, Metadata, PixelType};
 use ndarray::Array;
 use serde_json::json;
@@ -36,7 +33,7 @@ fn pipeline_executes_in_order() {
         ],
     };
     let dataset = test_dataset();
-    let registry: HashMap<&'static str, Arc<dyn Operation>> = default_registry();
+    let registry: OperationRegistry = default_registry();
     let (result, report) = run_pipeline(&spec, &dataset, &registry).expect("pipeline");
     assert_eq!(report.steps.len(), 2);
     assert!(
@@ -54,6 +51,6 @@ fn invalid_pipeline_is_rejected() {
         operations: vec![],
     };
     let dataset = test_dataset();
-    let registry: HashMap<&'static str, Arc<dyn Operation>> = default_registry();
+    let registry: OperationRegistry = default_registry();
     assert!(run_pipeline(&spec, &dataset, &registry).is_err());
 }

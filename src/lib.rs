@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod formats;
 pub mod model;
+pub mod plugins;
 pub mod runtime;
 pub mod ui;
 pub mod workflow;

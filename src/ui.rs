@@ -4,4 +4,4 @@ mod macros;
 mod menu;
 mod toolbar;
 
-pub use gpui_app::run;
+pub use gpui_app::{run, run_with_ops};

@@ -6,7 +6,7 @@ Rust-first core rewrite inspired by ImageJ, with a native GPUI desktop UI and de
 
 - Single package: `image-rs`
 - Single binary: `image`
-- Internal modules: `cli`, `ui`, `model`, `formats`, `commands`, `workflow`, `runtime`
+- Internal modules: `cli`, `ui`, `model`, `formats`, `commands`, `plugins`, `workflow`, `runtime`
 
 ## What currently works
 
@@ -15,6 +15,7 @@ Rust-first core rewrite inspired by ImageJ, with a native GPUI desktop UI and de
 - Operation introspection with `image ops list`
 - Native ImageJ-style GPUI workspace with a persistent launcher and one native window per image
 - Shared tools, macros, command routing, ROI clipboard edits, ROI Manager, undo/redo, and persistent Results across viewers
+- Safe plugin package discovery with strict manifests, SemVer compatibility, namespaced operation/command contributions, and a future WebAssembly Component execution boundary; see [`docs/plugin-system.md`](docs/plugin-system.md)
 - MorphoLibJ-style operations integrated via [`morpholib-rs`](https://github.com/keejkrej/morpholib-rs)
 
 ## Application-owned Bio-Formats storage
@@ -154,6 +155,8 @@ Current constraints:
 
 ## UI launcher notes
 
+The current command counts, semantic gaps, and recommended parity sequence are tracked in [`docs/imagej-parity.md`](docs/imagej-parity.md).
+
 - Run `image` with no arguments to launch the native UI.
 - The startup launcher remains the command and tool surface. Every open image gets a native viewer window with an independent `viewer-N` session; reopening the same path focuses its existing viewer.
 - ImageJ-aligned behavior is presented with a modern zinc/blue surface, compact shadcn-inspired controls, and Lucide tool icons.
@@ -162,7 +165,7 @@ Current constraints:
 - Tool shortcuts (`R`, `O`, `G`, `F`, `L`, `A`, `P`, `W`, `T`, `Z`, `H`, `D`) work across image windows.
 - Rectangle, oval, polygon, freehand, line, angle, point, wand, and text selections render as ImageJ-style yellow overlays; `Image > Crop` crops to the active selection.
 - Cut/copy/paste, clear, fill, and select-all operate on the active plane and ROI bounds, with clipboard contents available in their own viewer.
-- Parameterized processing commands open viewer-bound GPUI dialogs, operation edits support undo/redo, and calibrated measurement rows accumulate in a persistent, horizontally scrollable Results window with CSV export and unit-safe summaries.
+- Parameterized processing commands open viewer-bound GPUI dialogs and operation edits support undo/redo. Analyze > Measure samples only the active C/Z/T plane and exact ROI, with calibrated ImageJ-style columns controlled by application-wide Set Measurements settings; Measure Stack appends one row per Z plane at the active C/T. Stored results retain full precision while the Results window and CSV export honor the selected decimal places.
 - Brightness/Contrast and Window/Level share a modeless, ROI-aware histogram utility with Minimum, Maximum, Brightness, Contrast, Window, and Level controls. Scientific channels retain independent display ranges; RGB Auto uses weighted luminance and repeated Auto progressively rejects sparse tails.
 - Display changes remain non-destructive until Apply LUT. Apply asks before changing pixels, honors exact ROI shapes, offers current-plane or full Z/T-stack scope, and records ImageJ-compatible `slice`/`stack` macros.
 - The modeless ROI Manager stores named selections with C/Z/T positions, supports stable Ctrl/Cmd and Shift multi-selection, restores selections into the active viewer, previews Show All without mutating overlays, measures real ROI geometry, and supports ImageJ `roiManager(...)` macro actions.

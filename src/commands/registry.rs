@@ -36,16 +36,83 @@ use super::{
     ThunderstormPipelineLocalizeOp,
 };
 
-type Registry = HashMap<&'static str, Arc<dyn Operation>>;
-
-fn register<O: Operation + 'static>(map: &mut Registry, operation: O) {
-    map.insert(operation.name(), Arc::new(operation));
+/// Application-owned operation registry with runtime-safe identifiers.
+///
+/// Built-ins and future sandboxed plugin adapters cross the same interface.
+/// Registration rejects collisions instead of silently replacing an existing
+/// implementation.
+#[derive(Clone, Default)]
+pub struct OperationRegistry {
+    operations: HashMap<String, Arc<dyn Operation>>,
 }
 
-fn registry() -> &'static Registry {
-    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+impl std::fmt::Debug for OperationRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperationRegistry")
+            .field("registered_ops", &self.operations.len())
+            .finish()
+    }
+}
+
+impl OperationRegistry {
+    pub fn register(&mut self, operation: Arc<dyn Operation>) -> Result<()> {
+        let declared_name = operation.name();
+        if declared_name.is_empty() || declared_name.trim() != declared_name {
+            return Err(OpsError::InvalidParams(
+                "operation identifiers must be non-empty and have no surrounding whitespace".into(),
+            ));
+        }
+        let name = declared_name.to_string();
+        if operation.schema().name != name {
+            return Err(OpsError::InvalidParams(format!(
+                "operation schema name must match `{name}`"
+            )));
+        }
+        if self.operations.contains_key(&name) {
+            return Err(OpsError::DuplicateOperation(name));
+        }
+        self.operations.insert(name, operation);
+        Ok(())
+    }
+
+    pub fn list(&self) -> Vec<OpSchema> {
+        let mut schemas = self
+            .operations
+            .values()
+            .map(|operation| operation.schema())
+            .collect::<Vec<_>>();
+        schemas.sort_by(|left, right| left.name.cmp(&right.name));
+        schemas
+    }
+
+    pub fn execute(&self, name: &str, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
+        let operation = self
+            .operations
+            .get(name)
+            .ok_or_else(|| OpsError::UnknownOperation(name.to_string()))?;
+        operation.execute(dataset, params)
+    }
+
+    pub fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+}
+
+fn register<O: Operation + 'static>(registry: &mut OperationRegistry, operation: O) {
+    registry
+        .register(Arc::new(operation))
+        .expect("built-in operation identifiers are unique");
+}
+
+fn registry() -> &'static OperationRegistry {
+    static REGISTRY: OnceLock<OperationRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let mut map: Registry = HashMap::new();
+        let mut map = OperationRegistry::default();
         register(&mut map, IntensityNormalizeOp);
         register(&mut map, IntensityEnhanceContrastOp);
         register(&mut map, IntensityInvertOp);
@@ -139,37 +206,83 @@ fn registry() -> &'static Registry {
     })
 }
 
-pub fn default_registry() -> HashMap<&'static str, Arc<dyn Operation>> {
-    registry()
-        .iter()
-        .map(|(name, op)| (*name, Arc::clone(op)))
-        .collect()
+pub fn default_registry() -> OperationRegistry {
+    registry().clone()
 }
 
 pub fn list_operations() -> Vec<OpSchema> {
-    let mut schemas = registry()
-        .values()
-        .map(|op| op.schema())
-        .collect::<Vec<_>>();
-    schemas.sort_by(|left, right| left.name.cmp(&right.name));
-    schemas
+    registry().list()
 }
 
 pub fn execute_operation(name: &str, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
-    let op = registry()
-        .get(name)
-        .ok_or_else(|| OpsError::UnknownOperation(name.to_string()))?;
-    op.execute(dataset, params)
+    registry().execute(name, dataset, params)
 }
 
 pub fn execute_operation_with_registry(
-    registry: &HashMap<&'static str, Arc<dyn Operation>>,
+    registry: &OperationRegistry,
     name: &str,
     dataset: &DatasetF32,
     params: &Value,
 ) -> Result<OpOutput> {
-    let op = registry
-        .get(name)
-        .ok_or_else(|| OpsError::UnknownOperation(name.to_string()))?;
-    op.execute(dataset, params)
+    registry.execute(name, dataset, params)
+}
+
+#[cfg(test)]
+mod tests {
+    use ndarray::Array;
+    use serde_json::Value;
+
+    use crate::model::{AxisKind, Dataset, Dim, Metadata, PixelType};
+
+    use super::*;
+
+    struct RuntimeNamedOperation {
+        name: String,
+    }
+
+    impl Operation for RuntimeNamedOperation {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn schema(&self) -> OpSchema {
+            OpSchema {
+                name: self.name.clone(),
+                description: "runtime-owned test operation".into(),
+                params: Vec::new(),
+            }
+        }
+
+        fn execute(&self, dataset: &DatasetF32, _params: &Value) -> Result<OpOutput> {
+            Ok(OpOutput::dataset_only(dataset.clone()))
+        }
+    }
+
+    fn dataset() -> DatasetF32 {
+        Dataset::new(
+            Array::from_shape_vec((1, 1), vec![7.0]).unwrap().into_dyn(),
+            Metadata {
+                dims: vec![Dim::new(AxisKind::Y, 1), Dim::new(AxisKind::X, 1)],
+                pixel_type: PixelType::F32,
+                ..Metadata::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn registry_accepts_runtime_owned_names_and_rejects_collisions() {
+        let mut registry = OperationRegistry::default();
+        let name = String::from("org.example.runtime.filter");
+        registry
+            .register(Arc::new(RuntimeNamedOperation { name: name.clone() }))
+            .unwrap();
+        let output = registry.execute(&name, &dataset(), &Value::Null).unwrap();
+        assert_eq!(output.dataset.data[[0, 0]], 7.0);
+
+        let error = registry
+            .register(Arc::new(RuntimeNamedOperation { name: name.clone() }))
+            .unwrap_err();
+        assert!(matches!(error, OpsError::DuplicateOperation(id) if id == name));
+    }
 }

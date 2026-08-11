@@ -789,7 +789,9 @@ fn declared_metadata(command_id: &str) -> CommandMetadata {
             true,
             true,
             None,
-            Some("Measure every Z slice in the active ImageJ-style stack into the Results table."),
+            Some(
+                "Measure every Z plane within the exact active ROI using the shared ImageJ-style measurement settings, appending one row per plane to Results.",
+            ),
         ),
         "image.stacks.statistics" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -1385,10 +1387,12 @@ fn declared_metadata(command_id: &str) -> CommandMetadata {
         "analyze.measure" => CommandMetadata::with(
             CommandScope::Viewer,
             true,
-            false,
+            true,
             true,
             None,
-            Some("Analyze the active image and append rows to the shared Results window."),
+            Some(
+                "Measure the active plane within the exact active ROI using the shared ImageJ-style measurement settings, then append one row to Results.",
+            ),
         ),
         "analyze.analyze_particles" => CommandMetadata::with(
             CommandScope::Viewer,
@@ -1495,12 +1499,12 @@ fn declared_metadata(command_id: &str) -> CommandMetadata {
             Some("Apply ImageJ Analyze/Calibrate value-unit metadata."),
         ),
         "analyze.set_measurements" => CommandMetadata::with(
-            CommandScope::Viewer,
+            CommandScope::Both,
+            true,
             true,
             false,
-            true,
             None,
-            Some("Open ImageJ-style measurement settings."),
+            Some("Configure the application-wide ImageJ-style measurement settings."),
         ),
         "analyze.summarize" | "analyze.clear_results" => CommandMetadata::with(
             CommandScope::Both,
@@ -1823,6 +1827,53 @@ mod tests {
             assert!(metadata.scope.contains("viewer-1"));
             assert!(!metadata.scope.contains("main"));
         }
+    }
+
+    #[test]
+    fn measurement_commands_expose_shared_exact_roi_workflows() {
+        let measure = metadata("analyze.measure");
+        assert!(
+            measure.implemented,
+            "Analyze > Measure should be implemented"
+        );
+        assert!(measure.frontend_only);
+        assert!(measure.requires_image);
+        assert!(measure.scope.contains("viewer-1"));
+        assert!(!measure.scope.contains("main"));
+        let measure_notes = measure.notes.expect("Analyze > Measure notes");
+        assert!(measure_notes.contains("active plane"));
+        assert!(measure_notes.contains("exact active ROI"));
+        assert!(measure_notes.contains("shared ImageJ-style measurement settings"));
+
+        let settings = metadata("analyze.set_measurements");
+        assert!(
+            settings.implemented,
+            "Analyze > Set Measurements should be implemented"
+        );
+        assert!(settings.frontend_only);
+        assert!(!settings.requires_image);
+        assert!(settings.scope.contains("main"));
+        assert!(settings.scope.contains("viewer-1"));
+        assert!(
+            settings
+                .notes
+                .expect("Analyze > Set Measurements notes")
+                .contains("application-wide")
+        );
+
+        let stack = metadata("image.stacks.measure_stack");
+        assert!(
+            stack.implemented,
+            "Image > Stacks > Measure Stack should be implemented"
+        );
+        assert!(stack.frontend_only);
+        assert!(stack.requires_image);
+        assert!(stack.scope.contains("viewer-1"));
+        assert!(!stack.scope.contains("main"));
+        let stack_notes = stack.notes.expect("Measure Stack notes");
+        assert!(stack_notes.contains("every Z plane"));
+        assert!(stack_notes.contains("exact active ROI"));
+        assert!(stack_notes.contains("shared ImageJ-style measurement settings"));
     }
 
     #[test]

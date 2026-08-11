@@ -44,7 +44,8 @@ pub use morphology::{
 };
 pub use noise::{NoiseGaussianOp, NoiseSaltAndPepperOp};
 pub use registry::{
-    default_registry, execute_operation, execute_operation_with_registry, list_operations,
+    OperationRegistry, default_registry, execute_operation, execute_operation_with_registry,
+    list_operations,
 };
 pub use schema::{MeasurementTable, OpOutput, OpSchema, Operation, ParamSpec};
 pub use threshold::{ThresholdFixedOp, ThresholdMakeBinaryOp, ThresholdOtsuOp};

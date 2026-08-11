@@ -2813,6 +2813,7 @@ dependencies = [
  "rayon",
  "rfd",
  "rustfft",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2821,7 +2822,9 @@ dependencies = [
  "thiserror 2.0.18",
  "thunderstorm-rs",
  "tiff",
+ "toml 0.8.23",
  "ureq",
+ "wasmparser",
 ]
 
 [[package]]

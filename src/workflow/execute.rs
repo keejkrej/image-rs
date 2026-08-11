@@ -1,8 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
-use crate::commands::{Operation, execute_operation_with_registry};
+use crate::commands::{OperationRegistry, execute_operation_with_registry};
 use crate::model::DatasetF32;
 
 use super::{PipelineReport, PipelineSpec, Result, StepReport};
@@ -10,7 +9,7 @@ use super::{PipelineReport, PipelineSpec, Result, StepReport};
 pub fn run_pipeline(
     spec: &PipelineSpec,
     dataset: &DatasetF32,
-    registry: &HashMap<&'static str, Arc<dyn Operation>>,
+    registry: &OperationRegistry,
 ) -> Result<(DatasetF32, PipelineReport)> {
     spec.validate()?;
     dataset.validate()?;

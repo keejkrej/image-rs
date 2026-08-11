@@ -11,6 +11,10 @@ pub struct PipelineService {
 }
 
 impl PipelineService {
+    pub fn new(ops: OpsService) -> Self {
+        Self { ops }
+    }
+
     pub fn load_spec(&self, path: impl AsRef<Path>) -> Result<PipelineSpec> {
         Ok(load_spec(path)?)
     }

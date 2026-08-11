@@ -40,7 +40,12 @@ impl OpOutput {
 }
 
 pub trait Operation: Send + Sync {
-    fn name(&self) -> &'static str;
+    /// Stable operation identifier.
+    ///
+    /// The identifier may be owned by the operation implementation. This is
+    /// what lets validated plugin operations join the same registry as the
+    /// built-in operations without leaking dynamically allocated strings.
+    fn name(&self) -> &str;
     fn schema(&self) -> OpSchema;
     fn execute(&self, dataset: &DatasetF32, params: &Value) -> Result<OpOutput>;
 }

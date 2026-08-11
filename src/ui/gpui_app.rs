@@ -16,9 +16,9 @@ use rfd::FileDialog;
 use serde_json::{Value, json};
 use smallvec::smallvec;
 
-use crate::commands::execute_operation;
 use crate::formats::{read_dataset, supported_formats, write_dataset};
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
+use crate::runtime::OpsService;
 
 use super::command_registry;
 use super::macros::{self, MacroCommandInvocation};
@@ -193,6 +193,71 @@ struct ParameterField {
     label: String,
     value: String,
     kind: ParameterKind,
+}
+
+/// Application-wide ImageJ measurement options.
+///
+/// ImageJ shares these choices across every image window. Keep them on the
+/// launcher-owned application state rather than on individual viewers so
+/// Analyze > Measure, Measure Stack, overlays, and the ROI Manager all cross
+/// the same interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeasurementSettings {
+    area: bool,
+    mean: bool,
+    standard_deviation: bool,
+    min_max: bool,
+    centroid: bool,
+    perimeter: bool,
+    bounding_rectangle: bool,
+    integrated_density: bool,
+    median: bool,
+    stack_position: bool,
+    display_label: bool,
+    invert_y_coordinates: bool,
+    decimal_places: u8,
+}
+
+impl Default for MeasurementSettings {
+    fn default() -> Self {
+        // Matches ImageJ's Analyzer default: AREA + MEAN + MIN_MAX.
+        Self {
+            area: true,
+            mean: true,
+            standard_deviation: false,
+            min_max: true,
+            centroid: false,
+            perimeter: false,
+            bounding_rectangle: false,
+            integrated_density: false,
+            median: false,
+            stack_position: false,
+            display_label: false,
+            invert_y_coordinates: false,
+            decimal_places: 3,
+        }
+    }
+}
+
+impl MeasurementSettings {
+    #[cfg(test)]
+    fn all_supported() -> Self {
+        Self {
+            area: true,
+            mean: true,
+            standard_deviation: true,
+            min_max: true,
+            centroid: true,
+            perimeter: true,
+            bounding_rectangle: true,
+            integrated_density: true,
+            median: true,
+            stack_position: true,
+            display_label: true,
+            invert_y_coordinates: false,
+            decimal_places: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -505,6 +570,7 @@ struct ViewerGeometry {
 }
 
 struct ImageJApp {
+    ops_service: OpsService,
     tabs: Vec<ImageTab>,
     active_tab: Option<u64>,
     activation_order: Vec<u64>,
@@ -527,6 +593,7 @@ struct ImageJApp {
     next_managed_roi_id: u64,
     roi_manager_show_all_target: Option<u64>,
     results: Vec<BTreeMap<String, Value>>,
+    measurement_settings: MeasurementSettings,
     results_window_pending: bool,
     macro_recording: bool,
     macro_recorded: String,
@@ -713,7 +780,7 @@ impl DisplayAdjustWindow {
 }
 
 impl ImageJApp {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, ops_service: OpsService, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let weak_app = cx.entity().downgrade();
@@ -728,6 +795,7 @@ impl ImageJApp {
             false
         });
         Self {
+            ops_service,
             tabs: Vec::new(),
             active_tab: None,
             activation_order: Vec::new(),
@@ -753,6 +821,7 @@ impl ImageJApp {
             next_managed_roi_id: 0,
             roi_manager_show_all_target: None,
             results: Vec::new(),
+            measurement_settings: MeasurementSettings::default(),
             results_window_pending: false,
             macro_recording: false,
             macro_recorded: String::new(),
@@ -1390,6 +1459,59 @@ impl ImageJApp {
             focused: 0,
         });
         self.status = "Create an 8-bit image or stack".into();
+    }
+
+    fn open_measurement_settings_dialog(&mut self) {
+        let settings = self.measurement_settings;
+        let field = |key: &str, label: &str, enabled: bool| ParameterField {
+            key: key.into(),
+            label: label.into(),
+            value: enabled.to_string(),
+            kind: ParameterKind::Boolean,
+        };
+        self.dialog = Some(DialogState::Operation {
+            command_id: "__measurement_settings".into(),
+            target_tab_id: None,
+            title: "Set Measurements".into(),
+            fields: vec![
+                field("area", "Area", settings.area),
+                field("mean", "Mean gray value", settings.mean),
+                field(
+                    "standard_deviation",
+                    "Standard deviation",
+                    settings.standard_deviation,
+                ),
+                field("min_max", "Min & max gray value", settings.min_max),
+                field("centroid", "Centroid", settings.centroid),
+                field("perimeter", "Perimeter", settings.perimeter),
+                field(
+                    "bounding_rectangle",
+                    "Bounding rectangle",
+                    settings.bounding_rectangle,
+                ),
+                field(
+                    "integrated_density",
+                    "Integrated density",
+                    settings.integrated_density,
+                ),
+                field("median", "Median", settings.median),
+                field("stack_position", "Stack position", settings.stack_position),
+                field("display_label", "Display label", settings.display_label),
+                field(
+                    "invert_y_coordinates",
+                    "Invert Y coordinates",
+                    settings.invert_y_coordinates,
+                ),
+                ParameterField {
+                    key: "decimal_places".into(),
+                    label: "Decimal places (0-9)".into(),
+                    value: settings.decimal_places.to_string(),
+                    kind: ParameterKind::Number,
+                },
+            ],
+            focused: 0,
+        });
+        self.status = "Choose the columns shared by Measure, Measure Stack, and ROI Manager".into();
     }
 
     fn open_display_range_set_dialog(&mut self) {
@@ -2393,6 +2515,17 @@ impl ImageJApp {
             }
             self.focus_viewer(tab_id, cx);
         }
+        if command_id == "__measurement_settings" {
+            self.measurement_settings = measurement_settings_from_params(
+                &Value::Object(params.clone()),
+                self.measurement_settings,
+                true,
+            );
+            let recorded = Value::Object(params);
+            self.record_command("analyze.set_measurements", Some(&recorded));
+            self.status = "Measurement settings updated for all image windows".into();
+            return;
+        }
         if command_id == "__apply_lut" {
             let scope = if params.get("stack").and_then(Value::as_bool) == Some(true) {
                 ApplyLutScope::Stack
@@ -2498,7 +2631,7 @@ impl ImageJApp {
             None
         };
         let operation_input = plane_input.as_ref().unwrap_or(current.as_ref());
-        match execute_operation(op, operation_input, &params) {
+        match self.ops_service.execute(op, operation_input, &params) {
             Ok(output) => {
                 let measurements = output.measurements;
                 if measurements.is_none() {
@@ -2554,7 +2687,10 @@ impl ImageJApp {
         if operation_for_command(command_id).is_none()
             && !matches!(
                 command_id,
-                "image.adjust.brightness" | "image.adjust.window_level" | "image.lookup.apply_lut"
+                "image.adjust.brightness"
+                    | "image.adjust.window_level"
+                    | "image.lookup.apply_lut"
+                    | "analyze.set_measurements"
             )
         {
             self.record_command(command_id, None);
@@ -2664,6 +2800,8 @@ impl ImageJApp {
                 }
             }
             "image.overlay.to_roi_manager" => self.replace_roi_manager_from_overlay(),
+            "analyze.measure" => self.measure_active_image(),
+            "analyze.set_measurements" => self.open_measurement_settings_dialog(),
             "analyze.tools.roi_manager" => self.open_roi_manager_window(cx),
             "analyze.tools.results" => self.open_results_window(cx),
             "analyze.clear_results" => self.clear_results(),
@@ -2713,6 +2851,7 @@ impl ImageJApp {
             }
             "image.stacks.next" => self.step_stack(AxisKind::Z, 1),
             "image.stacks.previous" => self.step_stack(AxisKind::Z, -1),
+            "image.stacks.measure_stack" => self.measure_active_stack(),
             "edit.selection.none" => self.clear_selection(),
             "help.about" => self.dialog = Some(DialogState::About),
             "help.shortcuts" => {
@@ -3302,6 +3441,70 @@ impl ImageJApp {
         }
     }
 
+    fn measure_active_image(&mut self) {
+        let settings = self.measurement_settings;
+        let roi_number = self.results.len().saturating_add(1);
+        let Some(tab) = self.active_tab() else {
+            self.status = "Measure requires an open image".into();
+            return;
+        };
+        let selection = active_measurement_selection(tab);
+        let row = match measure_roi_on_tab(
+            tab,
+            &selection,
+            &tab.title,
+            "Measure",
+            roi_number,
+            RoiPosition {
+                channel: tab.channel,
+                z: tab.z,
+                t: tab.t,
+            },
+            &settings,
+        ) {
+            Ok(row) => row,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.results.push(row);
+        self.results_window_pending = true;
+        self.status = format!(
+            "Measured active C/Z/T plane · {} result row(s)",
+            self.results.len()
+        );
+    }
+
+    fn measure_active_stack(&mut self) {
+        let settings = self.measurement_settings;
+        let first_roi_number = self.results.len().saturating_add(1);
+        let (rows, channel, time) = {
+            let Some(tab) = self.active_tab() else {
+                self.status = "Measure Stack requires an open image".into();
+                return;
+            };
+            let selection = active_measurement_selection(tab);
+            let rows = match measure_stack_rows(tab, &selection, &settings, first_roi_number) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+            (rows, tab.channel, tab.t)
+        };
+        let added = rows.len();
+        self.results.extend(rows);
+        self.results_window_pending = true;
+        self.status = format!(
+            "Measured {added} Z slice(s) at C={} T={} · {} result row(s)",
+            channel + 1,
+            time + 1,
+            self.results.len()
+        );
+    }
+
     fn show_overlay_list(&mut self) {
         let Some(tab) = self.active_tab() else {
             self.status = "No image is open".into();
@@ -3323,6 +3526,7 @@ impl ImageJApp {
     }
 
     fn measure_overlays(&mut self) {
+        let settings = self.measurement_settings;
         let Some(tab) = self.active_tab() else {
             self.status = "No image is open".into();
             return;
@@ -3348,9 +3552,17 @@ impl ImageJApp {
                     "Measure Overlay",
                     index + 1,
                     position,
+                    &settings,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>();
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         self.results.extend(rows);
         self.results_window_pending = true;
         self.status = format!(
@@ -3576,6 +3788,7 @@ impl ImageJApp {
     }
 
     fn measure_managed_rois(&mut self, cx: &mut Context<Self>) {
+        let settings = self.measurement_settings;
         let Some(tab) = self.active_tab() else {
             self.status = "Open an image before measuring managed ROIs".into();
             return;
@@ -3607,9 +3820,17 @@ impl ImageJApp {
                     "ROI Manager Measure",
                     index + 1,
                     entry.position,
+                    &settings,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>();
+        let rows = match rows {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
         let added = rows.len();
         self.results.extend(rows);
         self.results_window_pending = true;
@@ -3765,6 +3986,7 @@ impl ImageJApp {
             return;
         };
         let columns = result_columns(&self.results);
+        let decimal_places = self.measurement_settings.decimal_places;
         let mut csv = String::new();
         csv.push_str("Row");
         for column in &columns {
@@ -3777,7 +3999,9 @@ impl ImageJApp {
             for column in &columns {
                 csv.push(',');
                 csv.push_str(&csv_cell(
-                    &row.get(column).map(format_json_value).unwrap_or_default(),
+                    &row.get(column)
+                        .map(|value| format_json_value(value, decimal_places))
+                        .unwrap_or_default(),
                 ));
             }
             csv.push('\n');
@@ -3794,9 +4018,10 @@ impl ImageJApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let columns = result_columns(&self.results);
+        let decimal_places = self.measurement_settings.decimal_places;
         let column_widths = columns
             .iter()
-            .map(|column| result_column_width(&self.results, column))
+            .map(|column| result_column_width(&self.results, column, decimal_places))
             .collect::<Vec<_>>();
         let header_cells = std::iter::once(
             div()
@@ -3849,7 +4074,11 @@ impl ImageJApp {
                                 .flex_none()
                                 .px_2()
                                 .whitespace_nowrap()
-                                .child(row.get(column).map(format_json_value).unwrap_or_default())
+                                .child(
+                                    row.get(column)
+                                        .map(|value| format_json_value(value, decimal_places))
+                                        .unwrap_or_default(),
+                                )
                                 .into_any_element()
                         }),
                 )
@@ -5233,6 +5462,32 @@ impl ImageJApp {
                     ApplyLutScope::Slice
                 };
                 return self.apply_lut_to_pixels(scope);
+            }
+            "analyze.measure" => {
+                let before = self.results.len();
+                self.measure_active_image();
+                if self.results.len() == before {
+                    return Err(self.status.clone());
+                }
+                return Ok(self.status.clone());
+            }
+            "analyze.set_measurements" => {
+                if params.as_object().is_none_or(serde_json::Map::is_empty) {
+                    self.open_measurement_settings_dialog();
+                    return Ok("measurement settings dialog opened".into());
+                }
+                self.measurement_settings =
+                    measurement_settings_from_params(&params, self.measurement_settings, true);
+                self.status = "Measurement settings updated for all image windows".into();
+                return Ok(self.status.clone());
+            }
+            "image.stacks.measure_stack" => {
+                let before = self.results.len();
+                self.measure_active_stack();
+                if self.results.len() == before {
+                    return Err(self.status.clone());
+                }
+                return Ok(self.status.clone());
             }
             "analyze.tools.roi_manager" => self.open_roi_manager_window(cx),
             "analyze.tools.results" => self.open_results_window(cx),
@@ -7204,6 +7459,103 @@ fn roi_bounds(
     (min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
+fn active_measurement_selection(tab: &ImageTab) -> RoiSelection {
+    tab.roi.clone().unwrap_or_else(|| RoiSelection {
+        tool: ToolId::Rect,
+        points: vec![(0.0, 0.0), (tab.width as f32, tab.height as f32)],
+    })
+}
+
+fn measure_stack_rows(
+    tab: &ImageTab,
+    selection: &RoiSelection,
+    settings: &MeasurementSettings,
+    first_roi_number: usize,
+) -> Result<Vec<BTreeMap<String, Value>>, String> {
+    if tab.slices <= 1 {
+        return Err("Measure Stack requires more than one Z slice".into());
+    }
+    // ImageJ's MeasureStack macro temporarily enables Stack position even
+    // when that global setting is off, so every emitted row remains
+    // identifiable. This native milestone iterates Z at the active C/T.
+    let mut stack_settings = *settings;
+    stack_settings.stack_position = true;
+    (0..tab.slices)
+        .map(|z| {
+            measure_roi_on_tab(
+                tab,
+                selection,
+                &format!("{}: slice {}", tab.title, z + 1),
+                "Measure Stack",
+                first_roi_number.saturating_add(z),
+                RoiPosition {
+                    channel: tab.channel,
+                    z,
+                    t: tab.t,
+                },
+                &stack_settings,
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct MeasurementAxisCalibration {
+    spacing: f64,
+    origin: f64,
+    direction: f64,
+    unit: String,
+}
+
+impl MeasurementAxisCalibration {
+    fn coordinate(&self, pixel: f64) -> f64 {
+        self.origin + self.direction * self.spacing * pixel
+    }
+}
+
+fn measurement_axis_calibration(
+    dataset: &DatasetF32,
+    axis_kind: AxisKind,
+    label: &str,
+) -> Result<MeasurementAxisCalibration, String> {
+    let axis = dataset
+        .axis_index(axis_kind)
+        .ok_or_else(|| format!("Measurement requires an {label}-axis"))?;
+    let dim = &dataset.metadata.dims[axis];
+    let spacing = f64::from(dim.spacing.unwrap_or(1.0));
+    if !spacing.is_finite() || spacing <= 0.0 {
+        return Err("Measurement requires finite positive X/Y spacing".into());
+    }
+    let unit = dim
+        .unit
+        .as_deref()
+        .map(str::trim)
+        .filter(|unit| !unit.is_empty())
+        .unwrap_or("pixel")
+        .to_string();
+    let origin_key = format!("{label}_origin_coordinate");
+    let origin = match dataset.metadata.extras.get(&origin_key) {
+        None => 0.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|origin| origin.is_finite())
+            .ok_or_else(|| format!("Measurement requires a finite `{origin_key}`"))?,
+    };
+    let inverted_key = format!("{label}_coordinate_inverted");
+    let inverted = match dataset.metadata.extras.get(&inverted_key) {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("Measurement requires `{inverted_key}` to be a boolean"))?,
+    };
+    Ok(MeasurementAxisCalibration {
+        spacing,
+        origin,
+        direction: if inverted { -1.0 } else { 1.0 },
+        unit,
+    })
+}
+
 fn measure_roi_on_tab(
     tab: &ImageTab,
     selection: &RoiSelection,
@@ -7211,7 +7563,8 @@ fn measure_roi_on_tab(
     command: &str,
     roi_number: usize,
     position: RoiPosition,
-) -> BTreeMap<String, Value> {
+    settings: &MeasurementSettings,
+) -> Result<BTreeMap<String, Value>, String> {
     let channel = position.channel.min(tab.channels.saturating_sub(1));
     let z = position.z.min(tab.slices.saturating_sub(1));
     let t = position.t.min(tab.frames.saturating_sub(1));
@@ -7220,42 +7573,188 @@ fn measure_roi_on_tab(
     } else {
         roi_bounds(selection, tab.width, tab.height)
     };
-    let pixels = roi_sample_pixels(selection, tab.width, tab.height);
-    let values = pixels
+    let pixels = match selection.tool {
+        // ImageJ measures a point's intensity at its nearest pixel, while
+        // retaining the original floating coordinate in the Results table.
+        ToolId::Point => selection
+            .points
+            .first()
+            .and_then(|point| nearest_pixel_at_point(*point, tab.width, tab.height))
+            .into_iter()
+            .collect(),
+        // Analyzer.measureAngle deliberately uses empty statistics and adds
+        // only the geometric angle after the selected measurement columns.
+        ToolId::Line | ToolId::Angle => Vec::new(),
+        _ => roi_sample_pixels(selection, tab.width, tab.height),
+    };
+    let samples = pixels
         .iter()
-        .filter_map(|&(x, y)| sample_dataset(tab.dataset.as_ref(), x, y, z, t, channel))
+        .filter_map(|&(x, y)| {
+            sample_dataset(tab.dataset.as_ref(), x, y, z, t, channel).map(|value| (x, y, value))
+        })
+        .filter(|(_, _, value)| value.is_finite())
+        .collect::<Vec<_>>();
+    let values = if selection.tool == ToolId::Line {
+        line_profile_values(tab, selection, z, t, channel)
+    } else {
+        samples
+            .iter()
+            .map(|(_, _, value)| *value)
+            .collect::<Vec<_>>()
+    };
+    let values = values
+        .into_iter()
         .filter(|value| value.is_finite())
         .collect::<Vec<_>>();
-    let (minimum, maximum, mean) = measurement_statistics(&values);
+    let statistics = measurement_statistics(&values);
+    let x_calibration = measurement_axis_calibration(tab.dataset.as_ref(), AxisKind::X, "x")?;
+    let y_calibration = measurement_axis_calibration(tab.dataset.as_ref(), AxisKind::Y, "y")?;
+    let common_length_unit = x_calibration.unit == y_calibration.unit;
+    let (length_x_scale, length_y_scale, length_unit) = if common_length_unit {
+        (
+            x_calibration.spacing,
+            y_calibration.spacing,
+            x_calibration.unit.clone(),
+        )
+    } else {
+        (1.0, 1.0, "pixel".to_string())
+    };
+    let area_unit = if x_calibration.unit == y_calibration.unit {
+        format!("{}^2", x_calibration.unit)
+    } else {
+        format!("{}·{}", x_calibration.unit, y_calibration.unit)
+    };
+    let sampled_area = values.len() as f64 * x_calibration.spacing * y_calibration.spacing;
+    let reported_area = if selection.tool == ToolId::Point {
+        0.0
+    } else {
+        sampled_area
+    };
+    let y_coordinate = |pixel: f64| {
+        if settings.invert_y_coordinates && y_calibration.direction > 0.0 {
+            y_calibration.origin + y_calibration.spacing * (tab.height as f64 - pixel - 1.0)
+        } else {
+            y_calibration.coordinate(pixel)
+        }
+    };
 
     let mut row = BTreeMap::new();
-    row.insert("Label".into(), json!(label));
+    if settings.display_label {
+        row.insert("Label".into(), json!(label));
+    }
+    row.insert("Image".into(), json!(tab.title));
     row.insert("Command".into(), json!(command));
     row.insert("ROI".into(), json!(roi_number));
     row.insert("Type".into(), json!(selection.tool.label()));
-    row.insert("C".into(), json!(channel + 1));
-    row.insert("Z".into(), json!(z + 1));
-    row.insert("T".into(), json!(t + 1));
-    row.insert("X".into(), json!(bounds.0));
-    row.insert("Y".into(), json!(bounds.1));
-    row.insert("Width".into(), json!(bounds.2));
-    row.insert("Height".into(), json!(bounds.3));
-    row.insert("Mean".into(), json!(mean));
-    row.insert("Min".into(), json!(minimum));
-    row.insert("Max".into(), json!(maximum));
-
-    if matches!(selection.tool, ToolId::Line | ToolId::Angle) {
-        row.insert("Length".into(), json!(polyline_length(&selection.points)));
-        if let Some(angle) = roi_angle(selection) {
-            row.insert("Angle".into(), json!(angle));
+    let point_stack_position =
+        selection.tool == ToolId::Point && (tab.channels > 1 || tab.slices > 1 || tab.frames > 1);
+    if settings.stack_position || point_stack_position {
+        let hyperstack = tab.channels > 1 || tab.frames > 1;
+        if tab.channels > 1 {
+            row.insert("Ch".into(), json!(channel + 1));
         }
-    } else {
-        row.insert("Area".into(), json!(pixels.len()));
-        if let Some(perimeter) = area_roi_perimeter(selection) {
-            row.insert("Perim.".into(), json!(perimeter));
+        // ImageJ's hyperstack branch includes only dimensions whose size is
+        // greater than one. Ordinary images/stacks use the legacy Slice
+        // column even for a single plane.
+        if tab.slices > 1 || !hyperstack {
+            row.insert("Slice".into(), json!(z + 1));
+        }
+        if tab.frames > 1 {
+            row.insert("Frame".into(), json!(t + 1));
         }
     }
-    row
+    if settings.area {
+        row.insert("Area".into(), json!(reported_area));
+        row.insert("area_unit".into(), json!(area_unit));
+    }
+    if settings.mean {
+        row.insert("Mean".into(), json!(statistics.mean));
+    }
+    if settings.standard_deviation {
+        row.insert("StdDev".into(), json!(statistics.standard_deviation));
+    }
+    if settings.min_max {
+        row.insert("Min".into(), json!(statistics.minimum));
+        row.insert("Max".into(), json!(statistics.maximum));
+    }
+    if settings.median {
+        row.insert("Median".into(), json!(statistics.median));
+    }
+    if settings.integrated_density {
+        row.insert("IntDen".into(), json!(sampled_area * statistics.mean));
+        row.insert("RawIntDen".into(), json!(statistics.sum));
+        row.entry("area_unit".into())
+            .or_insert_with(|| json!(area_unit));
+    }
+    if selection.tool == ToolId::Point
+        && let Some(&(x, y)) = selection.points.first()
+    {
+        row.insert("X".into(), json!(x_calibration.coordinate(f64::from(x))));
+        row.insert("Y".into(), json!(y_coordinate(f64::from(y))));
+    } else if settings.centroid && selection.tool == ToolId::Angle {
+        row.insert("X".into(), json!(0.0));
+        row.insert("Y".into(), json!(0.0));
+    } else if settings.centroid && selection.tool == ToolId::Line && selection.points.len() >= 2 {
+        let first = selection.points[0];
+        let last = *selection
+            .points
+            .last()
+            .expect("line has at least two points");
+        let midpoint_x = f64::from(first.0 + last.0) * 0.5;
+        let midpoint_y = f64::from(first.1 + last.1) * 0.5;
+        row.insert("X".into(), json!(x_calibration.coordinate(midpoint_x)));
+        row.insert("Y".into(), json!(y_coordinate(midpoint_y)));
+    } else if settings.centroid && !samples.is_empty() {
+        let count = samples.len() as f64;
+        let centroid_x = samples.iter().map(|(x, _, _)| *x as f64 + 0.5).sum::<f64>() / count;
+        let centroid_y = samples.iter().map(|(_, y, _)| *y as f64 + 0.5).sum::<f64>() / count;
+        row.insert("X".into(), json!(x_calibration.coordinate(centroid_x)));
+        row.insert("Y".into(), json!(y_coordinate(centroid_y)));
+    }
+    if settings.bounding_rectangle {
+        row.insert(
+            "BX".into(),
+            json!(x_calibration.coordinate(bounds.0 as f64)),
+        );
+        row.insert("BY".into(), json!(y_coordinate(bounds.1 as f64)));
+        row.insert(
+            "Width".into(),
+            json!(bounds.2 as f64 * x_calibration.spacing),
+        );
+        row.insert(
+            "Height".into(),
+            json!(bounds.3 as f64 * y_calibration.spacing),
+        );
+    }
+
+    if settings.perimeter
+        && let Some(perimeter) = roi_perimeter(selection, length_x_scale, length_y_scale)
+    {
+        row.insert("Perim.".into(), json!(perimeter));
+        row.insert("length_unit".into(), json!(length_unit.clone()));
+    }
+
+    if selection.tool == ToolId::Line {
+        row.insert(
+            "Length".into(),
+            json!(polyline_length(
+                &selection.points,
+                length_x_scale,
+                length_y_scale
+            )),
+        );
+        row.insert("length_unit".into(), json!(length_unit));
+        if selection.points.len() == 2
+            && let Some(angle) = roi_angle(selection, length_x_scale, length_y_scale)
+        {
+            row.insert("Angle".into(), json!(angle));
+        }
+    } else if selection.tool == ToolId::Angle
+        && let Some(angle) = roi_angle(selection, length_x_scale, length_y_scale)
+    {
+        row.insert("Angle".into(), json!(angle));
+    }
+    Ok(row)
 }
 
 fn roi_sample_pixels(
@@ -7406,6 +7905,103 @@ fn pixel_at_point(
     Some((point.0.floor() as usize, point.1.floor() as usize))
 }
 
+fn nearest_pixel_at_point(
+    point: (f32, f32),
+    image_width: usize,
+    image_height: usize,
+) -> Option<(usize, usize)> {
+    if !point.0.is_finite() || !point.1.is_finite() {
+        return None;
+    }
+    let x = point.0.round();
+    let y = point.1.round();
+    if x < 0.0 || y < 0.0 || x >= image_width as f32 || y >= image_height as f32 {
+        return None;
+    }
+    Some((x as usize, y as usize))
+}
+
+/// ImageJ's default line profile uses approximately one bilinearly
+/// interpolated value per Euclidean pixel. Keep a shared vertex only once
+/// when the ROI is a multi-segment polyline.
+fn line_profile_values(
+    tab: &ImageTab,
+    selection: &RoiSelection,
+    z: usize,
+    t: usize,
+    channel: usize,
+) -> Vec<f32> {
+    if selection.points.len() < 2 {
+        return Vec::new();
+    }
+    let mut values = Vec::new();
+    for segment in selection.points.windows(2) {
+        let start = segment[0];
+        let end = segment[1];
+        let dx = f64::from(end.0 - start.0);
+        let dy = f64::from(end.1 - start.1);
+        let intervals = dx.hypot(dy).round().max(0.0) as usize;
+        let first_step = usize::from(!values.is_empty());
+        if intervals == 0 {
+            if values.is_empty() {
+                values.push(interpolated_dataset_sample(
+                    tab,
+                    f64::from(start.0),
+                    f64::from(start.1),
+                    z,
+                    t,
+                    channel,
+                ));
+            }
+            continue;
+        }
+        values.extend((first_step..=intervals).map(|step| {
+            let fraction = step as f64 / intervals as f64;
+            let x = f64::from(start.0) + dx * fraction;
+            let y = f64::from(start.1) + dy * fraction;
+            interpolated_dataset_sample(tab, x, y, z, t, channel)
+        }));
+    }
+    values
+}
+
+fn interpolated_dataset_sample(
+    tab: &ImageTab,
+    x: f64,
+    y: f64,
+    z: usize,
+    t: usize,
+    channel: usize,
+) -> f32 {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= tab.width as f64
+        || y >= tab.height as f64
+    {
+        return 0.0;
+    }
+    if tab.width <= 1 || tab.height <= 1 {
+        return nearest_pixel_at_point((x as f32, y as f32), tab.width, tab.height)
+            .and_then(|(x, y)| sample_dataset(tab.dataset.as_ref(), x, y, z, t, channel))
+            .unwrap_or(0.0);
+    }
+    let left = x.floor().clamp(0.0, tab.width.saturating_sub(2) as f64) as usize;
+    let top = y.floor().clamp(0.0, tab.height.saturating_sub(2) as f64) as usize;
+    let x_fraction = (x - left as f64).clamp(0.0, 1.0);
+    let y_fraction = (y - top as f64).clamp(0.0, 1.0);
+    let sample =
+        |x, y| sample_dataset(tab.dataset.as_ref(), x, y, z, t, channel).unwrap_or(0.0) as f64;
+    let lower_left = sample(left, top);
+    let lower_right = sample(left + 1, top);
+    let upper_left = sample(left, top + 1);
+    let upper_right = sample(left + 1, top + 1);
+    let lower = lower_left + x_fraction * (lower_right - lower_left);
+    let upper = upper_left + x_fraction * (upper_right - upper_left);
+    (lower + y_fraction * (upper - lower)) as f32
+}
+
 fn polyline_sample_pixels(
     points: &[(f32, f32)],
     image_width: usize,
@@ -7443,24 +8039,30 @@ fn polyline_sample_pixels(
     pixels
 }
 
-fn polyline_length(points: &[(f32, f32)]) -> f64 {
+fn polyline_length(points: &[(f32, f32)], x_scale: f64, y_scale: f64) -> f64 {
     points
         .windows(2)
         .map(|segment| {
-            let dx = f64::from(segment[1].0 - segment[0].0);
-            let dy = f64::from(segment[1].1 - segment[0].1);
+            let dx = f64::from(segment[1].0 - segment[0].0) * x_scale;
+            let dy = f64::from(segment[1].1 - segment[0].1) * y_scale;
             dx.hypot(dy)
         })
         .sum()
 }
 
-fn roi_angle(selection: &RoiSelection) -> Option<f64> {
+fn roi_angle(selection: &RoiSelection, x_scale: f64, y_scale: f64) -> Option<f64> {
     if selection.points.len() >= 3 {
         let first = selection.points[0];
         let vertex = selection.points[1];
         let last = selection.points[2];
-        let first_vector = (f64::from(first.0 - vertex.0), f64::from(first.1 - vertex.1));
-        let second_vector = (f64::from(last.0 - vertex.0), f64::from(last.1 - vertex.1));
+        let first_vector = (
+            f64::from(first.0 - vertex.0) * x_scale,
+            f64::from(first.1 - vertex.1) * y_scale,
+        );
+        let second_vector = (
+            f64::from(last.0 - vertex.0) * x_scale,
+            f64::from(last.1 - vertex.1) * y_scale,
+        );
         let denominator =
             first_vector.0.hypot(first_vector.1) * second_vector.0.hypot(second_vector.1);
         if denominator <= f64::EPSILON {
@@ -7475,22 +8077,27 @@ fn roi_angle(selection: &RoiSelection) -> Option<f64> {
         return None;
     };
     Some(
-        f64::from(-(last.1 - first.1))
-            .atan2(f64::from(last.0 - first.0))
+        (-f64::from(last.1 - first.1) * y_scale)
+            .atan2(f64::from(last.0 - first.0) * x_scale)
             .to_degrees(),
     )
 }
 
-fn area_roi_perimeter(selection: &RoiSelection) -> Option<f64> {
+fn roi_perimeter(selection: &RoiSelection, x_scale: f64, y_scale: f64) -> Option<f64> {
     match selection.tool {
+        ToolId::Line | ToolId::Angle if selection.points.len() >= 2 => {
+            Some(polyline_length(&selection.points, x_scale, y_scale))
+        }
         ToolId::Rect if selection.points.len() >= 2 => {
             let (minimum, maximum) = selection_axis_bounds(selection);
-            Some(2.0 * f64::from(maximum.0 - minimum.0 + maximum.1 - minimum.1))
+            let width = f64::from((maximum.0 - minimum.0).abs()) * x_scale;
+            let height = f64::from((maximum.1 - minimum.1).abs()) * y_scale;
+            Some(2.0 * (width + height))
         }
         ToolId::Oval if selection.points.len() >= 2 => {
             let (minimum, maximum) = selection_axis_bounds(selection);
-            let a = f64::from((maximum.0 - minimum.0).abs()) * 0.5;
-            let b = f64::from((maximum.1 - minimum.1).abs()) * 0.5;
+            let a = f64::from((maximum.0 - minimum.0).abs()) * x_scale * 0.5;
+            let b = f64::from((maximum.1 - minimum.1).abs()) * y_scale * 0.5;
             if a <= f64::EPSILON || b <= f64::EPSILON {
                 return Some(0.0);
             }
@@ -7498,27 +8105,70 @@ fn area_roi_perimeter(selection: &RoiSelection) -> Option<f64> {
             Some(std::f64::consts::PI * (a + b) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt())))
         }
         ToolId::Poly | ToolId::Free if selection.points.len() >= 3 => {
-            let mut perimeter = polyline_length(&selection.points);
+            let mut perimeter = polyline_length(&selection.points, x_scale, y_scale);
             let first = selection.points[0];
             let last = *selection
                 .points
                 .last()
                 .expect("area ROI has at least three points");
-            perimeter += f64::from(last.0 - first.0).hypot(f64::from(last.1 - first.1));
+            perimeter += (f64::from(last.0 - first.0) * x_scale)
+                .hypot(f64::from(last.1 - first.1) * y_scale);
             Some(perimeter)
         }
         _ => None,
     }
 }
 
-fn measurement_statistics(values: &[f32]) -> (f32, f32, f64) {
+#[derive(Debug, Clone, Copy)]
+struct MeasurementStatistics {
+    minimum: f32,
+    maximum: f32,
+    mean: f64,
+    sum: f64,
+    standard_deviation: f64,
+    median: f64,
+}
+
+fn measurement_statistics(values: &[f32]) -> MeasurementStatistics {
     if values.is_empty() {
-        return (0.0, 0.0, 0.0);
+        return MeasurementStatistics {
+            minimum: 0.0,
+            maximum: 0.0,
+            mean: 0.0,
+            sum: 0.0,
+            standard_deviation: 0.0,
+            median: 0.0,
+        };
     }
     let minimum = values.iter().copied().fold(f32::INFINITY, f32::min);
     let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum = values.iter().map(|value| f64::from(*value)).sum::<f64>();
-    (minimum, maximum, sum / values.len() as f64)
+    let mean = sum / values.len() as f64;
+    let standard_deviation = if values.len() > 1 {
+        let squared_error = values
+            .iter()
+            .map(|value| (f64::from(*value) - mean).powi(2))
+            .sum::<f64>();
+        (squared_error / (values.len() - 1) as f64).sqrt()
+    } else {
+        0.0
+    };
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let middle = sorted.len() / 2;
+    let median = if sorted.len().is_multiple_of(2) {
+        (f64::from(sorted[middle - 1]) + f64::from(sorted[middle])) * 0.5
+    } else {
+        f64::from(sorted[middle])
+    };
+    MeasurementStatistics {
+        minimum,
+        maximum,
+        mean,
+        sum,
+        standard_deviation,
+        median,
+    }
 }
 
 fn clipboard_patch(tab: &ImageTab) -> ClipboardPatch {
@@ -7673,6 +8323,8 @@ pub(super) fn command_is_routed(command: &str) -> bool {
             | "image.overlay.measure"
             | "image.overlay.from_roi_manager"
             | "image.overlay.to_roi_manager"
+            | "analyze.measure"
+            | "analyze.set_measurements"
             | "analyze.tools.roi_manager"
             | "analyze.tools.results"
             | "analyze.clear_results"
@@ -7685,6 +8337,7 @@ pub(super) fn command_is_routed(command: &str) -> bool {
             | "process.repeat_command"
             | "image.stacks.next"
             | "image.stacks.previous"
+            | "image.stacks.measure_stack"
             | "help.about"
             | "help.docs"
             | "help.shortcuts"
@@ -7787,7 +8440,6 @@ fn operation_for_command(command: &str) -> Option<(&'static str, Value)> {
         "image.transform.rotate_right" => ("image.rotate_90", json!({ "direction": "right" })),
         "image.transform.rotate_left" => ("image.rotate_90", json!({ "direction": "left" })),
         "image.stacks.statistics" => ("image.stack.statistics", json!({})),
-        "analyze.measure" => ("measurements.summary", json!({})),
         "analyze.analyze_particles" => ("measurements.particles", json!({})),
         "analyze.histogram" => ("measurements.histogram", json!({})),
         "analyze.plot_profile" => ("measurements.profile", json!({})),
@@ -7828,6 +8480,66 @@ fn overlay_json_objects(target: &mut Value, source: Value) {
     };
     for (key, value) in source {
         target.insert(key.clone(), value.clone());
+    }
+}
+
+fn measurement_settings_from_params(
+    params: &Value,
+    current: MeasurementSettings,
+    clear_unspecified: bool,
+) -> MeasurementSettings {
+    let missing = |value: bool| if clear_unspecified { false } else { value };
+    let option = |keys: &[&str], current: bool| {
+        keys.iter()
+            .find_map(|key| params.get(*key))
+            .and_then(|value| match value {
+                Value::Bool(value) => Some(*value),
+                Value::Number(value) => value.as_i64().map(|value| value != 0),
+                Value::String(value) if value.eq_ignore_ascii_case("true") => Some(true),
+                Value::String(value) if value.eq_ignore_ascii_case("false") => Some(false),
+                _ => None,
+            })
+            .unwrap_or_else(|| missing(current))
+    };
+    let decimal_places = ["decimal_places", "decimal", "precision"]
+        .iter()
+        .find_map(|key| params.get(*key))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .map(|value| value.round().clamp(0.0, 9.0) as u8)
+        .unwrap_or(current.decimal_places);
+    MeasurementSettings {
+        area: option(&["area"], current.area),
+        mean: option(&["mean"], current.mean),
+        standard_deviation: option(
+            &["standard_deviation", "standard", "std_dev"],
+            current.standard_deviation,
+        ),
+        min_max: option(&["min_max", "min", "minimum"], current.min_max),
+        centroid: option(&["centroid"], current.centroid),
+        perimeter: option(&["perimeter"], current.perimeter),
+        bounding_rectangle: option(
+            &["bounding_rectangle", "bounding", "rect"],
+            current.bounding_rectangle,
+        ),
+        integrated_density: option(
+            &["integrated_density", "integrated"],
+            current.integrated_density,
+        ),
+        median: option(&["median"], current.median),
+        stack_position: option(
+            &["stack_position", "stack", "slice"],
+            current.stack_position,
+        ),
+        display_label: option(
+            &["display_label", "display", "labels"],
+            current.display_label,
+        ),
+        invert_y_coordinates: option(
+            &["invert_y_coordinates", "invert_y", "invert"],
+            current.invert_y_coordinates,
+        ),
+        decimal_places,
     }
 }
 
@@ -7872,9 +8584,19 @@ fn format_compact_number(value: f32) -> String {
     }
 }
 
-fn format_json_value(value: &Value) -> String {
+fn format_json_value(value: &Value, decimal_places: u8) -> String {
     match value {
         Value::String(value) => value.clone(),
+        Value::Number(value) if value.is_i64() || value.is_u64() => value.to_string(),
+        Value::Number(value) => value
+            .as_f64()
+            .map(|value| {
+                format!(
+                    "{value:.precision$}",
+                    precision = usize::from(decimal_places)
+                )
+            })
+            .unwrap_or_else(|| value.to_string()),
         _ => value.to_string(),
     }
 }
@@ -7904,11 +8626,11 @@ fn common_result_units(
     Ok(shared)
 }
 
-fn result_column_width(rows: &[BTreeMap<String, Value>], column: &str) -> f32 {
+fn result_column_width(rows: &[BTreeMap<String, Value>], column: &str, decimal_places: u8) -> f32 {
     let widest = rows
         .iter()
         .filter_map(|row| row.get(column))
-        .map(format_json_value)
+        .map(|value| format_json_value(value, decimal_places))
         .map(|value| value.chars().count())
         .chain(std::iter::once(column.chars().count()))
         .max()
@@ -7921,16 +8643,32 @@ fn result_columns(rows: &[BTreeMap<String, Value>]) -> Vec<String> {
         "Label",
         "Area",
         "Mean",
+        "StdDev",
         "Min",
         "Max",
+        "Mode",
         "X",
         "Y",
+        "XM",
+        "YM",
         "BX",
         "BY",
         "Width",
         "Height",
         "Perim.",
+        "Major",
+        "Minor",
         "Circ.",
+        "Feret",
+        "IntDen",
+        "Median",
+        "Skew",
+        "Kurt",
+        "%Area",
+        "RawIntDen",
+        "Ch",
+        "Slice",
+        "Frame",
         "Pixels",
         "Length",
         "Angle",
@@ -8176,6 +8914,10 @@ fn install_key_bindings(cx: &mut App) {
 }
 
 pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
+    run_with_ops(startup_input, OpsService::default())
+}
+
+pub fn run_with_ops(startup_input: Option<PathBuf>, ops_service: OpsService) -> Result<(), String> {
     gpui_platform::application().run(move |cx: &mut App| {
         install_key_bindings(cx);
         cx.set_menus(vec![
@@ -8215,9 +8957,11 @@ pub fn run(startup_input: Option<PathBuf>) -> Result<(), String> {
             app_id: Some("image-rs".into()),
             ..Default::default()
         };
+        let launcher_ops = ops_service.clone();
         let launcher = cx
             .open_window(options, move |window, cx| {
-                cx.new(|cx| ImageJApp::new(window, cx))
+                let ops_service = launcher_ops.clone();
+                cx.new(|cx| ImageJApp::new(window, ops_service, cx))
             })
             .expect("failed to open GPUI ImageJ window");
         let app = launcher
@@ -8362,7 +9106,9 @@ mod tests {
                 z: 0,
                 t: 0,
             },
+            &MeasurementSettings::all_supported(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -8722,7 +9468,8 @@ mod tests {
             ]
         );
         assert!(
-            result_column_width(&particle_rows, "Image") > result_column_width(&particle_rows, "X")
+            result_column_width(&particle_rows, "Image", 3)
+                > result_column_width(&particle_rows, "X", 3)
         );
         assert_eq!(csv_cell("plain"), "plain");
         assert_eq!(csv_cell("a,b"), "\"a,b\"");
@@ -8772,6 +9519,239 @@ mod tests {
     }
 
     #[test]
+    fn measurement_defaults_match_imagej_and_precision_only_changes_formatting() {
+        let settings = MeasurementSettings::default();
+        assert!(settings.area);
+        assert!(settings.mean);
+        assert!(settings.min_max);
+        assert!(!settings.standard_deviation);
+        assert!(!settings.centroid);
+        assert!(!settings.perimeter);
+        assert!(!settings.bounding_rectangle);
+        assert!(!settings.integrated_density);
+        assert!(!settings.median);
+        assert!(!settings.stack_position);
+        assert!(!settings.display_label);
+        assert!(!settings.invert_y_coordinates);
+        assert_eq!(settings.decimal_places, 3);
+
+        let tab = measurement_test_tab(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
+        let selection = active_measurement_selection(&tab);
+        let row = measure_roi_on_tab(
+            &tab,
+            &selection,
+            "default",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &settings,
+        )
+        .unwrap();
+        let imagej_cells = row
+            .keys()
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "Image" | "Command" | "ROI" | "Type" | "area_unit" | "length_unit"
+                )
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            imagej_cells,
+            BTreeSet::from([
+                "Area".to_string(),
+                "Max".to_string(),
+                "Mean".to_string(),
+                "Min".to_string(),
+            ])
+        );
+        assert_eq!(format_json_value(&json!(1.23456), 3), "1.235");
+        assert_eq!(format_json_value(&json!(2), 7), "2");
+        assert_eq!(row.get("Mean").and_then(Value::as_f64), Some(1.5));
+    }
+
+    #[test]
+    fn set_measurements_params_replace_the_application_wide_selection() {
+        let settings = measurement_settings_from_params(
+            &json!({
+                "std_dev": true,
+                "bounding": true,
+                "integrated": true,
+                "labels": true,
+                "precision": 5
+            }),
+            MeasurementSettings::default(),
+            true,
+        );
+        assert!(!settings.area);
+        assert!(!settings.mean);
+        assert!(!settings.min_max);
+        assert!(settings.standard_deviation);
+        assert!(settings.bounding_rectangle);
+        assert!(settings.integrated_density);
+        assert!(settings.display_label);
+        assert_eq!(settings.decimal_places, 5);
+
+        let updated = measurement_settings_from_params(&json!({"area": false}), settings, false);
+        assert!(!updated.area);
+        assert!(updated.standard_deviation);
+        assert_eq!(updated.decimal_places, 5);
+    }
+
+    #[test]
+    fn imagej_measurement_macros_route_to_the_native_workflow() {
+        let invocations = macros::parse_macro_source(
+            r#"
+                run("Set Measurements...", "area standard min bounding integrated stack display decimal=4");
+                run("Measure");
+                run("Measure Stack");
+            "#,
+            &command_registry::command_catalog(),
+        )
+        .unwrap();
+        assert_eq!(invocations[0].command_id, "analyze.set_measurements");
+        assert_eq!(invocations[1].command_id, "analyze.measure");
+        assert_eq!(invocations[2].command_id, "image.stacks.measure_stack");
+        let settings = measurement_settings_from_params(
+            invocations[0].params.as_ref().unwrap(),
+            MeasurementSettings::default(),
+            true,
+        );
+        assert!(settings.area);
+        assert!(settings.standard_deviation);
+        assert!(settings.min_max);
+        assert!(settings.bounding_rectangle);
+        assert!(settings.integrated_density);
+        assert!(settings.stack_position);
+        assert!(settings.display_label);
+        assert_eq!(settings.decimal_places, 4);
+    }
+
+    #[test]
+    fn measurement_is_scoped_to_the_active_channel_slice_time_and_exact_roi() {
+        let mut pixels = Vec::new();
+        for y in 0..2 {
+            for x in 0..2 {
+                for z in 0..2 {
+                    for channel in 0..2 {
+                        for time in 0..2 {
+                            pixels.push((channel * 1_000 + z * 100 + time * 10 + y * 2 + x) as f32);
+                        }
+                    }
+                }
+            }
+        }
+        let dataset = Dataset::new(
+            Array::from_shape_vec((2, 2, 2, 2, 2), pixels)
+                .unwrap()
+                .into_dyn(),
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 2),
+                    Dim::new(AxisKind::X, 2),
+                    Dim::new(AxisKind::Z, 2),
+                    Dim::new(AxisKind::Channel, 2),
+                    Dim::new(AxisKind::Time, 2),
+                ],
+                pixel_type: PixelType::F32,
+                ..Metadata::default()
+            },
+        )
+        .unwrap();
+        let mut tab = ImageTab::from_dataset(1, None, "Hyperstack".into(), dataset).unwrap();
+        tab.channel = 1;
+        tab.z = 1;
+        tab.t = 1;
+        let selection = RoiSelection {
+            tool: ToolId::Rect,
+            points: vec![(0.0, 0.0), (2.0, 2.0)],
+        };
+        let row = measure_roi_on_tab(
+            &tab,
+            &selection,
+            "active",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: tab.channel,
+                z: tab.z,
+                t: tab.t,
+            },
+            &MeasurementSettings::default(),
+        )
+        .unwrap();
+
+        assert_eq!(row.get("Area"), Some(&json!(4.0)));
+        assert_eq!(row.get("Mean"), Some(&json!(1_111.5)));
+        assert_eq!((tab.channel, tab.z, tab.t), (1, 1, 1));
+    }
+
+    #[test]
+    fn stack_position_omits_singleton_slice_for_channel_time_hyperstacks() {
+        let dataset = Dataset::new(
+            Array::from_shape_vec((1, 1, 2, 2), vec![1.0, 2.0, 3.0, 4.0])
+                .unwrap()
+                .into_dyn(),
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 1),
+                    Dim::new(AxisKind::X, 1),
+                    Dim::new(AxisKind::Channel, 2),
+                    Dim::new(AxisKind::Time, 2),
+                ],
+                pixel_type: PixelType::F32,
+                ..Metadata::default()
+            },
+        )
+        .unwrap();
+        let tab = ImageTab::from_dataset(1, None, "C/T hyperstack".into(), dataset).unwrap();
+        let row = measure_roi_on_tab(
+            &tab,
+            &active_measurement_selection(&tab),
+            "active",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: 1,
+                z: 0,
+                t: 1,
+            },
+            &MeasurementSettings::all_supported(),
+        )
+        .unwrap();
+
+        assert_eq!(row.get("Ch"), Some(&json!(2)));
+        assert_eq!(row.get("Frame"), Some(&json!(2)));
+        assert!(!row.contains_key("Slice"));
+    }
+
+    #[test]
+    fn zero_intensity_pixels_still_contribute_to_measured_area() {
+        let tab = measurement_test_tab(2, 2, vec![0.0; 4]);
+        let row = measure_roi_on_tab(
+            &tab,
+            &active_measurement_selection(&tab),
+            "zeros",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &MeasurementSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(row.get("Area"), Some(&json!(4.0)));
+        assert_eq!(row.get("Mean"), Some(&json!(0.0)));
+    }
+
+    #[test]
     fn rectangle_measurement_uses_only_pixels_inside_the_roi() {
         let tab = measurement_test_tab(4, 4, (1..=16).map(|value| value as f32).collect());
         let row = measured_row(
@@ -8782,17 +9762,20 @@ mod tests {
             },
         );
 
-        assert_eq!(row.get("Area"), Some(&json!(4)));
+        assert_eq!(row.get("Area"), Some(&json!(4.0)));
         assert_eq!(row.get("Mean"), Some(&json!(8.5)));
         assert_eq!(row.get("Min"), Some(&json!(6.0)));
         assert_eq!(row.get("Max"), Some(&json!(11.0)));
-        assert_eq!(row.get("X"), Some(&json!(1)));
-        assert_eq!(row.get("Y"), Some(&json!(1)));
-        assert_eq!(row.get("Width"), Some(&json!(2)));
-        assert_eq!(row.get("Height"), Some(&json!(2)));
-        assert_eq!(row.get("C"), Some(&json!(1)));
-        assert_eq!(row.get("Z"), Some(&json!(1)));
-        assert_eq!(row.get("T"), Some(&json!(1)));
+        assert_eq!(row.get("X"), Some(&json!(2.0)));
+        assert_eq!(row.get("Y"), Some(&json!(2.0)));
+        assert_eq!(row.get("BX"), Some(&json!(1.0)));
+        assert_eq!(row.get("BY"), Some(&json!(1.0)));
+        assert_eq!(row.get("Width"), Some(&json!(2.0)));
+        assert_eq!(row.get("Height"), Some(&json!(2.0)));
+        assert_eq!(row.get("Perim."), Some(&json!(8.0)));
+        assert_eq!(row.get("Slice"), Some(&json!(1)));
+        assert!(!row.contains_key("Ch"));
+        assert!(!row.contains_key("Frame"));
     }
 
     #[test]
@@ -8805,7 +9788,7 @@ mod tests {
                 points: vec![(0.0, 0.0), (4.0, 4.0)],
             },
         );
-        assert_eq!(oval.get("Area"), Some(&json!(12)));
+        assert_eq!(oval.get("Area"), Some(&json!(12.0)));
 
         for tool in [ToolId::Poly, ToolId::Free] {
             let mut points = vec![(0.0, 0.0), (4.0, 0.0), (0.0, 4.0)];
@@ -8814,7 +9797,7 @@ mod tests {
                 points.insert(0, (0.0, 0.0));
             }
             let triangle = measured_row(&tab, RoiSelection { tool, points });
-            assert_eq!(triangle.get("Area"), Some(&json!(10)), "{tool:?}");
+            assert_eq!(triangle.get("Area"), Some(&json!(10.0)), "{tool:?}");
             assert_eq!(triangle.get("Mean"), Some(&json!(1.0)), "{tool:?}");
         }
     }
@@ -8830,10 +9813,14 @@ mod tests {
             },
         );
 
-        assert_eq!(row.get("Area"), Some(&json!(1)));
-        assert_eq!(row.get("Mean"), Some(&json!(7.0)));
-        assert_eq!(row.get("Min"), Some(&json!(7.0)));
-        assert_eq!(row.get("Max"), Some(&json!(7.0)));
+        assert_eq!(row.get("Area"), Some(&json!(0.0)));
+        assert_eq!(row.get("Mean"), Some(&json!(8.0)));
+        assert_eq!(row.get("Min"), Some(&json!(8.0)));
+        assert_eq!(row.get("Max"), Some(&json!(8.0)));
+        assert_eq!(row.get("IntDen"), Some(&json!(8.0)));
+        assert_eq!(row.get("RawIntDen"), Some(&json!(8.0)));
+        assert_eq!(row.get("X"), Some(&json!(1.6_f32)));
+        assert_eq!(row.get("Y"), Some(&json!(2.2_f32)));
     }
 
     #[test]
@@ -8850,7 +9837,8 @@ mod tests {
         assert_eq!(line.get("Mean"), Some(&json!(2.0)));
         assert_eq!(line.get("Min"), Some(&json!(0.0)));
         assert_eq!(line.get("Max"), Some(&json!(4.0)));
-        assert!(!line.contains_key("Area"));
+        assert_eq!(line.get("Area"), Some(&json!(5.0)));
+        assert_eq!(line.get("Perim."), Some(&json!(4.0)));
 
         let angle = measured_row(
             &tab,
@@ -8859,9 +9847,244 @@ mod tests {
                 points: vec![(0.0, 0.0), (3.0, 0.0), (3.0, 4.0)],
             },
         );
-        assert_eq!(angle.get("Length"), Some(&json!(7.0)));
+        assert_eq!(angle.get("Area"), Some(&json!(0.0)));
+        assert_eq!(angle.get("Mean"), Some(&json!(0.0)));
+        assert!(!angle.contains_key("Length"));
+        assert_eq!(angle.get("Perim."), Some(&json!(7.0)));
         let measured_angle = angle.get("Angle").and_then(Value::as_f64).unwrap();
         assert!((measured_angle - 90.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn multi_segment_line_measurements_profile_every_segment() {
+        let pixels = (0..5)
+            .flat_map(|y| (0..5).map(move |x| (x + 10 * y) as f32))
+            .collect();
+        let tab = measurement_test_tab(5, 5, pixels);
+        let line = measured_row(
+            &tab,
+            RoiSelection {
+                tool: ToolId::Line,
+                points: vec![(0.0, 0.0), (2.0, 0.0), (2.0, 2.0)],
+            },
+        );
+
+        assert_eq!(line.get("Area"), Some(&json!(5.0)));
+        assert_eq!(line.get("Min"), Some(&json!(0.0)));
+        assert_eq!(line.get("Max"), Some(&json!(22.0)));
+        assert_eq!(line.get("Length"), Some(&json!(4.0)));
+        assert!(!line.contains_key("Angle"));
+        let mean = line.get("Mean").and_then(Value::as_f64).unwrap();
+        assert!((mean - 7.4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn diagonal_line_statistics_use_imagej_profile_intervals_and_interpolation() {
+        let pixels = (0..5)
+            .flat_map(|y| (0..5).map(move |x| (x + 10 * y) as f32))
+            .collect();
+        let tab = measurement_test_tab(5, 5, pixels);
+        let row = measure_roi_on_tab(
+            &tab,
+            &RoiSelection {
+                tool: ToolId::Line,
+                points: vec![(0.0, 0.0), (3.0, 4.0)],
+            },
+            "diagonal",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &MeasurementSettings::default(),
+        )
+        .unwrap();
+
+        // Raw length 5 => five intervals and six profile values. A linear
+        // gradient remains linear under ImageJ's default bilinear sampling.
+        assert_eq!(row.get("Area"), Some(&json!(6.0)));
+        let mean = row.get("Mean").and_then(Value::as_f64).unwrap();
+        assert!((mean - 21.5).abs() < 1.0e-6);
+        assert_eq!(row.get("Min"), Some(&json!(0.0)));
+        assert_eq!(row.get("Max"), Some(&json!(43.0)));
+    }
+
+    #[test]
+    fn calibrated_measurements_scale_area_bounds_perimeter_length_and_angle() {
+        let data = Array::from_shape_vec((5, 5), vec![1.0; 25])
+            .unwrap()
+            .into_dyn();
+        let mut metadata = Metadata {
+            dims: vec![Dim::new(AxisKind::Y, 5), Dim::new(AxisKind::X, 5)],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        };
+        metadata.dims[0].spacing = Some(3.0);
+        metadata.dims[0].unit = Some("um".into());
+        metadata.dims[1].spacing = Some(2.0);
+        metadata.dims[1].unit = Some("um".into());
+        metadata
+            .extras
+            .insert("x_origin_coordinate".into(), json!(10.0));
+        metadata
+            .extras
+            .insert("y_origin_coordinate".into(), json!(20.0));
+        let dataset = Dataset::new(data, metadata).unwrap();
+        let tab = ImageTab::from_dataset(1, None, "Calibrated".into(), dataset).unwrap();
+        let settings = MeasurementSettings::all_supported();
+        let rectangle = measure_roi_on_tab(
+            &tab,
+            &RoiSelection {
+                tool: ToolId::Rect,
+                points: vec![(1.0, 1.0), (3.0, 3.0)],
+            },
+            "rectangle",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(rectangle.get("Area"), Some(&json!(24.0)));
+        assert_eq!(rectangle.get("X"), Some(&json!(14.0)));
+        assert_eq!(rectangle.get("Y"), Some(&json!(26.0)));
+        assert_eq!(rectangle.get("BX"), Some(&json!(12.0)));
+        assert_eq!(rectangle.get("BY"), Some(&json!(23.0)));
+        assert_eq!(rectangle.get("Width"), Some(&json!(4.0)));
+        assert_eq!(rectangle.get("Height"), Some(&json!(6.0)));
+        assert_eq!(rectangle.get("Perim."), Some(&json!(20.0)));
+        assert_eq!(rectangle.get("area_unit"), Some(&json!("um^2")));
+        assert_eq!(rectangle.get("length_unit"), Some(&json!("um")));
+
+        let line = measure_roi_on_tab(
+            &tab,
+            &RoiSelection {
+                tool: ToolId::Line,
+                points: vec![(0.0, 0.0), (3.0, 4.0)],
+            },
+            "line",
+            "Measure",
+            2,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &settings,
+        )
+        .unwrap();
+        let length = line.get("Length").and_then(Value::as_f64).unwrap();
+        assert!((length - 180.0_f64.sqrt()).abs() < 1.0e-9);
+        let angle = line.get("Angle").and_then(Value::as_f64).unwrap();
+        assert!((angle - (-12.0_f64).atan2(6.0).to_degrees()).abs() < 1.0e-9);
+
+        let inverted_settings = MeasurementSettings {
+            invert_y_coordinates: true,
+            ..settings
+        };
+        let inverted = measure_roi_on_tab(
+            &tab,
+            &RoiSelection {
+                tool: ToolId::Rect,
+                points: vec![(0.0, 1.0), (1.0, 2.0)],
+            },
+            "inverted",
+            "Measure",
+            3,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &inverted_settings,
+        )
+        .unwrap();
+        assert_eq!(inverted.get("Y"), Some(&json!(27.5)));
+        assert_eq!(inverted.get("BY"), Some(&json!(29.0)));
+    }
+
+    #[test]
+    fn measurement_rejects_invalid_spatial_calibration() {
+        let data = Array::from_shape_vec((1, 1), vec![1.0]).unwrap().into_dyn();
+        let mut metadata = Metadata {
+            dims: vec![Dim::new(AxisKind::Y, 1), Dim::new(AxisKind::X, 1)],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        };
+        metadata.dims[1].spacing = Some(0.0);
+        let dataset = Dataset::new(data, metadata).unwrap();
+        let tab = ImageTab::from_dataset(1, None, "Invalid calibration".into(), dataset).unwrap();
+        let error = measure_roi_on_tab(
+            &tab,
+            &active_measurement_selection(&tab),
+            "invalid",
+            "Measure",
+            1,
+            RoiPosition {
+                channel: 0,
+                z: 0,
+                t: 0,
+            },
+            &MeasurementSettings::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("finite positive X/Y spacing"));
+    }
+
+    #[test]
+    fn measure_stack_holds_channel_time_and_roi_while_iterating_z() {
+        let mut pixels = Vec::new();
+        for z in 0..3 {
+            for channel in 0..2 {
+                for time in 0..2 {
+                    pixels.push((z * 100 + channel * 10 + time) as f32);
+                }
+            }
+        }
+        let dataset = Dataset::new(
+            Array::from_shape_vec((1, 1, 3, 2, 2), pixels)
+                .unwrap()
+                .into_dyn(),
+            Metadata {
+                dims: vec![
+                    Dim::new(AxisKind::Y, 1),
+                    Dim::new(AxisKind::X, 1),
+                    Dim::new(AxisKind::Z, 3),
+                    Dim::new(AxisKind::Channel, 2),
+                    Dim::new(AxisKind::Time, 2),
+                ],
+                pixel_type: PixelType::F32,
+                ..Metadata::default()
+            },
+        )
+        .unwrap();
+        let mut tab = ImageTab::from_dataset(1, None, "Stack".into(), dataset).unwrap();
+        tab.channel = 1;
+        tab.t = 1;
+        tab.z = 2;
+        let rows = measure_stack_rows(
+            &tab,
+            &active_measurement_selection(&tab),
+            &MeasurementSettings::default(),
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        for (z, row) in rows.iter().enumerate() {
+            assert_eq!(row.get("Ch"), Some(&json!(2)));
+            assert_eq!(row.get("Slice"), Some(&json!(z + 1)));
+            assert_eq!(row.get("Frame"), Some(&json!(2)));
+            assert_eq!(row.get("ROI"), Some(&json!(10 + z)));
+            assert_eq!(row.get("Mean"), Some(&json!((z * 100 + 11) as f64)));
+        }
+        assert_eq!((tab.channel, tab.z, tab.t), (1, 2, 1));
     }
 
     #[test]

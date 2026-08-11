@@ -8,6 +8,9 @@ pub enum OpsError {
     #[error("unknown operation: {0}")]
     UnknownOperation(String),
 
+    #[error("duplicate operation: {0}")]
+    DuplicateOperation(String),
+
     #[error("invalid operation parameters: {0}")]
     InvalidParams(String),
 

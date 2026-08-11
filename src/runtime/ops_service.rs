@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::commands::{
-    OpOutput, OpSchema, Operation, default_registry, execute_operation_with_registry,
+    OpOutput, OpSchema, OperationRegistry, default_registry, execute_operation_with_registry,
 };
 use crate::model::DatasetF32;
 use serde_json::Value;
@@ -11,7 +10,7 @@ use super::Result;
 
 #[derive(Clone)]
 pub struct OpsService {
-    registry: HashMap<&'static str, Arc<dyn Operation>>,
+    registry: Arc<OperationRegistry>,
 }
 
 impl std::fmt::Debug for OpsService {
@@ -26,20 +25,20 @@ impl std::fmt::Debug for OpsService {
 impl Default for OpsService {
     fn default() -> Self {
         Self {
-            registry: default_registry(),
+            registry: Arc::new(default_registry()),
         }
     }
 }
 
 impl OpsService {
+    pub fn from_registry(registry: OperationRegistry) -> Self {
+        Self {
+            registry: Arc::new(registry),
+        }
+    }
+
     pub fn list(&self) -> Vec<OpSchema> {
-        let mut schemas = self
-            .registry
-            .values()
-            .map(|operation| operation.schema())
-            .collect::<Vec<_>>();
-        schemas.sort_by(|left, right| left.name.cmp(&right.name));
-        schemas
+        self.registry.list()
     }
 
     pub fn execute(&self, op: &str, dataset: &DatasetF32, params: &Value) -> Result<OpOutput> {
@@ -51,7 +50,7 @@ impl OpsService {
         )?)
     }
 
-    pub fn registry(&self) -> &HashMap<&'static str, Arc<dyn Operation>> {
-        &self.registry
+    pub fn registry(&self) -> &OperationRegistry {
+        self.registry.as_ref()
     }
 }

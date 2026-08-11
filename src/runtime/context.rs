@@ -1,6 +1,6 @@
 use super::{DatasetService, IoService, OpsService, PipelineService};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppContext {
     dataset_service: DatasetService,
     io_service: IoService,
@@ -8,9 +8,24 @@ pub struct AppContext {
     pipeline_service: PipelineService,
 }
 
+impl Default for AppContext {
+    fn default() -> Self {
+        Self::with_ops(OpsService::default())
+    }
+}
+
 impl AppContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_ops(ops_service: OpsService) -> Self {
+        Self {
+            dataset_service: DatasetService,
+            io_service: IoService,
+            pipeline_service: PipelineService::new(ops_service.clone()),
+            ops_service,
+        }
     }
 
     pub fn dataset_service(&self) -> &DatasetService {
