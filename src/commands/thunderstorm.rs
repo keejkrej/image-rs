@@ -71,6 +71,7 @@ fn execute_thunderstorm(op_name: &str, dataset: &DatasetF32, params: &Value) -> 
     Ok(OpOutput {
         dataset,
         measurements: Some(measurements),
+        status: None,
     })
 }
 

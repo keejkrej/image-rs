@@ -1,12 +1,15 @@
 //! Safe discovery and validation for external image-rs plugins.
 //!
 //! The versioned WIT contract and host-side buffer/progress invariants live in [`contract`]. This
-//! milestone still stops before executing plugin code: a catalog contains only validated metadata
-//! and declarative contributions, and a future WebAssembly Component adapter can remain behind
-//! this module without exposing loader details to callers.
+//! A catalog contains validated metadata and declarative contributions. Image-operation
+//! contributions can be registered behind the ordinary operation-registry seam; component
+//! loading, sandbox policy, and invocation state remain private to this module.
 
 pub mod contract;
 mod manifest;
+mod runtime;
+
+pub use runtime::PluginRuntimeError;
 
 use std::collections::BTreeMap;
 use std::fs;

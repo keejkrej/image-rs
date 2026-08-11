@@ -225,26 +225,33 @@ impl PluginOperationCapabilities {
         accepts_area_mask: bool,
         modifies_pixels: bool,
     ) -> Result<Self, PluginContractError> {
-        let pixel_types = pixel_types.into_iter().collect::<Vec<_>>();
-        let scopes = scopes.into_iter().collect::<Vec<_>>();
-        if pixel_types.is_empty() || scopes.is_empty() {
-            return Err(PluginContractError::EmptyCapabilities);
+        let mut pixel_type_count = 0;
+        let mut validated_pixel_types = BTreeSet::new();
+        for pixel_type in pixel_types {
+            pixel_type_count += 1;
+            validate_count("supported pixel types", pixel_type_count, 3)?;
+            if !validated_pixel_types.insert(pixel_type) {
+                return Err(PluginContractError::DuplicateCapability);
+            }
         }
-        validate_count("supported pixel types", pixel_types.len(), 3)?;
-        validate_count("supported plane scopes", scopes.len(), 3)?;
-        let pixel_type_count = pixel_types.len();
-        let scope_count = scopes.len();
-        let pixel_types = pixel_types.into_iter().collect::<BTreeSet<_>>();
-        let scopes = scopes.into_iter().collect::<BTreeSet<_>>();
-        if pixel_types.len() != pixel_type_count || scopes.len() != scope_count {
-            return Err(PluginContractError::DuplicateCapability);
+        let mut scope_count = 0;
+        let mut validated_scopes = BTreeSet::new();
+        for scope in scopes {
+            scope_count += 1;
+            validate_count("supported plane scopes", scope_count, 3)?;
+            if !validated_scopes.insert(scope) {
+                return Err(PluginContractError::DuplicateCapability);
+            }
+        }
+        if validated_pixel_types.is_empty() || validated_scopes.is_empty() {
+            return Err(PluginContractError::EmptyCapabilities);
         }
         if requires_area_roi && !accepts_area_mask {
             return Err(PluginContractError::IncoherentRoiCapabilities);
         }
         Ok(Self {
-            pixel_types,
-            scopes,
+            pixel_types: validated_pixel_types,
+            scopes: validated_scopes,
             requires_area_roi,
             accepts_area_mask,
             modifies_pixels,
@@ -526,7 +533,7 @@ impl PluginPayloadBudget {
         Ok(())
     }
 
-    fn charge(&mut self, nodes: usize, bytes: usize) -> Result<(), PluginContractError> {
+    pub(super) fn charge(&mut self, nodes: usize, bytes: usize) -> Result<(), PluginContractError> {
         let next_nodes = self
             .nodes
             .checked_add(nodes)
@@ -817,7 +824,7 @@ fn validate_count(
     Ok(())
 }
 
-fn validate_name(field: &'static str, value: &str) -> Result<(), PluginContractError> {
+pub(super) fn validate_name(field: &'static str, value: &str) -> Result<(), PluginContractError> {
     if value.is_empty() || value.trim() != value {
         return Err(PluginContractError::InvalidName { field });
     }

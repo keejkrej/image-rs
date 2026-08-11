@@ -102,6 +102,7 @@ impl Operation for MeasurementsSummaryOp {
         Ok(OpOutput {
             dataset: dataset.clone(),
             measurements: Some(measurements),
+            status: None,
         })
     }
 }
@@ -156,6 +157,7 @@ impl Operation for MeasurementsHistogramOp {
         Ok(OpOutput {
             dataset: dataset.clone(),
             measurements: Some(measurements),
+            status: None,
         })
     }
 }
@@ -235,6 +237,7 @@ impl Operation for MeasurementsProfileOp {
         Ok(OpOutput {
             dataset: dataset.clone(),
             measurements: Some(measurements),
+            status: None,
         })
     }
 }
@@ -294,6 +297,7 @@ impl Operation for ImageStackZProfileOp {
         Ok(OpOutput {
             dataset: dataset.clone(),
             measurements: Some(measurements),
+            status: None,
         })
     }
 }
@@ -354,6 +358,7 @@ impl Operation for ImageStackStatisticsOp {
         Ok(OpOutput {
             dataset: dataset.clone(),
             measurements: Some(measurements),
+            status: None,
         })
     }
 }

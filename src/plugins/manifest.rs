@@ -16,7 +16,7 @@ use super::{
 };
 
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
-const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_AUTHORS: usize = 32;
 const MAX_OPERATIONS: usize = 128;
 const MAX_HANDLERS: usize = 128;

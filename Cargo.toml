@@ -38,9 +38,11 @@ tiff = "0.10"
 toml = "0.8"
 ureq = "2.12"
 wasmparser = { version = "0.244", default-features = false, features = ["std", "validate", "component-model", "features"] }
+wasmtime = { version = "47.0.3", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 
 [dev-dependencies]
 tempfile = "3.14"
+wat = "=1.244.0"
 wit-bindgen = "0.51"
 wit-component = "0.244"
 wit-parser = "0.244"

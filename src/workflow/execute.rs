@@ -36,6 +36,7 @@ pub fn run_pipeline(
             op: invocation.op.clone(),
             duration_ms,
             measurements: output.measurements.clone(),
+            status: output.status.clone(),
         });
         current = output.dataset;
     }

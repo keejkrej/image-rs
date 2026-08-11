@@ -10,6 +10,8 @@ pub struct StepReport {
     pub op: String,
     pub duration_ms: u128,
     pub measurements: Option<MeasurementTable>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

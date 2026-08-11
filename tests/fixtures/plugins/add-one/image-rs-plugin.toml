@@ -1,0 +1,46 @@
+schema_version = 1
+id = "org.image-rs.fixture.add-one"
+name = "Add One Runtime Fixture"
+version = "0.1.0"
+description = "A no-WASI image-operation fixture for the Component runtime adapter."
+authors = ["image-rs contributors"]
+
+[runtime]
+kind = "wasm-component"
+api_version = "0.1.0"
+path = "add-one.component.wasm"
+
+[[operations]]
+id = "add-one"
+description = "Adds one to every sample and completes successfully."
+export = "add-one"
+
+[[operations]]
+id = "fail-finish"
+description = "Adds one to every sample, then fails during finish."
+export = "fail-finish"
+
+[[operations]]
+id = "spin"
+description = "Loops forever so the host fuel limit can be verified."
+export = "spin"
+
+[[operations]]
+id = "grow-memory"
+description = "Exceeds the host linear-memory limit."
+export = "grow-memory"
+
+[[operations]]
+id = "bad-progress"
+description = "Reports regressing progress so the host contract check traps."
+export = "bad-progress"
+
+[[operations]]
+id = "bad-replacement"
+description = "Returns a replacement for the wrong plane position."
+export = "bad-replacement"
+
+[[operations]]
+id = "needs-roi"
+description = "Requires an ROI that the generic operation registry cannot supply."
+export = "needs-roi"

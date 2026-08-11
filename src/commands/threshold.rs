@@ -78,6 +78,7 @@ impl Operation for ThresholdOtsuOp {
         Ok(OpOutput {
             dataset,
             measurements: Some(measurements),
+            status: None,
         })
     }
 }
@@ -163,6 +164,7 @@ impl Operation for ThresholdMakeBinaryOp {
         Ok(OpOutput {
             dataset,
             measurements: Some(measurements),
+            status: None,
         })
     }
 }

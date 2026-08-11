@@ -28,6 +28,7 @@ pub struct MeasurementTable {
 pub struct OpOutput {
     pub dataset: DatasetF32,
     pub measurements: Option<MeasurementTable>,
+    pub status: Option<String>,
 }
 
 impl OpOutput {
@@ -35,6 +36,7 @@ impl OpOutput {
         Self {
             dataset,
             measurements: None,
+            status: None,
         }
     }
 }

@@ -99,6 +99,7 @@ impl Operation for MorpholibjChamferDistanceOp {
         Ok(OpOutput {
             dataset: output_dataset,
             measurements: Some(measurements),
+            status: None,
         })
     }
 }

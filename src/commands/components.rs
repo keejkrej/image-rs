@@ -98,6 +98,7 @@ impl Operation for ComponentsLabelOp {
         Ok(OpOutput {
             dataset: output_dataset,
             measurements: Some(measurements),
+            status: None,
         })
     }
 }
@@ -176,6 +177,7 @@ impl Operation for AnalyzeParticlesOp {
         Ok(OpOutput {
             dataset: dataset.clone(),
             measurements: Some(measurements),
+            status: None,
         })
     }
 }

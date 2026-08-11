@@ -32,7 +32,7 @@ ImageJ's Measure Stack macro can also iterate user-selected C/Z/T axes in six or
 
 The remaining Set Measurements options include mode, center of mass, ellipse/shape descriptors, Feret, skewness, kurtosis, area fraction, threshold limiting, redirect images, and scientific notation. This milestone establishes one shared measurement path; it does not claim the entire Analyzer option surface.
 
-## Completed plugin contract milestone
+## Completed plugin execution milestone
 
 - `image-rs:plugin@0.1.0` defines separate Component Model worlds for image operations and command handlers plus a combined world for mixed packages.
 - Image operations use invocation-local `begin` → repeated `process-plane` → consuming `finish` state, matching the durable part of ImageJ's filter lifecycle without exposing the host dataset.
@@ -40,23 +40,31 @@ The remaining Set Measurements options include mode, center of mass, ellipse/sha
 - Named capabilities replace ImageJ's integer filter flags; the host chooses scope per invocation, and v0.1 replacement planes must preserve dimensions, position, representation, and byte count.
 - The only callable guest imports are monotonic progress and cancellation. Ambient filesystem, network, process, environment, clock, random, and WASI capabilities are absent.
 - Contract tests parse, version-check, code-generate, and fingerprint the WIT package, then verify plane schedules, buffers, ROI masks, replacement layouts, metadata/JSON/measurement budgets, and progress invariants.
+- The host-facing `PluginCatalog::register_operations` library API now compiles image-operation Components with Wasmtime, capability-checks them, and atomically adapts them into the ordinary operation registry.
+- Every invocation gets fresh guest state, fixed memory, table, stack, fuel, and epoch/time limits, and only the contract host imports. The host stages pixels and metadata in a cloned dataset and publishes them only after the consuming `finish` call succeeds.
+- Registered operations preserve validated guest status and ordered measurement rows through `OpsService` and workflow reports. Structured guest errors, traps, and contract failures do not expose partial output.
 
-This milestone defines and verifies the interface but does not instantiate components, register plugin operations, add dynamic menus, or install/update packages. The command-surface count is therefore unchanged.
+The current generic operation interface has no active C/Z/T or ROI context, so
+the adapter deliberately accepts only `all-planes` operations that do not
+require an ROI. Command-handler execution, dynamic menus, install/update
+packages, automatic CLI/GPUI discovery and registration, and UI-aware
+active-plane, stack, and exact-ROI invocation remain future work. The
+command-surface count is therefore unchanged.
 
 ## Largest remaining gaps
 
 1. **Processing scope and semantics.** Several routed operations still process an entire dataset where ImageJ acts on an active plane or ROI. Threshold is destructive instead of modeless state, and ordinary smoothing/binary operations need explicit 2D versus 3D behavior.
 2. **File and import workflows.** Image sequence, raw, URL, text-image, LUT/ROI imports, Open Recent, and several export flows are absent from GPUI. Optional Bio-Formats support is not yet exposed consistently through UI and CLI.
 3. **Image/stack workflows.** Channels, stack composition, hyperstack tools, transforms, overlays, and lookup-table commands account for most unavailable menu entries.
-4. **Plugin and macro ecosystem.** The plugin catalog and WIT contract safely define namespaced contributions and a capability-limited execution seam, but components are not instantiated, registered, installed, or exposed in menus yet. The macro layer parses a useful literal-command subset, not the ImageJ language/runtime; a sandboxed runtime, dependency model, and UI/CLI contribution adapters remain.
+4. **Plugin and macro ecosystem.** Capability-compatible image-operation Components can now execute through the registry, but command handlers, dynamic menu exposure, installation and dependency management, and UI-aware active-plane/ROI invocation remain absent. The macro layer parses a useful literal-command subset, not the ImageJ language/runtime.
 5. **Data model fidelity.** The core stores `f32` samples and exposes a smaller pixel-type set than ImageJ. Composite images, color models, virtual stacks, calibration curves, and metadata round-tripping remain partial.
 6. **Interaction fidelity.** Several advertised tools and shortcuts are incomplete, some Window behavior differs from ImageJ, and long I/O/processing work still blocks the UI thread.
 7. **Architecture and verification.** GPUI application state is concentrated in one large module and lacks deep lifecycle/window tests. Compatibility needs oracle tests against the bundled ImageJ behavior, not only route-count growth.
 
 ## Recommended sequence
 
-1. Add a capability-limited WebAssembly Component runtime and contribution adapters behind the validated catalog and WIT contract.
+1. Introduce a reusable active-plane/ROI processing scope adapter and separate explicit 3D operations, then use it for built-in and plugin operations.
 2. Restore File/Open parity: image sequence, raw, URL, Open Recent, export, and Bio-Formats entry points.
-3. Introduce a reusable active-plane/ROI processing scope adapter and separate explicit 3D operations.
+3. Add plugin command-handler/menu adapters and a staged install/update policy.
 4. Repair tool/shortcut/window fidelity and move I/O and processing off the GPUI thread.
 5. Expand macro and plugin compatibility incrementally behind stable command, dataset, and results interfaces.

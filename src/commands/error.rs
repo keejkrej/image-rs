@@ -17,6 +17,9 @@ pub enum OpsError {
     #[error("unsupported dataset layout: {0}")]
     UnsupportedLayout(String),
 
+    #[error("plugin operation `{operation}` failed: {message}")]
+    PluginExecution { operation: String, message: String },
+
     #[error("core dataset error: {0}")]
     Core(#[from] CoreError),
 }
