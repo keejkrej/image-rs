@@ -41,3 +41,6 @@ wasmparser = { version = "0.244", default-features = false, features = ["std", "
 
 [dev-dependencies]
 tempfile = "3.14"
+wit-bindgen = "0.51"
+wit-component = "0.244"
+wit-parser = "0.244"

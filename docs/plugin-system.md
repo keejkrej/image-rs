@@ -4,16 +4,21 @@
 
 The first plugin milestone is a safe package catalog. `PluginCatalog::discover`
 finds, parses, validates, and indexes declarative operation, handler, and
-command contributions. It deliberately does **not** instantiate or execute
-external code. A `.wasm` file is checked for location and regular-file status,
-then fully validated as WebAssembly Component Model binary encoding. Core Wasm
+command contributions. The second milestone freezes the guest-facing
+`image-rs:plugin@0.1.0` WIT package and the host-side buffer, mask, schedule,
+metadata, measurement, replacement, payload, and progress invariants. Tests
+generate Rust guest bindings for all three contract worlds.
+
+The system still deliberately does **not** instantiate or execute external
+code. A `.wasm` file is checked for location and regular-file status, then
+fully validated as WebAssembly Component Model binary encoding. Core Wasm
 modules are rejected.
 
 The host operation path is ready for the next layer: `OperationRegistry`
 accepts runtime-owned identifiers and is injected through `OpsService`,
 `AppContext`, workflows, and the GPUI launcher. The catalog still cannot turn a
-declared component export into an `Operation`; that adapter begins only after
-the WIT contract and sandbox policy exist.
+declared operation into an `Operation`; the Wasmtime and contribution adapters
+are the next layer behind the now-versioned contract.
 
 This separates two decisions that classic ImageJ combines: what a plugin
 contributes, and how its code is loaded. Keeping execution behind the plugin
@@ -74,13 +79,51 @@ target = { kind = "handler", id = "about" }
 default_params = { argument = "credits" }
 ```
 
-The tagged target makes operation and handler dispatch unambiguous. Handler
-and operation export names are retained privately for the future sandbox
-adapter; UI and workflow callers see only qualified contribution identities.
+The tagged target makes operation and handler dispatch unambiguous. A manifest
+`export` is a component-local entrypoint selector passed to the fixed WIT
+dispatcher; it is not an arbitrary Component Model export name. Handler and
+operation selectors remain private to the future sandbox adapter; UI and
+workflow callers see only qualified contribution identities.
 
 Manifest fields reject unknown keys so authoring mistakes fail locally instead
 of being silently ignored. Package discovery is one directory deep and does
 not follow symlinked package directories or manifests.
+
+## Component contract (API 0.1.0)
+
+The canonical contract is [`wit/image-rs-plugin.wit`](../wit/image-rs-plugin.wit).
+It defines separate `image-operation-plugin` and `command-handler-plugin`
+worlds so ImageJ-style image filters do not receive the authority of general
+commands, plus a `combined-plugin` world for packages that declare both kinds.
+
+Image operations use an invocation-local lifecycle:
+
+1. `capabilities(entrypoint)` declares accepted pixel representations,
+   supported scopes, ROI requirements, masking support, and whether pixels
+   change.
+2. `begin(entrypoint, request)` receives validated parameters, immutable image
+   metadata, and the host-selected scope and active C/Z/T position, then
+   returns fresh invocation state.
+3. The future host adapter calls `process-plane` in a checked deterministic
+   schedule with bounded owned full planes and an optional exact area mask.
+4. `finish` consumes the invocation. The adapter then checks cancellation and
+   validates every lifted value before atomically committing staged pixels,
+   metadata, measurements, and status. Errors leave application state intact.
+
+This preserves the useful ImageJ `PlugInFilter` lifecycle without copying its
+integer flags or handing a guest the active image object. Dataset selection,
+plane/stack scheduling, ROI masking, undo, preview UI, and commit remain future
+host-adapter behavior. Version 0.1 replacements must preserve the input width,
+height, C/Z/T position, pixel representation, and byte count. Planes and masks
+are row-major with X fastest; U16 and F32 samples are little-endian.
+Shape-changing commands, tiles, pixel-changing final processing, and new-image
+creation are deliberately outside this first filter contract. Image operations
+also reject non-singleton unknown axes because v0.1 positions schedule only
+X/Y planes across C/Z/T; handlers may still receive unknown-axis metadata.
+
+Command handlers receive identifiers, labels, arguments, JSON parameters, and
+an optional immutable active-image summary. They may return status and
+measurement rows; they cannot mutate datasets or create native windows.
 
 ## Compatibility and identity
 
@@ -116,8 +159,30 @@ not follow symlinked package directories or manifests.
   defaults are free-form structured values within the same resource limits.
 - Defaults across one package are limited to 8 levels, 1024 value nodes, and
   64 KiB of aggregate scalar/key data.
+- Each full plane or ROI mask crossing the component seam is limited to 64 MiB.
+  Plane samples are tightly packed U8, little-endian U16, or little-endian F32
+  bytes. ROI masks use exactly one validated zero-or-one byte per pixel.
+- One cumulative 4 MiB output budget covers every staged `process-plane`
+  result plus `finish` for an invocation; the limit cannot be multiplied by
+  the number of scheduled planes. Handler input/output is bounded per
+  invocation as well.
+- Host-side contract checks reject empty/out-of-bounds regions, size overflow,
+  malformed buffer or mask lengths, C/Z/T schedule drift, non-identical or
+  forbidden replacement layouts, changed metadata shapes, invalid calibration
+  (including f64 values that cannot narrow to finite positive host f32), or
+  JSON, duplicate result columns/properties, non-finite measurements,
+  over-budget strings/collections/payloads, regressing progress, and unstable
+  progress totals before an adapter can commit output.
 - Discovery performs no native library loading, process execution, network
   access, or WebAssembly instantiation.
+- The only callable guest imports are the contract host's monotonic progress
+  and cooperative cancellation functions; the other local import carries
+  shared types only. There are no filesystem, network, process, environment,
+  clock, random, or other WASI imports. The Wasmtime adapter must preserve that
+  denial and additionally enforce memory, fuel, and epoch/time limits.
+- Tests parse and generate Rust bindings for all three worlds. A normalized
+  semantic fingerprint freezes record fields, variants, function signatures,
+  resource ownership, imports, and exports for API `0.1.0`.
 - The resolved module path and operation/handler exports remain private
   implementation details. Callers see a small catalog interface; the eventual
   sandbox adapter can execute through that same module without leaking loader
@@ -150,17 +215,12 @@ capabilities:
 
 ## Next milestones
 
-1. Define command-handler and image-operation contracts in WIT. The operation
-   world needs owned plane/tile buffers, metadata, parameters, progress,
-   cancellation, measurements, and structured errors. Keep datasets host-owned
-   and pass bounded buffers rather than raw pointers.
-2. Add a Wasmtime Component adapter with no ambient filesystem, network, or
+1. Add a Wasmtime Component adapter with no ambient filesystem, network, or
    process capabilities; enforce memory, fuel, and epoch/time limits.
-3. Adapt validated plugin operations into the runtime operation registry, then
+2. Adapt validated plugin operations into the runtime operation registry, then
    adapt plugin commands into the shared application command/menu catalog.
-4. Add install/update staging, archive integrity/signature policy, persistent
+3. Add install/update staging, archive integrity/signature policy, persistent
    enable/disable state, and atomic catalog reloads.
-5. Extend the contract deliberately for ImageJ filter concerns: active plane
-   versus stack scope, ROI masks, supported pixel types, previews, undo, and
-   final processing. Add capabilities only when a concrete second adapter or
-   use case makes the seam real.
+4. Extend the contract deliberately for previews, shape-changing/new-image
+   outputs, tiled virtual datasets, and richer command actions. Add
+   capabilities only when a concrete adapter or use case makes the seam real.

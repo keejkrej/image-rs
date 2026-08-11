@@ -15,7 +15,7 @@ Rust-first core rewrite inspired by ImageJ, with a native GPUI desktop UI and de
 - Operation introspection with `image ops list`
 - Native ImageJ-style GPUI workspace with a persistent launcher and one native window per image
 - Shared tools, macros, command routing, ROI clipboard edits, ROI Manager, undo/redo, and persistent Results across viewers
-- Safe plugin package discovery with strict manifests, SemVer compatibility, namespaced operation/command contributions, and a future WebAssembly Component execution boundary; see [`docs/plugin-system.md`](docs/plugin-system.md)
+- Safe plugin package discovery with strict manifests, SemVer compatibility, namespaced contributions, and a versioned WebAssembly Component contract with bounded host-owned plane/ROI buffers; execution remains a future adapter; see [`docs/plugin-system.md`](docs/plugin-system.md)
 - MorphoLibJ-style operations integrated via [`morpholib-rs`](https://github.com/keejkrej/morpholib-rs)
 
 ## Application-owned Bio-Formats storage

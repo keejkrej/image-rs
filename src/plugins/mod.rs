@@ -1,9 +1,11 @@
 //! Safe discovery and validation for external image-rs plugins.
 //!
-//! This milestone intentionally stops before executing plugin code. A catalog contains only
-//! validated metadata and declarative contributions; a future WebAssembly Component adapter can
-//! be added behind this module without exposing loader details to callers.
+//! The versioned WIT contract and host-side buffer/progress invariants live in [`contract`]. This
+//! milestone still stops before executing plugin code: a catalog contains only validated metadata
+//! and declarative contributions, and a future WebAssembly Component adapter can remain behind
+//! this module without exposing loader details to callers.
 
+pub mod contract;
 mod manifest;
 
 use std::collections::BTreeMap;
@@ -25,7 +27,7 @@ pub const PLUGIN_MANIFEST_FILE: &str = "image-rs-plugin.toml";
 /// The only manifest schema understood by this release.
 pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
 
-/// Host interface version reserved for the future WebAssembly Component adapter.
+/// Host interface version implemented by the bundled WIT contract.
 pub const PLUGIN_API_VERSION: &str = "0.1.0";
 
 /// A discovered plugin's stable metadata.

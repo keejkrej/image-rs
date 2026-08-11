@@ -1,0 +1,272 @@
+package image-rs:plugin@0.1.0;
+
+/// Data shared by command handlers, image operations, and the host.
+interface types {
+  /// Axis names understood by the image-rs dataset model.
+  enum axis-kind {
+    x,
+    y,
+    z,
+    channel,
+    time,
+    /// Preserved for metadata fidelity. Image operations reject non-singleton
+    /// unknown axes because v0.1 plane positions cannot schedule them.
+    unknown,
+  }
+
+  /// Pixel encodings accepted at the v0.1 component seam.
+  ///
+  /// Multi-byte samples in `plane-buffer.pixels` use little-endian byte order.
+  enum pixel-type {
+    uint8,
+    uint16,
+    float32,
+  }
+
+  /// One host-owned dataset dimension. A present spacing must be finite,
+  /// positive, and within the host model's finite positive f32 range.
+  record dimension {
+    axis: axis-kind,
+    size: u64,
+    spacing: option<f64>,
+    unit: option<string>,
+  }
+
+  /// A JSON-valued metadata property.
+  ///
+  /// `value-json` must contain one finite, valid JSON value. Source paths and
+  /// other host capabilities are deliberately not metadata properties.
+  record metadata-entry {
+    name: string,
+    value-json: string,
+  }
+
+  /// Immutable image information supplied when an invocation begins.
+  record image-metadata {
+    dimensions: list<dimension>,
+    channel-names: list<string>,
+    properties: list<metadata-entry>,
+  }
+
+  /// Zero-based position of a plane in a C/Z/T dataset.
+  record plane-position {
+    channel: u32,
+    z: u32,
+    time: u32,
+  }
+
+  /// A non-empty rectangle in full-image pixel coordinates.
+  record region {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+  }
+
+  /// An owned, tightly packed full plane.
+  ///
+  /// `pixels` contains exactly `width * height * bytes-per-pixel` bytes. The
+  /// layout is row-major with X fastest: sample `(x, y)` starts at byte offset
+  /// `(y * width + x) * bytes-per-pixel`. The host sets a resource limit before
+  /// copying this buffer into a component. Tiles require explicit halo/write-
+  /// region semantics and are not part of v0.1. The full dataset remains
+  /// host-owned.
+  record plane-buffer {
+    width: u32,
+    height: u32,
+    position: plane-position,
+    sample-type: pixel-type,
+    pixels: list<u8>,
+  }
+
+  /// Exact area selection data.
+  ///
+  /// `members` is tightly packed by pixel (not by bit) and contains exactly
+  /// `bounds.width * bounds.height` bytes in row-major, X-fastest order. The
+  /// member for local `(x, y)` is at `y * bounds.width + x`. Zero excludes a
+  /// pixel and one includes it. The host validates every member byte. The host
+  /// owns masking and restores excluded pixels.
+  record roi-mask {
+    bounds: region,
+    members: list<u8>,
+  }
+
+  /// Scalar values accepted in result-table rows.
+  variant measurement-value {
+    number(f64),
+    integer(s64),
+    boolean(bool),
+    text(string),
+    missing,
+  }
+
+  record measurement {
+    column: string,
+    value: measurement-value,
+  }
+
+  record measurement-row {
+    label: option<string>,
+    values: list<measurement>,
+  }
+
+  /// Stable error categories crossing the component seam.
+  enum error-kind {
+    invalid-parameters,
+    unsupported-image,
+    invalid-buffer,
+    cancelled,
+    resource-limit,
+    internal,
+  }
+
+  /// A user-presentable error plus optional machine-readable JSON details.
+  record plugin-error {
+    kind: error-kind,
+    message: string,
+    details-json: option<string>,
+  }
+
+  /// Monotonic progress for one invocation.
+  record progress-update {
+    completed: u64,
+    total: option<u64>,
+    message: option<string>,
+  }
+}
+
+/// The complete set of host calls available to a v0.1 plugin.
+///
+/// Filesystem, network, process, environment, clock, and random capabilities
+/// are intentionally absent. The future runtime adapter must not link WASI.
+interface host {
+  use types.{progress-update};
+
+  /// Report monotonic work. The host rejects regressions and changing totals.
+  report-progress: func(update: progress-update);
+
+  /// Cooperative cancellation. Guests should check between bounded work units.
+  is-cancelled: func() -> bool;
+}
+
+/// Stateful, same-shape image filtering over host-scheduled planes.
+interface image-operation {
+  use types.{image-metadata, measurement-row, pixel-type, plane-buffer, plane-position, plugin-error, roi-mask};
+
+  /// Named capabilities used by the host before allocating guest buffers.
+  enum plane-scope {
+    active-plane,
+    z-stack,
+    all-planes,
+  }
+
+  record operation-capabilities {
+    supported-pixel-types: list<pixel-type>,
+    supported-scopes: list<plane-scope>,
+    requires-area-roi: bool,
+    accepts-area-mask: bool,
+    modifies-pixels: bool,
+  }
+
+  /// Invocation-local setup information. All positions and counts are zero-based.
+  /// `parameters-json` must be a finite JSON object validated against the
+  /// manifest schema before the component is entered.
+  record begin-request {
+    operation-id: string,
+    command-id: option<string>,
+    command-label: option<string>,
+    argument: string,
+    parameters-json: string,
+    image: image-metadata,
+    selected-scope: plane-scope,
+    active-position: plane-position,
+    plane-count: u32,
+  }
+
+  record plane-request {
+    plane: plane-buffer,
+    area-roi: option<roi-mask>,
+  }
+
+  /// The host stages both replacements and measurements until `finish`
+  /// succeeds, using one cumulative output budget across the entire
+  /// invocation. In v0.1 a replacement must match the input width, height,
+  /// position, pixel type, and byte count exactly. It must be none when
+  /// `modifies-pixels` is false.
+  record plane-output {
+    replacement: option<plane-buffer>,
+    measurements: list<measurement-row>,
+  }
+
+  /// Final invocation output. Replacement metadata must preserve dimension
+  /// sizes and axes; it may update calibration, channel names, and properties.
+  /// Pixel-changing final processing is not supported in v0.1.
+  record finish-output {
+    metadata: option<image-metadata>,
+    measurements: list<measurement-row>,
+    status: option<string>,
+  }
+
+  /// One fresh resource is created for every command invocation. State may be
+  /// accumulated across repeated host-scheduled plane calls.
+  resource operation-invocation {
+    process-plane: func(request: plane-request) -> result<plane-output, plugin-error>;
+  }
+
+  /// Resolve the manifest's validated `export` selector to named capabilities.
+  capabilities: func(entrypoint: string) -> result<operation-capabilities, plugin-error>;
+
+  /// Begin setup for one invocation. A component may expose many manifest
+  /// operations; `entrypoint` selects one implementation behind this dispatcher.
+  begin: func(entrypoint: string, request: begin-request) -> result<own<operation-invocation>, plugin-error>;
+
+  /// Consume the invocation. After this succeeds, the host performs one final
+  /// cancellation and output-validation check, then atomically commits all
+  /// staged pixels, metadata, measurements, and status. Errors and cancellation
+  /// leave observable host state intact.
+  finish: func(invocation: own<operation-invocation>) -> result<finish-output, plugin-error>;
+}
+
+/// Bounded ImageJ-style commands that do not directly filter pixel buffers.
+interface command-handler {
+  use types.{image-metadata, measurement-row, plugin-error};
+
+  record command-request {
+    handler-id: string,
+    command-id: string,
+    command-label: string,
+    argument: string,
+    parameters-json: string,
+    active-image: option<image-metadata>,
+  }
+
+  /// v0.1 handlers may report status and append measurements. They cannot
+  /// create native windows, mutate datasets, or request ambient capabilities.
+  record command-output {
+    status: option<string>,
+    measurements: list<measurement-row>,
+  }
+
+  /// Invoke one manifest `export` selector. The runtime creates fresh guest
+  /// state for each invocation rather than sharing an ImageJ-style singleton.
+  invoke: func(entrypoint: string, request: command-request) -> result<command-output, plugin-error>;
+}
+
+/// World implemented by components with image-operation contributions.
+world image-operation-plugin {
+  import host;
+  export image-operation;
+}
+
+/// World implemented by components with command-handler contributions.
+world command-handler-plugin {
+  import host;
+  export command-handler;
+}
+
+/// World implemented by one component that contributes both kinds.
+world combined-plugin {
+  import host;
+  export image-operation;
+  export command-handler;
+}
