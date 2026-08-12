@@ -262,6 +262,18 @@ impl PluginOperationCapabilities {
         self.modifies_pixels
     }
 
+    pub fn scopes(&self) -> impl ExactSizeIterator<Item = PluginPlaneScope> + '_ {
+        self.scopes.iter().copied()
+    }
+
+    pub fn requires_area_roi(&self) -> bool {
+        self.requires_area_roi
+    }
+
+    pub fn accepts_area_mask(&self) -> bool {
+        self.accepts_area_mask
+    }
+
     pub fn validate_invocation(
         &self,
         pixel_type: PluginPixelType,

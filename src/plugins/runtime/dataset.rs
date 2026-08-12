@@ -14,7 +14,7 @@ use crate::plugins::contract::{
     MAX_PLUGIN_CHANNEL_NAMES, MAX_PLUGIN_DIMENSIONS, MAX_PLUGIN_METADATA_ENTRIES, PluginAxisKind,
     PluginContractError, PluginDimension, PluginImageMetadata, PluginMetadataEntry,
     PluginPayloadBudget, PluginPixelType, PluginPlaneBounds, PluginPlaneLayout,
-    PluginPlanePosition, PluginPlaneSchedule, PluginPlaneScope,
+    PluginPlanePosition, PluginPlaneSchedule, PluginPlaneScope, PluginRegion, validate_roi_mask,
 };
 
 /// Errors produced while adapting the host dataset to the component contract.
@@ -94,27 +94,38 @@ impl DatasetLayout {
         self.pixel_type
     }
 
-    pub(super) fn all_plane_positions(&self) -> &[PluginPlanePosition] {
-        &self.all_plane_positions
+    /// Return a fresh contract schedule for the caller-selected scope and active position.
+    pub(super) fn schedule(
+        &self,
+        active: PluginPlanePosition,
+        scope: PluginPlaneScope,
+    ) -> Result<PluginPlaneSchedule, DatasetAdapterError> {
+        Ok(PluginPlaneSchedule::new(self.bounds, active, scope)?)
     }
 
-    pub(super) fn plane_count(&self) -> u32 {
-        // Construction rejects schedules larger than the v0.1 limit, which is below u32::MAX.
-        u32::try_from(self.all_plane_positions.len())
-            .expect("validated plugin plane count must fit u32")
-    }
-
-    /// Return a fresh contract schedule matching [`Self::all_plane_positions`].
-    pub(super) fn all_plane_schedule(&self) -> Result<PluginPlaneSchedule, DatasetAdapterError> {
-        Ok(PluginPlaneSchedule::new(
-            self.bounds,
-            PluginPlanePosition {
-                channel: 0,
-                z: 0,
-                time: 0,
-            },
-            PluginPlaneScope::AllPlanes,
-        )?)
+    /// Derive the exact deterministic plane order for a scoped invocation.
+    pub(super) fn plane_positions(
+        &self,
+        active: PluginPlanePosition,
+        scope: PluginPlaneScope,
+    ) -> Result<Vec<PluginPlanePosition>, DatasetAdapterError> {
+        // Build the authoritative contract schedule first so all bounds and count limits are
+        // applied before allocating the position vector.
+        let schedule = self.schedule(active, scope)?;
+        let mut positions = Vec::with_capacity(schedule.len());
+        match scope {
+            PluginPlaneScope::ActivePlane => positions.push(active),
+            PluginPlaneScope::ZStack => {
+                for z in 0..self.bounds.z() {
+                    positions.push(PluginPlanePosition { z, ..active });
+                }
+            }
+            PluginPlaneScope::AllPlanes => {
+                positions.extend_from_slice(&self.all_plane_positions);
+            }
+        }
+        debug_assert_eq!(positions.len(), schedule.len());
+        Ok(positions)
     }
 
     pub(super) fn plane_layout(
@@ -296,6 +307,7 @@ impl<'a> DatasetAdapter<'a> {
         &self,
         staged: &mut DatasetF32,
         replacement: &wit::PlaneBuffer,
+        area_roi: Option<(PluginRegion, &[u8])>,
     ) -> Result<PluginPlanePosition, DatasetAdapterError> {
         self.layout.validate_staged(staged)?;
 
@@ -312,13 +324,35 @@ impl<'a> DatasetAdapter<'a> {
         if actual_layout != expected_layout {
             return Err(PluginContractError::ReplacementLayout.into());
         }
+        if let Some((bounds, members)) = area_roi {
+            validate_roi_mask(&expected_layout, bounds, members)?;
+        }
 
         let width = self.layout.width as usize;
         let sample_count = width * self.layout.height as usize;
         for index in 0..sample_count {
-            let value = decode_sample(&replacement.pixels, self.layout.pixel_type, index);
             let x = index % width;
             let y = index / width;
+            if !area_roi.is_none_or(|(bounds, members)| {
+                let x = x as u32;
+                let y = y as u32;
+                if x < bounds.x
+                    || y < bounds.y
+                    || x >= bounds.x + bounds.width
+                    || y >= bounds.y + bounds.height
+                {
+                    return false;
+                }
+                let local_x = (x - bounds.x) as usize;
+                let local_y = (y - bounds.y) as usize;
+                members[local_y * bounds.width as usize + local_x] == 1
+            }) {
+                // The staged dataset started as an immutable-source clone. Skipping every zero
+                // member and every pixel outside the ROI rectangle defensively restores source
+                // pixels even when an untrusted guest changed its full replacement plane.
+                continue;
+            }
+            let value = decode_sample(&replacement.pixels, self.layout.pixel_type, index);
             let coordinates = self.layout.coordinates(position, x, y);
             *staged
                 .data
@@ -841,8 +875,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(adapter.layout().all_plane_positions(), expected_positions);
-        assert_eq!(adapter.layout().plane_count(), 8);
+        assert_eq!(adapter.layout().all_plane_positions, expected_positions);
         assert_eq!(adapter.image_metadata().dimensions.len(), 5);
 
         let position = PluginPlanePosition {
@@ -861,7 +894,9 @@ mod tests {
             .flat_map(|value| (20_000.0_f32 + value as f32).to_bits().to_le_bytes())
             .collect();
         let mut staged = adapter.staged_dataset();
-        adapter.scatter_replacement(&mut staged, &plane).unwrap();
+        adapter
+            .scatter_replacement(&mut staged, &plane, None)
+            .unwrap();
         for y in 0..2 {
             for x in 0..3 {
                 assert_eq!(
@@ -871,6 +906,59 @@ mod tests {
             }
         }
         assert_eq!(staged.data[IxDyn(&[0, 0, 1, 0, 1])], 1_100.0);
+    }
+
+    #[test]
+    fn scoped_schedules_and_exact_masks_are_host_authoritative() {
+        let dataset = arbitrary_axis_dataset(PixelType::F32);
+        let adapter = DatasetAdapter::new(&dataset).unwrap();
+        let active = PluginPlanePosition {
+            channel: 1,
+            z: 1,
+            time: 1,
+        };
+        assert_eq!(
+            adapter
+                .layout()
+                .plane_positions(active, PluginPlaneScope::ActivePlane)
+                .unwrap(),
+            vec![active]
+        );
+        assert_eq!(
+            adapter
+                .layout()
+                .plane_positions(active, PluginPlaneScope::ZStack)
+                .unwrap(),
+            vec![
+                PluginPlanePosition { z: 0, ..active },
+                PluginPlanePosition { z: 1, ..active },
+            ]
+        );
+
+        let mut replacement = adapter.encode_plane(active).unwrap();
+        replacement.pixels = [20_000.0_f32; 6]
+            .into_iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect();
+        let bounds = PluginRegion {
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        // Members are (1,0) and (2,1); the two zero members and every pixel outside the
+        // rectangle must remain source-owned even though the replacement changed all six.
+        let members = [1, 0, 0, 1];
+        let mut staged = adapter.staged_dataset();
+        adapter
+            .scatter_replacement(&mut staged, &replacement, Some((bounds, &members)))
+            .unwrap();
+        assert_eq!(staged.data[IxDyn(&[1, 0, 1, 0, 1])], 11_100.0);
+        assert_eq!(staged.data[IxDyn(&[1, 0, 1, 1, 1])], 20_000.0);
+        assert_eq!(staged.data[IxDyn(&[1, 0, 1, 2, 1])], 11_102.0);
+        assert_eq!(staged.data[IxDyn(&[1, 1, 1, 0, 1])], 11_110.0);
+        assert_eq!(staged.data[IxDyn(&[1, 1, 1, 1, 1])], 11_111.0);
+        assert_eq!(staged.data[IxDyn(&[1, 1, 1, 2, 1])], 20_000.0);
     }
 
     #[test]
@@ -996,13 +1084,13 @@ mod tests {
             .collect();
         let mut staged = adapter.staged_dataset();
         adapter
-            .scatter_replacement(&mut staged, &replacement)
+            .scatter_replacement(&mut staged, &replacement, None)
             .unwrap();
         assert_eq!(staged.data.as_slice().unwrap(), &[3.25, -7.5]);
 
         replacement.width += 1;
         assert!(matches!(
-            adapter.scatter_replacement(&mut staged, &replacement),
+            adapter.scatter_replacement(&mut staged, &replacement, None),
             Err(DatasetAdapterError::Contract(
                 PluginContractError::PixelLength { .. } | PluginContractError::ReplacementLayout
             ))

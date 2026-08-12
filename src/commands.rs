@@ -3,6 +3,7 @@ mod components;
 mod error;
 mod gaussian;
 mod intensity;
+mod invocation;
 mod measurements;
 #[cfg(feature = "morpholib")]
 mod morpholibj;
@@ -26,6 +27,11 @@ pub use gaussian::GaussianBlurOp;
 pub use intensity::{
     IntensityEnhanceContrastOp, IntensityInvertOp, IntensityMathOp, IntensityNaNBackgroundOp,
     IntensityNormalizeOp, IntensityWindowOp,
+};
+pub use invocation::{
+    AreaMask, AreaMaskSupport, CancellationToken, DatasetEffect, ExecutionControl,
+    InvocationRequest, InvocationResult, OperationDescriptor, OperationScope, PlanePosition,
+    ProgressEvent, ProgressSink, WorkProgress,
 };
 pub use measurements::{
     ImageStackStatisticsOp, ImageStackZProfileOp, MeasurementsHistogramOp, MeasurementsProfileOp,
@@ -69,6 +75,7 @@ pub use transform::{
 };
 
 pub(crate) use axes::spatial_axes;
+pub(crate) use invocation::{NativePlaneAdapter, ScopedOperation};
 #[cfg(feature = "morpholib")]
 pub(crate) use params::get_optional_bool;
 pub(crate) use params::{get_optional_f32, get_optional_usize, get_required_f32};

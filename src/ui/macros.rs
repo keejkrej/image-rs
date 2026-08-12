@@ -1296,6 +1296,17 @@ mod tests {
     }
 
     #[test]
+    fn recorder_preserves_plane_stack_scope_for_replay() {
+        let catalog = command_registry::command_catalog();
+        let params = json!({ "__image_rs_process_stack": true });
+        let line = macro_record_line_for_command("process.smooth", Some(&params), &catalog)
+            .expect("Smooth should be recordable");
+
+        assert_eq!(line, r#"run("Smooth", "__image_rs_process_stack");"#);
+        assert_eq!(parse(&line), invocation("process.smooth", Some(params)));
+    }
+
+    #[test]
     fn recorder_emits_native_display_range_calls() {
         let catalog = command_registry::command_catalog();
         let set_range = macro_record_line_for_command(

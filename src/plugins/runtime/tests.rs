@@ -1,10 +1,14 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use ndarray::{ArrayD, IxDyn};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::commands::{ParamSpec, default_registry};
+use crate::commands::{
+    AreaMask, AreaMaskSupport, CancellationToken, ExecutionControl, InvocationRequest,
+    OperationScope, ParamSpec, PlanePosition, ProgressEvent, ProgressSink, default_registry,
+};
 use crate::model::{AxisKind, Dataset, Dim, Metadata, PixelType};
 use crate::runtime::OpsService;
 use crate::workflow::{OpInvocation, PipelineSpec, run_pipeline};
@@ -48,34 +52,106 @@ fn test_dataset(pixel_type: PixelType) -> DatasetF32 {
     .unwrap()
 }
 
-fn compatible_fixture_catalog() -> PluginCatalog {
-    let mut discovery = PluginCatalog::discover(fixture_root()).unwrap();
+fn scoped_dataset() -> DatasetF32 {
+    // T, Z, C, Y, X keeps all scheduling axes non-trivial and non-canonical.
+    let shape = [2, 2, 2, 2, 3];
+    let mut data = ArrayD::zeros(IxDyn(&shape));
+    for time in 0..shape[0] {
+        for z in 0..shape[1] {
+            for channel in 0..shape[2] {
+                for y in 0..shape[3] {
+                    for x in 0..shape[4] {
+                        data[IxDyn(&[time, z, channel, y, x])] =
+                            (time * 1_000 + z * 100 + channel * 10 + y * 3 + x) as f32;
+                    }
+                }
+            }
+        }
+    }
+    Dataset::new(
+        data,
+        Metadata {
+            dims: vec![
+                Dim::new(AxisKind::Time, shape[0]),
+                Dim::new(AxisKind::Z, shape[1]),
+                Dim::new(AxisKind::Channel, shape[2]),
+                Dim::new(AxisKind::Y, shape[3]),
+                Dim::new(AxisKind::X, shape[4]),
+            ],
+            pixel_type: PixelType::F32,
+            ..Metadata::default()
+        },
+    )
+    .unwrap()
+}
+
+fn result_dataset<'a>(
+    result: &'a crate::commands::InvocationResult,
+    input: &'a Arc<DatasetF32>,
+) -> &'a DatasetF32 {
+    result.dataset_effect.dataset(input).as_ref()
+}
+
+#[test]
+fn no_op_detection_uses_pixel_bits_including_nan_payloads() {
+    let mut left = test_dataset(PixelType::F32);
+    left.data[IxDyn(&[0, 0, 0])] = f32::from_bits(0x7fc0_0011);
+    let mut right = left.clone();
+    assert!(datasets_bit_identical(&left, &right));
+
+    right.data[IxDyn(&[0, 0, 0])] = f32::from_bits(0x7fc0_0012);
+    assert!(!datasets_bit_identical(&left, &right));
+}
+
+#[derive(Default)]
+struct RecordingProgress(Mutex<Vec<ProgressEvent>>);
+
+impl ProgressSink for RecordingProgress {
+    fn report(&self, event: ProgressEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+struct CancelOnGuestProgress {
+    cancellation: CancellationToken,
+}
+
+impl ProgressSink for CancelOnGuestProgress {
+    fn report(&self, event: ProgressEvent) {
+        if event.detail.is_some() {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+fn fixture_catalog() -> PluginCatalog {
+    let discovery = PluginCatalog::discover(fixture_root()).unwrap();
     assert!(discovery.rejected.is_empty(), "{:?}", discovery.rejected);
-    assert!(discovery.catalog.operations.remove(NEEDS_ROI).is_some());
     discovery.catalog
 }
 
 fn fixture_registry() -> OperationRegistry {
-    let catalog = compatible_fixture_catalog();
+    let catalog = fixture_catalog();
     let mut registry = OperationRegistry::default();
-    assert_eq!(catalog.register_operations(&mut registry).unwrap(), 6);
+    assert_eq!(catalog.register_operations(&mut registry).unwrap(), 7);
     registry
 }
 
 #[test]
-fn incompatible_late_capability_keeps_registration_atomic() {
-    let discovery = PluginCatalog::discover(fixture_root()).unwrap();
+fn required_roi_capability_registers_as_a_scoped_descriptor() {
+    let catalog = fixture_catalog();
     let mut registry = OperationRegistry::default();
-
-    let error = discovery
-        .catalog
-        .register_operations(&mut registry)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        PluginRuntimeError::Capabilities { operation_id, .. } if operation_id == NEEDS_ROI
-    ));
-    assert!(registry.is_empty());
+    assert_eq!(catalog.register_operations(&mut registry).unwrap(), 7);
+    let descriptor = registry.describe(NEEDS_ROI).unwrap();
+    assert_eq!(descriptor.area_mask, AreaMaskSupport::Required);
+    assert_eq!(
+        descriptor.scopes,
+        vec![
+            OperationScope::ActivePlane,
+            OperationScope::ZStack,
+            OperationScope::AllPlanes,
+        ]
+    );
 }
 
 #[test]
@@ -136,6 +212,195 @@ fn fixture_runs_through_catalog_registry_and_ops_service_for_every_pixel_type() 
 }
 
 #[test]
+fn ops_service_invokes_active_plane_and_z_stack_with_exact_progress_context() {
+    let service = OpsService::from_registry(fixture_registry());
+    let input = Arc::new(scoped_dataset());
+    let original = input.data.clone();
+    let active = PlanePosition {
+        channel: 1,
+        z: 1,
+        time: 1,
+    };
+    let progress = Arc::new(RecordingProgress::default());
+    let control = ExecutionControl::new(CancellationToken::default(), progress.clone());
+    let active_result = service
+        .invoke(
+            InvocationRequest {
+                operation: ADD_ONE.to_string(),
+                input: input.clone(),
+                parameters: json!({}),
+                scope: OperationScope::ActivePlane,
+                active,
+                area_mask: None,
+            },
+            &control,
+        )
+        .unwrap();
+    let active_output = result_dataset(&active_result, &input);
+    let mut expected = original.clone();
+    for y in 0..2 {
+        for x in 0..3 {
+            expected[IxDyn(&[1, 1, 1, y, x])] += 1.0;
+        }
+    }
+    assert_eq!(active_output.data, expected);
+    assert_eq!(input.data, original);
+
+    let events = progress.0.lock().unwrap();
+    assert!(events.iter().any(|event| {
+        event.completed_planes == 0
+            && event.total_planes == 1
+            && event.current_plane == Some(active)
+            && event.detail.as_ref().is_some_and(|detail| {
+                detail.completed == 1
+                    && detail.total == Some(1)
+                    && detail.message.as_deref() == Some("add-one")
+            })
+    }));
+    assert!(events.iter().any(|event| {
+        event.completed_planes == 1
+            && event.total_planes == 1
+            && event.current_plane == Some(active)
+            && event.detail.is_none()
+    }));
+    assert!(events.iter().any(|event| {
+        event.completed_planes == 1
+            && event.total_planes == 1
+            && event.current_plane.is_none()
+            && event.detail.as_ref().is_some_and(|detail| {
+                detail.completed == 1
+                    && detail.total == Some(1)
+                    && detail.message.as_deref() == Some("finish")
+            })
+    }));
+    drop(events);
+
+    let z_result = service
+        .invoke(
+            InvocationRequest {
+                operation: ADD_ONE.to_string(),
+                input: input.clone(),
+                parameters: json!({}),
+                scope: OperationScope::ZStack,
+                active,
+                area_mask: None,
+            },
+            &ExecutionControl::default(),
+        )
+        .unwrap();
+    let z_output = result_dataset(&z_result, &input);
+    let mut expected = original.clone();
+    for z in 0..2 {
+        for y in 0..2 {
+            for x in 0..3 {
+                expected[IxDyn(&[1, z, 1, y, x])] += 1.0;
+            }
+        }
+    }
+    assert_eq!(z_output.data, expected);
+    assert_eq!(input.data, original);
+}
+
+#[test]
+fn ops_service_enforces_required_irregular_roi_on_every_z_plane() {
+    let service = OpsService::from_registry(fixture_registry());
+    let input = Arc::new(scoped_dataset());
+    let original = input.data.clone();
+    let active = PlanePosition {
+        channel: 1,
+        z: 1,
+        time: 1,
+    };
+
+    let error = service
+        .invoke(
+            InvocationRequest {
+                operation: NEEDS_ROI.to_string(),
+                input: input.clone(),
+                parameters: json!({}),
+                scope: OperationScope::ZStack,
+                active,
+                area_mask: None,
+            },
+            &ExecutionControl::default(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("requires an area mask"));
+
+    // Irregular checkerboard membership inside the full 3x2 plane. The fixture deliberately
+    // changes every replacement pixel, so equality here proves host-side restoration.
+    let area_mask = AreaMask::new(0, 0, 3, 2, vec![1, 0, 1, 0, 1, 0]).unwrap();
+    let result = service
+        .invoke(
+            InvocationRequest {
+                operation: NEEDS_ROI.to_string(),
+                input: input.clone(),
+                parameters: json!({}),
+                scope: OperationScope::ZStack,
+                active,
+                area_mask: Some(area_mask),
+            },
+            &ExecutionControl::default(),
+        )
+        .unwrap();
+    let output = result_dataset(&result, &input);
+    let mut expected = original.clone();
+    for z in 0..2 {
+        for (y, x) in [(0, 0), (0, 2), (1, 1)] {
+            expected[IxDyn(&[1, z, 1, y, x])] += 1.0;
+        }
+    }
+    assert_eq!(output.data, expected);
+    assert_eq!(input.data, original);
+}
+
+#[test]
+fn caller_cancellation_and_traps_discard_every_staged_replacement() {
+    let service = OpsService::from_registry(fixture_registry());
+    let input = Arc::new(test_dataset(PixelType::F32));
+    let original = input.as_ref().clone();
+    let cancellation = CancellationToken::default();
+    let control = ExecutionControl::new(
+        cancellation.clone(),
+        Arc::new(CancelOnGuestProgress { cancellation }),
+    );
+
+    let error = service
+        .invoke(
+            InvocationRequest {
+                operation: ADD_ONE.to_string(),
+                input: input.clone(),
+                parameters: json!({}),
+                scope: OperationScope::AllPlanes,
+                active: PlanePosition::default(),
+                area_mask: None,
+            },
+            &control,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    assert_eq!(input.data, original.data);
+    assert_eq!(input.metadata, original.metadata);
+
+    let trap = service
+        .invoke(
+            InvocationRequest {
+                operation: BAD_REPLACEMENT.to_string(),
+                input: input.clone(),
+                parameters: json!({}),
+                scope: OperationScope::ActivePlane,
+                active: PlanePosition::default(),
+                area_mask: None,
+            },
+            &ExecutionControl::default(),
+        )
+        .unwrap_err();
+    assert!(trap.to_string().contains("plane position"), "{trap}");
+    assert_eq!(input.data, original.data);
+    assert_eq!(input.metadata, original.metadata);
+}
+
+#[test]
 fn fixture_operation_survives_the_workflow_boundary_losslessly() {
     let registry = fixture_registry();
     let input = test_dataset(PixelType::F32);
@@ -186,7 +451,7 @@ fn fixture_operation_survives_the_workflow_boundary_losslessly() {
 
 #[test]
 fn integer_typed_builtin_output_is_quantized_at_the_plugin_boundary() {
-    let catalog = compatible_fixture_catalog();
+    let catalog = fixture_catalog();
     let mut registry = default_registry();
     catalog.register_operations(&mut registry).unwrap();
     let input = test_dataset(PixelType::U8);
@@ -282,7 +547,14 @@ fn epoch_deadline_interrupts_guest_even_when_fuel_is_effectively_unbounded() {
         image: adapter.image_metadata(),
         selected_scope: wit_operation::PlaneScope::AllPlanes,
         active_position: plugin_position_to_wit(active),
-        plane_count: adapter.layout().plane_count(),
+        plane_count: u32::try_from(
+            adapter
+                .layout()
+                .plane_positions(active, PluginPlaneScope::AllPlanes)
+                .unwrap()
+                .len(),
+        )
+        .unwrap(),
     };
     let invocation = guest
         .call_begin(&mut store, "spin", &begin)
@@ -339,7 +611,7 @@ fn linker_rejects_an_ambient_wasi_import() {
 
 #[test]
 fn registration_collision_is_atomic_and_parameters_are_checked_before_guest_entry() {
-    let catalog = compatible_fixture_catalog();
+    let catalog = fixture_catalog();
     let mut registry = OperationRegistry::default();
     catalog.register_operations(&mut registry).unwrap();
     let before = registry.len();
@@ -498,7 +770,7 @@ fn encode_u32_leb(mut value: u32, output: &mut Vec<u8>) {
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
-        output.push(byte | u8::from(value != 0) * 0x80);
+        output.push(byte | (u8::from(value != 0) * 0x80));
         if value == 0 {
             break;
         }

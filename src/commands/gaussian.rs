@@ -19,7 +19,7 @@ impl Operation for GaussianBlurOp {
     fn schema(&self) -> OpSchema {
         OpSchema {
             name: self.name().to_string(),
-            description: "Gaussian blur across spatial axes (X/Y/Z).".to_string(),
+            description: "Gaussian blur across spatial axes for whole-dataset execution; scoped invocation processes scheduled X/Y planes independently.".to_string(),
             params: vec![ParamSpec {
                 name: "sigma".to_string(),
                 description: "Standard deviation for Gaussian kernel.".to_string(),

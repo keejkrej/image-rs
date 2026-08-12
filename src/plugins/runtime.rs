@@ -23,7 +23,7 @@ use serde_json::{Map, Number, Value};
 use thiserror::Error;
 use wasmparser::{Encoding, Parser, Payload, Validator};
 use wasmtime::component::{Component, HasSelf, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder, UpdateDeadline};
 
 use self::bindings::exports::image_rs::plugin::image_operation as wit_operation;
 use self::bindings::image_rs::plugin::{host as wit_host, types as wit_types};
@@ -33,13 +33,15 @@ use self::dataset::{
 };
 use super::PluginCatalog;
 use crate::commands::{
-    MeasurementTable, OpOutput, OpSchema, Operation, OperationRegistry, OpsError,
+    AreaMask, AreaMaskSupport, ExecutionControl, InvocationRequest, InvocationResult,
+    MeasurementTable, OpOutput, OpSchema, OperationDescriptor, OperationRegistry, OperationScope,
+    OpsError, PlanePosition, ProgressEvent, ScopedOperation, WorkProgress,
 };
 use crate::model::DatasetF32;
 use crate::plugins::contract::{
     MAX_PLUGIN_MEASUREMENT_ROWS, MAX_PLUGIN_MEASUREMENTS_PER_ROW, PluginContractError,
-    PluginOperationCapabilities, PluginPayloadBudget, PluginPixelType, PluginPlaneLayout,
-    PluginPlanePosition, PluginPlaneScope, PluginProgress, validate_name,
+    PluginOperationCapabilities, PluginPayloadBudget, PluginPlaneLayout, PluginPlanePosition,
+    PluginPlaneScope, PluginProgress, PluginRegion, validate_name,
 };
 
 // One memory can simultaneously hold a maximum-size input and replacement plane plus canonical
@@ -184,18 +186,30 @@ impl RuntimeCore {
     }
 
     fn store(&self, timeout: Duration, fuel: u64) -> Result<Store<HostState>, String> {
-        let mut store = Store::new(&self.engine, HostState::new(timeout));
+        self.store_with_control(timeout, fuel, None)
+    }
+
+    fn store_with_control(
+        &self,
+        timeout: Duration,
+        fuel: u64,
+        control: Option<&ExecutionControl>,
+    ) -> Result<Store<HostState>, String> {
+        let mut store = Store::new(&self.engine, HostState::new(timeout, control.cloned()));
         store.limiter(|state| &mut state.limits);
         store
             .set_fuel(fuel)
             .map_err(|error| concise_error(&error.to_string()))?;
-        let ticks = timeout
-            .as_nanos()
-            .div_ceil(EPOCH_TICK.as_nanos())
-            .max(1)
-            .min(u128::from(u64::MAX)) as u64;
-        store.set_epoch_deadline(ticks);
-        store.epoch_deadline_trap();
+        // Check the caller token as well as the wall-clock deadline on every epoch tick. This
+        // makes cancellation interrupt even a guest that spins without calling `is-cancelled`.
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(|context| {
+            Ok(if context.data().cancelled() {
+                UpdateDeadline::Interrupt
+            } else {
+                UpdateDeadline::Continue(1)
+            })
+        });
         Ok(store)
     }
 }
@@ -218,11 +232,15 @@ struct HostState {
     progress: PluginProgress,
     output_budget: PluginPayloadBudget,
     deadline: Instant,
+    control: Option<ExecutionControl>,
+    completed_planes: usize,
+    total_planes: usize,
+    current_plane: Option<PlanePosition>,
     contract_violation: Option<String>,
 }
 
 impl HostState {
-    fn new(timeout: Duration) -> Self {
+    fn new(timeout: Duration, control: Option<ExecutionControl>) -> Self {
         Self {
             limits: StoreLimitsBuilder::new()
                 .memory_size(STORE_MEMORY_BYTES)
@@ -235,12 +253,53 @@ impl HostState {
             progress: PluginProgress::default(),
             output_budget: PluginPayloadBudget::new(),
             deadline: Instant::now() + timeout,
+            control,
+            completed_planes: 0,
+            total_planes: 0,
+            current_plane: None,
             contract_violation: None,
         }
     }
 
     fn cancelled(&self) -> bool {
+        self.caller_cancelled() || self.deadline_exceeded()
+    }
+
+    fn caller_cancelled(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(ExecutionControl::is_cancelled)
+    }
+
+    fn deadline_exceeded(&self) -> bool {
         Instant::now() >= self.deadline
+    }
+
+    fn set_invocation_context(&mut self, total_planes: usize) {
+        self.completed_planes = 0;
+        self.total_planes = total_planes;
+        self.current_plane = None;
+    }
+
+    fn set_plane_context(&mut self, completed_planes: usize, current_plane: PlanePosition) {
+        self.completed_planes = completed_planes;
+        self.current_plane = Some(current_plane);
+    }
+
+    fn report_plane_completion(&mut self) {
+        self.completed_planes = self
+            .completed_planes
+            .saturating_add(1)
+            .min(self.total_planes);
+        if let Some(control) = &self.control {
+            control.report(ProgressEvent {
+                completed_planes: self.completed_planes,
+                total_planes: self.total_planes,
+                current_plane: self.current_plane,
+                detail: None,
+            });
+        }
+        self.current_plane = None;
     }
 
     fn reject(&mut self, message: String) -> wasmtime::Error {
@@ -255,8 +314,13 @@ impl wit_types::Host for HostState {}
 
 impl wit_host::Host for HostState {
     fn report_progress(&mut self, update: wit_types::ProgressUpdate) -> wasmtime::Result<()> {
-        if self.cancelled() {
-            return Err(self.reject("plugin invocation deadline exceeded".to_string()));
+        if self.caller_cancelled() {
+            return Err(wasmtime::Error::msg(
+                "plugin invocation cancelled by caller",
+            ));
+        }
+        if self.deadline_exceeded() {
+            return Err(wasmtime::Error::msg("plugin invocation deadline exceeded"));
         }
         if let Err(error) = self.progress.update(
             update.completed,
@@ -265,6 +329,23 @@ impl wit_host::Host for HostState {
             &mut self.output_budget,
         ) {
             return Err(self.reject(error.to_string()));
+        }
+        if let Some(control) = &self.control {
+            control.report(ProgressEvent {
+                completed_planes: self.completed_planes,
+                total_planes: self.total_planes,
+                current_plane: self.current_plane,
+                detail: Some(WorkProgress {
+                    completed: update.completed,
+                    total: update.total,
+                    message: update.message,
+                }),
+            });
+        }
+        if self.caller_cancelled() {
+            return Err(wasmtime::Error::msg(
+                "plugin invocation cancelled by caller",
+            ));
         }
         Ok(())
     }
@@ -277,9 +358,9 @@ impl wit_host::Host for HostState {
 /// Register every discovered image operation as an ordinary application operation.
 ///
 /// Registration is atomic: artifacts are compiled, linked, capability-checked, and added to a
-/// cloned registry before the supplied registry is changed. The current operation interface has
-/// no active-plane or ROI context, so this adapter accepts only operations that support the
-/// all-planes scope without requiring an ROI.
+/// cloned registry before the supplied registry is changed. Each component's dynamic scope and
+/// ROI capabilities become its scoped-operation descriptor; invocation context is supplied only
+/// when the registry executes that operation.
 impl PluginCatalog {
     pub fn register_operations(
         &self,
@@ -345,7 +426,6 @@ impl PluginCatalog {
                     &operation.export,
                     remaining.min(CAPABILITY_TIMEOUT),
                 )?;
-                ensure_registry_compatible(&operation.id, &capabilities)?;
                 let adapter = WasmOperation {
                     id: operation.id.clone(),
                     entrypoint: operation.export.clone(),
@@ -355,7 +435,7 @@ impl PluginCatalog {
                     pre: pre.clone(),
                 };
                 staged_registry
-                    .register(Arc::new(adapter))
+                    .register_scoped(Arc::new(adapter))
                     .map_err(|error| PluginRuntimeError::Registry {
                         operation_id: operation.id.clone(),
                         message: error.to_string(),
@@ -378,25 +458,123 @@ struct WasmOperation {
     pre: bindings::ImageOperationPluginPre<HostState>,
 }
 
-impl Operation for WasmOperation {
+#[derive(Debug, Clone)]
+struct InvocationAreaRoi {
+    bounds: PluginRegion,
+    members: Vec<u8>,
+}
+
+impl InvocationAreaRoi {
+    fn view(&self) -> (PluginRegion, &[u8]) {
+        (self.bounds, &self.members)
+    }
+
+    fn to_wit(&self) -> wit_types::RoiMask {
+        wit_types::RoiMask {
+            bounds: wit_types::Region {
+                x: self.bounds.x,
+                y: self.bounds.y,
+                width: self.bounds.width,
+                height: self.bounds.height,
+            },
+            members: self.members.clone(),
+        }
+    }
+}
+
+impl ScopedOperation for WasmOperation {
     fn name(&self) -> &str {
         &self.id
     }
 
-    fn schema(&self) -> OpSchema {
-        self.schema.clone()
+    fn descriptor(&self) -> OperationDescriptor {
+        OperationDescriptor {
+            schema: self.schema.clone(),
+            scopes: self
+                .capabilities
+                .scopes()
+                .map(plugin_scope_to_operation)
+                .collect(),
+            area_mask: if self.capabilities.requires_area_roi() {
+                AreaMaskSupport::Required
+            } else if self.capabilities.accepts_area_mask() {
+                AreaMaskSupport::Optional
+            } else {
+                AreaMaskSupport::Unsupported
+            },
+        }
     }
 
-    fn execute(&self, dataset: &DatasetF32, params: &Value) -> crate::commands::Result<OpOutput> {
-        self.execute_inner(dataset, params)
+    fn invoke(
+        &self,
+        request: &InvocationRequest,
+        control: &ExecutionControl,
+    ) -> crate::commands::Result<InvocationResult> {
+        if request.operation != self.id {
+            return Err(OpsError::InvalidParams(format!(
+                "scoped request for `{}` was routed to plugin operation `{}`",
+                request.operation, self.id
+            )));
+        }
+        if control.is_cancelled() {
+            return Err(OpsError::Cancelled);
+        }
+        let selected_scope =
+            operation_scope_to_plugin(request.scope).ok_or_else(|| OpsError::UnsupportedScope {
+                operation: self.id.clone(),
+                scope: request.scope,
+            })?;
+        let active = PluginPlanePosition {
+            channel: u32::try_from(request.active.channel).map_err(|_| {
+                OpsError::ActivePosition("channel index does not fit the plugin ABI".into())
+            })?,
+            z: u32::try_from(request.active.z).map_err(|_| {
+                OpsError::ActivePosition("Z index does not fit the plugin ABI".into())
+            })?,
+            time: u32::try_from(request.active.time).map_err(|_| {
+                OpsError::ActivePosition("time index does not fit the plugin ABI".into())
+            })?,
+        };
+        let area_roi = request
+            .area_mask
+            .as_ref()
+            .map(invocation_area_roi)
+            .transpose()?;
+        let output = self.execute_scoped_inner(
+            request.input.as_ref(),
+            &request.parameters,
+            selected_scope,
+            active,
+            area_roi.as_ref(),
+            Some(control),
+        )?;
+        let OpOutput {
+            dataset,
+            measurements,
+            status,
+        } = output;
+        if datasets_bit_identical(&dataset, request.input.as_ref()) {
+            Ok(InvocationResult::unchanged(measurements, status))
+        } else {
+            Ok(InvocationResult::replaced(
+                request.input.clone(),
+                dataset,
+                measurements,
+                status,
+            ))
+        }
     }
 }
 
 impl WasmOperation {
-    fn execute_inner(
+    fn execute_scoped_inner(
         &self,
         dataset: &DatasetF32,
         params: &Value,
+        selected_scope: PluginPlaneScope,
+        active: PluginPlanePosition,
+        area_roi: Option<&InvocationAreaRoi>,
+        control: Option<&ExecutionControl>,
     ) -> crate::commands::Result<OpOutput> {
         let parameters_json = validate_parameters(&self.schema, params)?;
         let mut input_budget = PluginPayloadBudget::new();
@@ -415,15 +593,32 @@ impl WasmOperation {
         self.capabilities
             .validate_invocation(
                 adapter.layout().pixel_type(),
-                PluginPlaneScope::AllPlanes,
-                false,
+                selected_scope,
+                area_roi.is_some(),
             )
             .map_err(|error| OpsError::UnsupportedLayout(error.to_string()))?;
+        let positions = adapter
+            .layout()
+            .plane_positions(active, selected_scope)
+            .map_err(dataset_input_error)?;
+        if let Some(area_roi) = area_roi {
+            let layout = adapter
+                .layout()
+                .plane_layout(active)
+                .map_err(dataset_input_error)?;
+            crate::plugins::contract::validate_roi_mask(
+                &layout,
+                area_roi.bounds,
+                &area_roi.members,
+            )
+            .map_err(|error| OpsError::UnsupportedLayout(error.to_string()))?;
+        }
 
         let mut store = self
             .runtime
-            .store(INVOCATION_TIMEOUT, INVOCATION_FUEL)
+            .store_with_control(INVOCATION_TIMEOUT, INVOCATION_FUEL, control)
             .map_err(|message| self.execution_error(message))?;
+        store.data_mut().set_invocation_context(positions.len());
         let instance = self
             .pre
             .instantiate(&mut store)
@@ -441,12 +636,8 @@ impl WasmOperation {
                 "capabilities changed between registration and invocation".to_string(),
             ));
         }
+        self.check_invocation_state(&store)?;
 
-        let active = PluginPlanePosition {
-            channel: 0,
-            z: 0,
-            time: 0,
-        };
         let begin = wit_operation::BeginRequest {
             operation_id: self.id.clone(),
             command_id: None,
@@ -454,9 +645,11 @@ impl WasmOperation {
             argument: String::new(),
             parameters_json,
             image: adapter.image_metadata(),
-            selected_scope: wit_operation::PlaneScope::AllPlanes,
+            selected_scope: plugin_scope_to_wit(selected_scope),
             active_position: plugin_position_to_wit(active),
-            plane_count: adapter.layout().plane_count(),
+            plane_count: u32::try_from(positions.len()).map_err(|_| {
+                self.contract_error("scheduled plane count does not fit u32".to_string())
+            })?,
         };
         let invocation = guest
             .call_begin(&mut store, &self.entrypoint, &begin)
@@ -467,24 +660,33 @@ impl WasmOperation {
             let mut staged = adapter.staged_dataset();
             let mut schedule = adapter
                 .layout()
-                .all_plane_schedule()
+                .schedule(active, selected_scope)
                 .map_err(|error| self.contract_error(error.to_string()))?;
             let mut result_rows = Vec::new();
 
-            for &position in adapter.layout().all_plane_positions() {
-                check_invocation_state(&store).map_err(|error| self.execution_error(error))?;
+            for (completed_planes, &position) in positions.iter().enumerate() {
+                self.check_invocation_state(&store)?;
+                store.data_mut().set_plane_context(
+                    completed_planes,
+                    PlanePosition {
+                        channel: position.channel as usize,
+                        z: position.z as usize,
+                        time: position.time as usize,
+                    },
+                );
                 let plane = adapter
                     .encode_plane(position)
                     .map_err(dataset_input_error)?;
                 let request = wit_operation::PlaneRequest {
                     plane,
-                    area_roi: None,
+                    area_roi: area_roi.map(InvocationAreaRoi::to_wit),
                 };
                 let output = guest
                     .operation_invocation()
                     .call_process_plane(&mut store, invocation, &request)
                     .map_err(|error| self.trap_error(&store, error))?
                     .map_err(|error| self.guest_error(&mut store, error))?;
+                self.check_invocation_state(&store)?;
 
                 if let Some(replacement) = output.replacement.as_ref() {
                     let input_layout = adapter
@@ -505,7 +707,11 @@ impl WasmOperation {
                         .validate_replacement(Some(&replacement_layout), &self.capabilities)
                         .map_err(|error| self.contract_error(error.to_string()))?;
                     adapter
-                        .scatter_replacement(&mut staged, replacement)
+                        .scatter_replacement(
+                            &mut staged,
+                            replacement,
+                            area_roi.map(InvocationAreaRoi::view),
+                        )
                         .map_err(|error| self.contract_error(error.to_string()))?;
                 }
                 schedule
@@ -517,12 +723,13 @@ impl WasmOperation {
                     &mut result_rows,
                 )
                 .map_err(|error| self.contract_error(error.to_string()))?;
+                store.data_mut().report_plane_completion();
             }
 
             schedule
                 .finish()
                 .map_err(|error| self.contract_error(error.to_string()))?;
-            check_invocation_state(&store).map_err(|error| self.execution_error(error))?;
+            self.check_invocation_state(&store)?;
             Ok((staged, result_rows))
         })();
         let (mut staged, mut result_rows) = match staging {
@@ -534,9 +741,9 @@ impl WasmOperation {
                 return Err(error);
             }
         };
-        if let Err(error) = check_invocation_state(&store) {
+        if let Err(error) = self.check_invocation_state(&store) {
             let _ = invocation.resource_drop(&mut store);
-            return Err(self.execution_error(error));
+            return Err(error);
         }
 
         // `finish` consumes the resource even when the guest returns a structured error.
@@ -568,7 +775,7 @@ impl WasmOperation {
             None => None,
         };
 
-        check_invocation_state(&store).map_err(|error| self.execution_error(error))?;
+        self.check_invocation_state(&store)?;
         staged.validate()?;
         let measurements = (!result_rows.is_empty()).then(|| MeasurementTable {
             values: BTreeMap::from([("rows".to_string(), Value::Array(result_rows))]),
@@ -592,11 +799,14 @@ impl WasmOperation {
     }
 
     fn trap_error(&self, store: &Store<HostState>, error: wasmtime::Error) -> OpsError {
+        if store.data().caller_cancelled() {
+            return OpsError::Cancelled;
+        }
+        if store.data().deadline_exceeded() {
+            return self.execution_error("deadline exceeded".to_string());
+        }
         if let Some(message) = &store.data().contract_violation {
             return self.contract_error(message.clone());
-        }
-        if store.data().cancelled() {
-            return self.execution_error("deadline exceeded".to_string());
         }
         if store.get_fuel().ok() == Some(0) {
             return self.execution_error("fuel exhausted".to_string());
@@ -611,9 +821,26 @@ impl WasmOperation {
         self.execution_error(format!("sandbox trap: {message}"))
     }
 
+    fn check_invocation_state(&self, store: &Store<HostState>) -> crate::commands::Result<()> {
+        if store.data().caller_cancelled() {
+            return Err(OpsError::Cancelled);
+        }
+        if store.data().deadline_exceeded() {
+            return Err(self.execution_error("deadline exceeded".to_string()));
+        }
+        if let Some(message) = &store.data().contract_violation {
+            return Err(self.contract_error(message.clone()));
+        }
+        Ok(())
+    }
+
     fn guest_error(&self, store: &mut Store<HostState>, error: wit_types::PluginError) -> OpsError {
         if let Err(validation) = validate_guest_error(&error, &mut store.data_mut().output_budget) {
             return self.contract_error(validation.to_string());
+        }
+        if matches!(error.kind, wit_types::ErrorKind::Cancelled) && store.data().caller_cancelled()
+        {
+            return OpsError::Cancelled;
         }
         let mut message = error.message;
         if let Some(details) = error.details_json {
@@ -719,31 +946,6 @@ fn query_capabilities(
     })
 }
 
-fn ensure_registry_compatible(
-    operation_id: &str,
-    capabilities: &PluginOperationCapabilities,
-) -> Result<(), PluginRuntimeError> {
-    let supports_a_pixel_type = [
-        PluginPixelType::U8,
-        PluginPixelType::U16,
-        PluginPixelType::F32,
-    ]
-    .into_iter()
-    .any(|pixel_type| {
-        capabilities
-            .validate_invocation(pixel_type, PluginPlaneScope::AllPlanes, false)
-            .is_ok()
-    });
-    if !supports_a_pixel_type {
-        return Err(PluginRuntimeError::Capabilities {
-            operation_id: operation_id.to_string(),
-            message: "the operation-registry adapter requires all-planes scope and no required ROI"
-                .to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn convert_capabilities(
     capabilities: wit_operation::OperationCapabilities,
 ) -> Result<PluginOperationCapabilities, PluginContractError> {
@@ -764,6 +966,58 @@ fn convert_capabilities(
         capabilities.accepts_area_mask,
         capabilities.modifies_pixels,
     )
+}
+
+fn plugin_scope_to_wit(scope: PluginPlaneScope) -> wit_operation::PlaneScope {
+    match scope {
+        PluginPlaneScope::ActivePlane => wit_operation::PlaneScope::ActivePlane,
+        PluginPlaneScope::ZStack => wit_operation::PlaneScope::ZStack,
+        PluginPlaneScope::AllPlanes => wit_operation::PlaneScope::AllPlanes,
+    }
+}
+
+fn plugin_scope_to_operation(scope: PluginPlaneScope) -> OperationScope {
+    match scope {
+        PluginPlaneScope::ActivePlane => OperationScope::ActivePlane,
+        PluginPlaneScope::ZStack => OperationScope::ZStack,
+        PluginPlaneScope::AllPlanes => OperationScope::AllPlanes,
+    }
+}
+
+fn operation_scope_to_plugin(scope: OperationScope) -> Option<PluginPlaneScope> {
+    match scope {
+        OperationScope::WholeDataset => None,
+        OperationScope::ActivePlane => Some(PluginPlaneScope::ActivePlane),
+        OperationScope::ZStack => Some(PluginPlaneScope::ZStack),
+        OperationScope::AllPlanes => Some(PluginPlaneScope::AllPlanes),
+    }
+}
+
+fn datasets_bit_identical(left: &DatasetF32, right: &DatasetF32) -> bool {
+    left.metadata == right.metadata
+        && left.shape() == right.shape()
+        && left
+            .data
+            .iter()
+            .zip(right.data.iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn invocation_area_roi(area_mask: &AreaMask) -> crate::commands::Result<InvocationAreaRoi> {
+    let coordinate = |field: &'static str, value: usize| {
+        u32::try_from(value).map_err(|_| {
+            OpsError::InvalidAreaMask(format!("area mask {field} does not fit the plugin ABI"))
+        })
+    };
+    Ok(InvocationAreaRoi {
+        bounds: PluginRegion {
+            x: coordinate("x coordinate", area_mask.x())?,
+            y: coordinate("y coordinate", area_mask.y())?,
+            width: coordinate("width", area_mask.width())?,
+            height: coordinate("height", area_mask.height())?,
+        },
+        members: area_mask.members().to_vec(),
+    })
 }
 
 fn validate_parameters(schema: &OpSchema, params: &Value) -> crate::commands::Result<String> {
@@ -900,16 +1154,6 @@ fn validate_guest_error(
     budget.validate_text("plugin error message", &error.message)?;
     if let Some(details) = &error.details_json {
         budget.validate_json_value("plugin error details", details)?;
-    }
-    Ok(())
-}
-
-fn check_invocation_state(store: &Store<HostState>) -> Result<(), String> {
-    if let Some(message) = &store.data().contract_violation {
-        return Err(format!("contract violation: {message}"));
-    }
-    if store.data().cancelled() {
-        return Err("deadline exceeded".to_string());
     }
     Ok(())
 }

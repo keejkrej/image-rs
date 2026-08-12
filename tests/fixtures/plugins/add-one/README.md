@@ -7,7 +7,8 @@ by the runtime adapter's integration tests. Its manifest exposes seven selectors
   on every host-scheduled plane. Each plane returns one measurement row whose
   integer `plane` column is the 1-based invocation order. It also reports the
   same monotonic completed count against the fixed `begin.plane-count` total.
-  A successful `finish` returns the status `add-one complete` and an
+  A successful `finish` reports that same completed total with a distinct
+  `finish` message, returns the status `add-one complete`, and applies an
   idempotent X-axis calibration update used to exercise metadata publication.
 - `fail-finish` returns the same replacements, rows, and progress updates, then
   returns an `internal` error from `finish`. This lets tests prove that the host
@@ -15,14 +16,15 @@ by the runtime adapter's integration tests. Its manifest exposes seven selectors
 - `spin`, `grow-memory`, `bad-progress`, and `bad-replacement` deliberately
   violate execution limits or the host contract so adversarial wiring is
   exercised end to end. They are test-only selectors, not examples to copy.
-- `needs-roi` advertises an incompatible required-ROI capability to prove that
-  registration is atomic and the generic all-planes adapter rejects it.
+- `needs-roi` requires an exact area ROI on every scheduled plane. It modifies
+  the full replacement deliberately so tests can verify that the host restores
+  every non-member pixel before committing.
 
 Successful `finish` also returns a labeled summary row covering number,
 boolean, text, and missing values; the per-plane row covers integers.
 
-All seven selectors advertise only `all-planes`; `needs-roi` additionally
-declares its deliberately incompatible ROI requirement. Every selector
+All seven selectors advertise `active-plane`, `z-stack`, and `all-planes`;
+`needs-roi` additionally declares its required exact-mask input. Every selector
 preserves each plane's dimensions, C/Z/T position, sample type, and byte length
 unless its name describes the intentional violation. The guest is freestanding:
 it uses the small bump allocator in `src/support.c`, links no libc, and imports

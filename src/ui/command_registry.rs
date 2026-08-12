@@ -2429,7 +2429,7 @@ mod tests {
     fn manifest_commands_are_routed_through_gpui_dispatcher() {
         let app_source = include_str!("gpui_app.rs");
         assert!(app_source.contains("fn dispatch_command("));
-        assert!(app_source.contains("_ => self.begin_operation(command_id)"));
+        assert!(app_source.contains("_ => self.begin_operation(command_id, cx)"));
         assert!(app_source.contains("fn operation_for_command("));
 
         for entry in manifest_commands() {

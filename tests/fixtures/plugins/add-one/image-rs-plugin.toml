@@ -42,5 +42,5 @@ export = "bad-replacement"
 
 [[operations]]
 id = "needs-roi"
-description = "Requires an ROI that the generic operation registry cannot supply."
+description = "Requires an exact area ROI and exercises host-owned mask restoration."
 export = "needs-roi"

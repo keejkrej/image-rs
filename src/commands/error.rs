@@ -17,6 +17,24 @@ pub enum OpsError {
     #[error("unsupported dataset layout: {0}")]
     UnsupportedLayout(String),
 
+    #[error("operation `{operation}` does not support scope {scope:?}")]
+    UnsupportedScope {
+        operation: String,
+        scope: super::OperationScope,
+    },
+
+    #[error("active plane position is out of bounds: {0}")]
+    ActivePosition(String),
+
+    #[error("invalid area mask: {0}")]
+    InvalidAreaMask(String),
+
+    #[error("operation execution was cancelled")]
+    Cancelled,
+
+    #[error("operation `{operation}` returned an invalid result: {message}")]
+    InvalidOperationOutput { operation: String, message: String },
+
     #[error("plugin operation `{operation}` failed: {message}")]
     PluginExecution { operation: String, message: String },
 

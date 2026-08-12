@@ -12,6 +12,7 @@ struct exports_image_rs_plugin_image_operation_operation_invocation_t {
 
 enum fixture_mode {
   MODE_ADD_ONE,
+  MODE_NEEDS_ROI,
   MODE_FAIL_FINISH,
   MODE_SPIN,
   MODE_GROW_MEMORY,
@@ -26,6 +27,8 @@ static uint8_t supported_pixel_types[] = {
 };
 
 static uint8_t supported_scopes[] = {
+    EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_ACTIVE_PLANE,
+    EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_Z_STACK,
     EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_ALL_PLANES,
 };
 
@@ -56,6 +59,9 @@ static bool is_supported_entrypoint(
 
 static uint8_t mode_for_entrypoint(
     const image_operation_plugin_string_t *entrypoint) {
+  if (string_equals(entrypoint, "needs-roi")) {
+    return MODE_NEEDS_ROI;
+  }
   if (string_equals(entrypoint, "fail-finish")) {
     return MODE_FAIL_FINISH;
   }
@@ -341,7 +347,7 @@ bool exports_image_rs_plugin_image_operation_capabilities(
   result->supported_pixel_types.ptr = supported_pixel_types;
   result->supported_pixel_types.len = 3;
   result->supported_scopes.ptr = supported_scopes;
-  result->supported_scopes.len = 1;
+  result->supported_scopes.len = 3;
   bool needs_roi = string_equals(entrypoint, "needs-roi");
   result->requires_area_roi = needs_roi;
   result->accepts_area_mask = needs_roi;
@@ -360,9 +366,13 @@ bool exports_image_rs_plugin_image_operation_begin(
     return false;
   }
   if (request->selected_scope !=
-      EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_ALL_PLANES) {
+          EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_ACTIVE_PLANE &&
+      request->selected_scope !=
+          EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_Z_STACK &&
+      request->selected_scope !=
+          EXPORTS_IMAGE_RS_PLUGIN_IMAGE_OPERATION_PLANE_SCOPE_ALL_PLANES) {
     set_error(error, IMAGE_RS_PLUGIN_TYPES_ERROR_KIND_INVALID_PARAMETERS,
-              "fixture requires all-planes scope", NULL);
+              "fixture received an unknown plane scope", NULL);
     return false;
   }
   if (request->plane_count == 0) {
@@ -417,9 +427,14 @@ bool exports_image_rs_plugin_image_operation_method_operation_invocation_process
               "fixture invocation cancelled", NULL);
     return false;
   }
-  if (request->area_roi.is_some) {
+  if (state->mode == MODE_NEEDS_ROI && !request->area_roi.is_some) {
     set_error(error, IMAGE_RS_PLUGIN_TYPES_ERROR_KIND_INVALID_PARAMETERS,
-              "fixture does not accept an area ROI", NULL);
+              "needs-roi requires an area ROI on every plane", NULL);
+    return false;
+  }
+  if (state->mode != MODE_NEEDS_ROI && request->area_roi.is_some) {
+    set_error(error, IMAGE_RS_PLUGIN_TYPES_ERROR_KIND_INVALID_PARAMETERS,
+              "this fixture operation does not accept an area ROI", NULL);
     return false;
   }
   if (state->processed_planes >= state->total_planes) {
@@ -482,6 +497,14 @@ bool exports_image_rs_plugin_image_operation_finish(
               "finish called before every declared plane was processed", NULL);
     return false;
   }
+
+  image_rs_plugin_host_progress_update_t progress;
+  progress.completed = processed_planes;
+  progress.total.is_some = true;
+  progress.total.val = total_planes;
+  progress.message.is_some = true;
+  image_operation_plugin_string_set(&progress.message.val, "finish");
+  image_rs_plugin_host_report_progress(&progress);
 
   if (!set_finish_measurements(&result->measurements, error)) {
     exports_image_rs_plugin_image_operation_operation_invocation_drop_own(

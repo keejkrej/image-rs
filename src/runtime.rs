@@ -5,6 +5,11 @@ mod io_service;
 mod ops_service;
 mod pipeline_service;
 
+pub use crate::commands::{
+    AreaMask, AreaMaskSupport, CancellationToken, DatasetEffect, ExecutionControl,
+    InvocationRequest, InvocationResult, OperationDescriptor, OperationScope, PlanePosition,
+    ProgressEvent, ProgressSink, WorkProgress,
+};
 pub use context::AppContext;
 pub use dataset_service::DatasetService;
 pub use error::{AppError, Result};

@@ -7,34 +7,72 @@ finds, parses, validates, and indexes declarative operation, handler, and
 command contributions. The second froze the guest-facing
 `image-rs:plugin@0.1.0` WIT package and the host-side buffer, mask, schedule,
 metadata, measurement, replacement, payload, and progress invariants. The
-third milestone now executes compatible image-operation Components through
-Wasmtime.
+third executes compatible image-operation Components through Wasmtime. The
+fourth adds the shared scoped invocation and GPUI commit lifecycle.
 
 `PluginCatalog::register_operations` compiles each discovered package once,
 checks every declared operation's capabilities, and atomically adds compatible
-adapters to an `OperationRegistry`. Registered operations therefore use the
-same `OpsService` and workflow path as built-in operations. Each invocation
-gets a fresh Store, Component instance, and guest resource; the runtime exposes
-only the contract's progress and cancellation imports and does not link WASI.
-This is currently a host/library API: neither the CLI nor the GPUI application
+scoped adapters to an `OperationRegistry`. Registered operations therefore use
+the same `OpsService` path as built-in operations. Each invocation gets a fresh
+Store, Component instance, and guest resource; the runtime exposes only the
+contract's progress and cancellation imports and does not link WASI. This is
+still a host/library registration API: neither the CLI nor the GPUI application
 automatically discovers a plugin directory or calls the registration method.
 
-The current `Operation` interface carries a dataset and parameters but no
-active C/Z/T position or ROI. The adapter consequently accepts only operations
-that support `all-planes` and do not require an area ROI. It processes a
-deterministic all-plane schedule into a cloned dataset, validates replacement
-planes, metadata, measurement rows, and status, and returns the staged output
-only after `finish` succeeds. A trap, structured guest error, timeout, or
-contract violation leaves the input dataset unchanged. Progress calls are
-validated but have no UI sink yet, and cooperative cancellation currently
-reports only the invocation deadline; caller-driven cancellation belongs to
-the future UI-aware execution seam.
+`OpsService::describe` returns the operation schema, supported scopes, and
+whether an exact area mask is unsupported, optional, or required.
+`OpsService::invoke` accepts an owned dataset snapshot, parameters, active C/Z/T
+position, selected scope, optional mask, and caller-owned `ExecutionControl`.
+Its result makes the dataset effect explicit (`Unchanged` or a replacement
+that identifies both the source and staged result) alongside measurements and
+status. The scopes deliberately separate two kinds of execution:
+
+- `WholeDataset` invokes an n-dimensional operation once. It is not an alias
+  for processing every 2D plane; current whole-dataset descriptors do not
+  accept an area mask.
+- `ActivePlane` processes exactly the requested C/Z/T plane.
+- `ZStack` holds the active C/T position and visits every Z plane.
+- `AllPlanes` visits every C/Z/T plane with C fastest, then Z, then T.
+
+The native plane adapter gathers a full calibrated X/Y plane so neighborhood
+kernels retain surrounding context, then scatters only exact mask members into
+an isolated clone. The Wasm adapter uses the same host-authoritative schedule
+and passes the exact binary mask to the guest, but also ignores every returned
+pixel outside the mask. That defensive scatter preserves source pixels even
+if an untrusted component modifies its entire replacement plane. Both adapters
+check caller cancellation between planes and report structured plane progress;
+validated guest progress is forwarded as detail on the same progress sink.
+Wasm cancellation also interrupts non-cooperative guest execution on an epoch
+tick. A cancellation, trap, structured guest error, timeout, or contract
+violation discards the staged clone.
+
+The legacy `OpsService::execute` and workflow path retains each built-in's
+original whole-dataset behavior for compatibility. Callers that need explicit
+active-plane or stack semantics use `describe` plus `invoke`. Cancellation of
+a legacy whole-dataset native call is checked before and after that call; its
+result remains atomic, but an individual long native call cannot yet be
+preempted cooperatively.
+
+GPUI processing uses operation descriptors to choose `ActivePlane` by default
+and offers `Process stack` when the descriptor supports `ZStack`. Rectangle,
+oval, polygon, and freehand selections are rasterized to exact masks before
+dispatch. Invocation runs on a background executor. Escape, viewer close, and
+quit signal the caller token; completion is accepted only when the original
+viewer and dataset revision still match. The candidate plane is rendered
+before mutation; completion publishes the dataset, measurements, and status,
+with exactly one undo entry when pixels were replaced. The GPUI currently
+updates its progress bar from host plane counts and may show validated guest
+progress messages. A single overwriteable slot retains only the latest available
+update so an operation cannot queue unbounded UI work.
+Recorded macro operation steps enter the same path one at a time, preserving
+active-plane versus active-Z-stack scope while retaining macro statement order.
 
 This separates two decisions that classic ImageJ combines: what a plugin
 contributes, and how its code is loaded. Execution remains behind the plugin
 module, and native dynamic libraries are not part of the default trust model.
-Command handlers, application command/menu contributions, installation and
-updates, and a UI-aware active-plane/ROI invocation seam remain future work.
+Command-handler execution, application command/menu contributions, automatic
+discovery, installation and updates, and interactive operation previews remain
+future work.
 
 ## Package format (schema 1)
 
@@ -93,8 +131,8 @@ default_params = { argument = "credits" }
 The tagged target makes operation and handler dispatch unambiguous. A manifest
 `export` is a component-local entrypoint selector passed to the fixed WIT
 dispatcher; it is not an arbitrary Component Model export name. Handler and
-operation selectors remain private to the future sandbox adapter; UI and
-workflow callers see only qualified contribution identities.
+operation selectors remain private to their sandbox adapters; UI and workflow
+callers see only qualified contribution identities.
 
 Manifest fields reject unknown keys so authoring mistakes fail locally instead
 of being silently ignored. Package discovery is one directory deep and does
@@ -122,10 +160,11 @@ Image operations use an invocation-local lifecycle:
    metadata, measurements, and status. Errors leave application state intact.
 
 This preserves the useful ImageJ `PlugInFilter` lifecycle without copying its
-integer flags or handing a guest the active image object. The current registry
-adapter implements full-dataset plane scheduling and atomic staged output.
-Active-plane and Z-stack selection, ROI masking, undo, preview UI, and
-application-side commit integration require a future UI-aware operation seam.
+integer flags or handing a guest the active image object. The registry adapter
+implements active-plane, active-Z-stack, and all-plane schedules, exact ROI
+masking, caller cancellation/progress, and atomic staged output. GPUI supplies
+the viewer-aware background execution, stale-result guard, and undo commit;
+interactive previews remain future work.
 Version 0.1 replacements must preserve the input width, height, C/Z/T position,
 pixel representation, and byte count. Planes and masks are row-major with X
 fastest; U16 and F32 samples are little-endian.
@@ -221,12 +260,13 @@ measurement rows; they cannot mutate datasets or create native windows.
 - Tests parse and generate Rust bindings for all three worlds. A normalized
   semantic fingerprint freezes record fields, variants, function signatures,
   resource ownership, imports, and exports for API `0.1.0`. A freestanding
-  Component fixture also exercises multi-plane U8/U16/F32 execution, progress,
-  measurement rows, status, and failure without WASI.
+  Component fixture also exercises active-plane and Z-stack invocation, exact
+  masking, caller cancellation, U8/U16/F32 execution, progress, measurement
+  rows, status, and failure without WASI.
 - The resolved module path and operation/handler exports remain private
   implementation details. Callers see the catalog registration interface and
-  ordinary operations without loader mechanics leaking into UI, CLI, or
-  workflow layers.
+  scoped operation descriptors without loader mechanics leaking into UI, CLI,
+  or workflow layers.
 - Component results are lifted into host memory before Rust can apply the
   structural payload validators. The single 160 MiB guest-memory ceiling and
   immediate raw collection prechecks bound that exposure, while process-level
@@ -259,12 +299,10 @@ capabilities:
 
 ## Next milestones
 
-1. Add a UI-aware operation invocation seam for active-plane and Z-stack scope,
-   exact ROI masks, application cancellation, undo, and preview/commit behavior.
-2. Implement the command-handler world and adapt validated plugin commands into
+1. Implement the command-handler world and adapt validated plugin commands into
    the shared application command/menu catalog.
-3. Add install/update staging, archive integrity/signature policy, persistent
+2. Add install/update staging, archive integrity/signature policy, persistent
    enable/disable state, and atomic catalog reloads.
-4. Extend the contract deliberately for previews, shape-changing/new-image
+3. Extend the contract deliberately for previews, shape-changing/new-image
    outputs, tiled virtual datasets, and richer command actions. Add
    capabilities only when a concrete adapter or use case makes the seam real.

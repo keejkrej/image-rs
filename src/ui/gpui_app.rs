@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gpui::{
     AnyWindowHandle, App, Bounds, ClickEvent, Context, ExternalPaths, FocusHandle, FontWeight,
@@ -18,7 +19,11 @@ use smallvec::smallvec;
 
 use crate::formats::{read_dataset, supported_formats, write_dataset};
 use crate::model::{AxisKind, Dataset, DatasetF32, Dim, Metadata, PixelType};
-use crate::runtime::OpsService;
+use crate::runtime::{
+    AreaMask, CancellationToken, DatasetEffect, ExecutionControl, InvocationRequest,
+    InvocationResult, OperationDescriptor, OperationScope, OpsService, PlanePosition,
+    ProgressEvent, ProgressSink,
+};
 
 use super::command_registry;
 use super::macros::{self, MacroCommandInvocation};
@@ -33,6 +38,7 @@ const STACK_HEIGHT: f32 = 32.0;
 const STATUS_HEIGHT: f32 = 30.0;
 const POPUP_WIDTH: f32 = 264.0;
 const AUTO_THRESHOLD_DIVISOR: usize = 5_000;
+const PROCESS_STACK_PARAMETER: &str = "__image_rs_process_stack";
 
 // Native GPUI equivalents of a shadcn/Tailwind zinc palette.
 const CHROME: u32 = 0xfafafa;
@@ -266,6 +272,83 @@ struct RoiSelection {
     points: Vec<(f32, f32)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RasterizedAreaMask {
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    members: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct ActiveOperation {
+    job_id: u64,
+    revision: u64,
+    input: Arc<DatasetF32>,
+    cancellation: CancellationToken,
+    progress: f32,
+    message: String,
+}
+
+fn active_operation_matches(
+    operation: &ActiveOperation,
+    job_id: u64,
+    revision: u64,
+    input: &Arc<DatasetF32>,
+) -> bool {
+    operation.job_id == job_id
+        && operation.revision == revision
+        && Arc::ptr_eq(&operation.input, input)
+}
+
+fn choose_operation_scope(
+    descriptor: &OperationDescriptor,
+    process_stack: bool,
+) -> Option<OperationScope> {
+    if process_stack {
+        return descriptor
+            .supports(OperationScope::ZStack)
+            .then_some(OperationScope::ZStack);
+    }
+    [
+        OperationScope::ActivePlane,
+        OperationScope::WholeDataset,
+        OperationScope::ZStack,
+        OperationScope::AllPlanes,
+    ]
+    .into_iter()
+    .find(|scope| descriptor.supports(*scope))
+}
+
+fn take_process_stack_parameter(params: &mut Value) -> bool {
+    params
+        .as_object_mut()
+        .and_then(|values| values.remove(PROCESS_STACK_PARAMETER))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+struct UiProgressSink(Arc<Mutex<Option<ProgressEvent>>>);
+
+impl ProgressSink for UiProgressSink {
+    fn report(&self, event: ProgressEvent) {
+        // The UI needs only the newest available update. Overwriting one shared slot prevents a
+        // noisy native kernel or untrusted guest from queueing unbounded application work.
+        if let Ok(mut latest) = self.0.lock() {
+            *latest = Some(event);
+        }
+    }
+}
+
+struct MacroRunState {
+    name: String,
+    pending: VecDeque<MacroCommandInvocation>,
+    lines: Vec<String>,
+    executed: usize,
+    awaiting_job_id: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RoiPosition {
     channel: usize,
@@ -361,6 +444,8 @@ struct ClipboardPatch {
 #[derive(Clone)]
 struct ImageTab {
     id: u64,
+    /// Monotonic dataset identity used to reject stale background operation results.
+    revision: u64,
     internal_label: String,
     title: String,
     path: Option<PathBuf>,
@@ -412,6 +497,7 @@ impl ImageTab {
         let frames = axis_len(dataset.as_ref(), AxisKind::Time);
         Ok(Self {
             id,
+            revision: 0,
             internal_label: format!("viewer-{id}"),
             title,
             path,
@@ -575,12 +661,14 @@ struct ImageJApp {
     active_tab: Option<u64>,
     activation_order: Vec<u64>,
     next_tab_id: u64,
+    next_operation_job_id: u64,
     selected_tool: ToolId,
     open_menu: Option<usize>,
     open_submenu: Option<String>,
     menus: Vec<MenuManifestTopLevel>,
     status: String,
     progress: Option<f32>,
+    active_operations: HashMap<u64, ActiveOperation>,
     dialog: Option<DialogState>,
     focus_handle: FocusHandle,
     last_pointer: HashMap<u64, (usize, usize, f32)>,
@@ -597,6 +685,7 @@ struct ImageJApp {
     results_window_pending: bool,
     macro_recording: bool,
     macro_recorded: String,
+    macro_run: Option<MacroRunState>,
     launcher_window: AnyWindowHandle,
     viewer_windows: HashMap<WindowId, u64>,
     viewer_handles: HashMap<u64, AnyWindowHandle>,
@@ -663,7 +752,13 @@ impl ImageViewerWindow {
             let Some(app) = weak_app.upgrade() else {
                 return true;
             };
-            if !app.read(cx).tab(tab_id).is_some_and(|tab| tab.dirty) {
+            let dirty = app.read(cx).tab(tab_id).is_some_and(|tab| tab.dirty);
+            if !dirty {
+                let _ = app.update(cx, |app, _| {
+                    if let Some(operation) = app.active_operations.remove(&tab_id) {
+                        operation.cancellation.cancel();
+                    }
+                });
                 return true;
             }
             let _ = app.update(cx, |app, cx| app.request_close(tab_id, cx));
@@ -788,7 +883,13 @@ impl ImageJApp {
             let Some(app) = weak_app.upgrade() else {
                 return true;
             };
-            if !app.read(cx).tabs.iter().any(|tab| tab.dirty) {
+            let has_dirty_tabs = app.read(cx).tabs.iter().any(|tab| tab.dirty);
+            if !has_dirty_tabs {
+                let _ = app.update(cx, |app, _| {
+                    for (_, operation) in app.active_operations.drain() {
+                        operation.cancellation.cancel();
+                    }
+                });
                 return true;
             }
             let _ = app.update(cx, |app, cx| app.request_quit(cx));
@@ -800,6 +901,7 @@ impl ImageJApp {
             active_tab: None,
             activation_order: Vec::new(),
             next_tab_id: 0,
+            next_operation_job_id: 1,
             selected_tool: ToolId::Rect,
             open_menu: None,
             open_submenu: None,
@@ -809,6 +911,7 @@ impl ImageJApp {
                 menu::manifest_commands().len()
             ),
             progress: None,
+            active_operations: HashMap::new(),
             dialog: None,
             focus_handle,
             last_pointer: HashMap::new(),
@@ -825,6 +928,7 @@ impl ImageJApp {
             results_window_pending: false,
             macro_recording: false,
             macro_recorded: String::new(),
+            macro_run: None,
             launcher_window: window.window_handle(),
             viewer_windows: HashMap::new(),
             viewer_handles: HashMap::new(),
@@ -850,6 +954,19 @@ impl ImageJApp {
     fn active_tab_mut(&mut self) -> Option<&mut ImageTab> {
         let index = self.active_index()?;
         self.tabs.get_mut(index)
+    }
+
+    fn cancel_active_operation(&mut self) -> bool {
+        let Some(tab_id) = self.active_tab else {
+            return false;
+        };
+        let Some(operation) = self.active_operations.get_mut(&tab_id) else {
+            return false;
+        };
+        operation.cancellation.cancel();
+        operation.message = "Cancelling operation…".into();
+        self.status = "Cancelling operation…".into();
+        true
     }
 
     fn tab(&self, id: u64) -> Option<&ImageTab> {
@@ -1312,12 +1429,18 @@ impl ImageJApp {
             return;
         }
         if window_id == self.launcher_window.window_id() {
+            for operation in self.active_operations.values() {
+                operation.cancellation.cancel();
+            }
             cx.quit();
             return;
         }
         let Some(tab_id) = self.viewer_windows.remove(&window_id) else {
             return;
         };
+        if let Some(operation) = self.active_operations.remove(&tab_id) {
+            operation.cancellation.cancel();
+        }
         self.viewer_handles.remove(&tab_id);
         if self.roi_manager_show_all_target == Some(tab_id) {
             self.roi_manager_show_all_target = None;
@@ -1895,6 +2018,7 @@ impl ImageJApp {
         self.tabs[index].undo.push(current);
         self.tabs[index].redo.clear();
         self.tabs[index].dataset = Arc::new(output);
+        self.tabs[index].revision = self.tabs[index].revision.saturating_add(1);
         self.tabs[index].dirty = true;
         self.tabs[index].set_display_range(0.0, pixel_maximum);
         self.tabs[index].render_image = rendered.image;
@@ -2071,6 +2195,9 @@ impl ImageJApp {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
+        if let Some(operation) = self.active_operations.remove(&tab_id) {
+            operation.cancellation.cancel();
+        }
         let closed = self.tabs.remove(index);
         self.last_pointer.remove(&tab_id);
         if self.roi_manager_show_all_target == Some(tab_id) {
@@ -2151,6 +2278,11 @@ impl ImageJApp {
     }
 
     fn request_quit(&mut self, cx: &mut Context<Self>) {
+        self.macro_run = None;
+        for operation in self.active_operations.values_mut() {
+            operation.cancellation.cancel();
+            operation.message = "Cancelling operation…".into();
+        }
         self.close_all(true, cx);
     }
 
@@ -2311,6 +2443,7 @@ impl ImageJApp {
         };
         tab.redo.push(tab.dataset.clone());
         tab.dataset = previous;
+        tab.revision = tab.revision.saturating_add(1);
         tab.reset_display_ranges();
         tab.dirty = true;
         if let Err(error) = tab.refresh_render_image() {
@@ -2330,6 +2463,7 @@ impl ImageJApp {
         };
         tab.undo.push(tab.dataset.clone());
         tab.dataset = next;
+        tab.revision = tab.revision.saturating_add(1);
         tab.reset_display_ranges();
         tab.dirty = true;
         if let Err(error) = tab.refresh_render_image() {
@@ -2339,7 +2473,7 @@ impl ImageJApp {
         }
     }
 
-    fn begin_operation(&mut self, command_id: &str) {
+    fn begin_operation(&mut self, command_id: &str, cx: &mut Context<Self>) {
         if operation_for_command(command_id).is_none() {
             self.run_operation_with_params(command_id, None);
             return;
@@ -2426,8 +2560,23 @@ impl ImageJApp {
                 _ => {}
             }
         }
-        let fields = parameter_fields(&defaults);
-        if (title.ends_with("...") || title.ends_with('…')) && !fields.is_empty() {
+        let mut fields = parameter_fields(&defaults);
+        let offers_stack = operation_for_command(command_id)
+            .and_then(|(operation, _)| self.ops_service.describe(operation))
+            .is_some_and(|descriptor| {
+                descriptor.supports(OperationScope::ZStack)
+                    && self.active_tab().is_some_and(|tab| tab.slices > 1)
+            });
+        if offers_stack {
+            fields.push(ParameterField {
+                key: PROCESS_STACK_PARAMETER.into(),
+                label: "Process stack".into(),
+                value: "false".into(),
+                kind: ParameterKind::Boolean,
+            });
+        }
+        if ((title.ends_with("...") || title.ends_with('…')) || offers_stack) && !fields.is_empty()
+        {
             self.dialog = Some(DialogState::Operation {
                 command_id: command_id.to_string(),
                 target_tab_id: self.active_tab,
@@ -2437,7 +2586,7 @@ impl ImageJApp {
             });
             self.status = "Adjust parameters, then choose OK".into();
         } else {
-            self.run_operation_with_params(command_id, Some(defaults));
+            self.start_operation(command_id, Some(defaults), cx);
         }
     }
 
@@ -2581,14 +2730,378 @@ impl ImageJApp {
             self.duplicate_active_as(title, cx);
             return;
         }
-        self.run_operation_with_params(&command_id, Some(Value::Object(params)));
-        if self.results_window_pending {
-            self.open_results_window(cx);
+        self.start_operation(&command_id, Some(Value::Object(params)), cx);
+    }
+
+    fn run_operation(&mut self, command_id: &str, cx: &mut Context<Self>) {
+        self.start_operation(command_id, None, cx);
+    }
+
+    fn start_operation(
+        &mut self,
+        command_id: &str,
+        overrides: Option<Value>,
+        cx: &mut Context<Self>,
+    ) {
+        // Analyze Particles still uses the legacy active-plane measurement adapter. It does not
+        // change pixels and will move onto the shared plane lifecycle when native measurement
+        // aggregation is represented by the scoped adapter.
+        if command_id == "analyze.analyze_particles" {
+            self.run_operation_with_params(command_id, overrides);
+            if self.results_window_pending {
+                self.open_results_window(cx);
+            }
+            return;
+        }
+
+        let Some((operation, mut params)) = operation_for_command(command_id) else {
+            self.run_operation_with_params(command_id, overrides);
+            return;
+        };
+        let Some(index) = self.active_index() else {
+            self.status = "This command requires an open image".into();
+            return;
+        };
+        if self.active_operations.contains_key(&self.tabs[index].id) {
+            self.status =
+                "An operation is already running for this image; press Escape to cancel it".into();
+            return;
+        }
+
+        let defaults = command_registry::merge_params(command_id, None);
+        merge_json_objects(&mut params, defaults);
+        if let Some(overrides) = overrides {
+            overlay_json_objects(&mut params, overrides);
+        }
+        let process_stack = take_process_stack_parameter(&mut params);
+        let mut repeat_params = params.clone();
+        if process_stack && let Some(values) = repeat_params.as_object_mut() {
+            values.insert(PROCESS_STACK_PARAMETER.into(), Value::Bool(true));
+        }
+        let Some(descriptor) = self.ops_service.describe(operation) else {
+            self.status = format!(
+                "{} failed: unknown operation {operation}",
+                command_label(command_id)
+            );
+            return;
+        };
+        let Some(scope) = choose_operation_scope(&descriptor, process_stack) else {
+            self.status = if process_stack {
+                format!(
+                    "{} does not support processing the active Z stack",
+                    command_label(command_id)
+                )
+            } else {
+                format!(
+                    "{} does not expose a compatible execution scope",
+                    command_label(command_id)
+                )
+            };
+            return;
+        };
+        let tab = &self.tabs[index];
+        let area_mask = if scope.is_plane_wise() {
+            match rasterize_processing_area(tab.roi.as_ref(), tab.width, tab.height).and_then(
+                |mask| {
+                    mask.map(|mask| {
+                        AreaMask::new(mask.left, mask.top, mask.width, mask.height, mask.members)
+                            .map_err(|error| error.to_string())
+                    })
+                    .transpose()
+                },
+            ) {
+                Ok(mask) => mask,
+                Err(error) => {
+                    self.status = format!("{} failed: {error}", command_label(command_id));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let tab_id = tab.id;
+        let revision = tab.revision;
+        let input = tab.dataset.clone();
+        let request = InvocationRequest {
+            operation: operation.to_string(),
+            input: input.clone(),
+            parameters: params.clone(),
+            scope,
+            active: PlanePosition {
+                channel: tab.channel,
+                z: tab.z,
+                time: tab.t,
+            },
+            area_mask,
+        };
+        let cancellation = CancellationToken::default();
+        let latest_progress = Arc::new(Mutex::new(None));
+        let control = ExecutionControl::new(
+            cancellation.clone(),
+            Arc::new(UiProgressSink(latest_progress.clone())),
+        );
+        let operation_message = format!("{} running…", command_label(command_id));
+        let job_id = self.next_operation_job_id;
+        let Some(next_operation_job_id) = job_id.checked_add(1) else {
+            self.status = "Cannot start another operation: job identifier space exhausted".into();
+            return;
+        };
+        self.next_operation_job_id = next_operation_job_id;
+        self.active_operations.insert(
+            tab_id,
+            ActiveOperation {
+                job_id,
+                revision,
+                input: input.clone(),
+                cancellation,
+                progress: 0.05,
+                message: operation_message.clone(),
+            },
+        );
+        self.status = operation_message;
+
+        let progress_input = input.clone();
+        let progress_command = command_id.to_string();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let event = latest_progress
+                    .lock()
+                    .ok()
+                    .and_then(|mut latest| latest.take());
+                let still_running = this
+                    .update(cx, |app, cx| {
+                        let Some(active) = app.active_operations.get_mut(&tab_id) else {
+                            return false;
+                        };
+                        let current =
+                            active_operation_matches(active, job_id, revision, &progress_input);
+                        if current
+                            && !active.cancellation.is_cancelled()
+                            && let Some(event) = event
+                        {
+                            active.progress = if event.total_planes == 0 {
+                                0.0
+                            } else {
+                                event.completed_planes as f32 / event.total_planes as f32
+                            };
+                            if let Some(message) = event
+                                .detail
+                                .as_ref()
+                                .and_then(|detail| detail.message.as_deref())
+                            {
+                                active.message =
+                                    format!("{}: {message}", command_label(&progress_command));
+                            }
+                            cx.notify();
+                        }
+                        current
+                    })
+                    .unwrap_or(false);
+                if !still_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        let ops_service = self.ops_service.clone();
+        let command_id = command_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { ops_service.invoke(request, &control) })
+                .await;
+            this.update(cx, |app, cx| {
+                app.finish_operation(
+                    tab_id,
+                    job_id,
+                    revision,
+                    input,
+                    command_id,
+                    repeat_params,
+                    result,
+                    cx,
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_operation(
+        &mut self,
+        tab_id: u64,
+        job_id: u64,
+        revision: u64,
+        input: Arc<DatasetF32>,
+        command_id: String,
+        repeat_params: Value,
+        result: crate::runtime::Result<InvocationResult>,
+        cx: &mut Context<Self>,
+    ) {
+        let outcome = self.finish_operation_result(
+            tab_id,
+            job_id,
+            revision,
+            input,
+            &command_id,
+            repeat_params,
+            result,
+            cx,
+        );
+        let resumes_macro = self
+            .macro_run
+            .as_ref()
+            .is_some_and(|run| run.awaiting_job_id == Some(job_id));
+        if resumes_macro {
+            if let Some(run) = self.macro_run.as_mut() {
+                run.awaiting_job_id = None;
+            }
+            self.record_macro_step(&command_id, outcome);
+            self.continue_macro_run(cx);
         }
     }
 
-    fn run_operation(&mut self, command_id: &str) {
-        self.run_operation_with_params(command_id, None);
+    fn finish_operation_result(
+        &mut self,
+        tab_id: u64,
+        job_id: u64,
+        revision: u64,
+        input: Arc<DatasetF32>,
+        command_id: &str,
+        repeat_params: Value,
+        result: crate::runtime::Result<InvocationResult>,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        let Some(active) = self.active_operations.get(&tab_id) else {
+            return Err(format!(
+                "{} result discarded because its viewer job is no longer current",
+                command_label(command_id)
+            ));
+        };
+        if !active_operation_matches(active, job_id, revision, &input) {
+            return Err(format!(
+                "{} result discarded because its viewer job changed",
+                command_label(command_id)
+            ));
+        }
+        let cancelled = active.cancellation.is_cancelled();
+        self.active_operations.remove(&tab_id);
+        if cancelled {
+            self.status = format!("{} canceled", command_label(command_id));
+            return Err(self.status.clone());
+        }
+
+        let result = match result {
+            Ok(result) => result,
+            Err(crate::runtime::AppError::Ops(crate::commands::OpsError::Cancelled)) => {
+                self.status = format!("{} canceled", command_label(command_id));
+                return Err(self.status.clone());
+            }
+            Err(error) => {
+                self.status = format!("{} failed: {error}", command_label(command_id));
+                return Err(self.status.clone());
+            }
+        };
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return Err(format!(
+                "{} result discarded because its viewer closed",
+                command_label(command_id)
+            ));
+        };
+        if self.tabs[index].revision != revision || !Arc::ptr_eq(&self.tabs[index].dataset, &input)
+        {
+            self.status = format!(
+                "{} result discarded because the source image changed",
+                command_label(command_id)
+            );
+            return Err(self.status.clone());
+        }
+
+        let InvocationResult {
+            dataset_effect,
+            measurements,
+            status,
+        } = result;
+        if let DatasetEffect::Replaced { before, after } = dataset_effect {
+            if !Arc::ptr_eq(&before, &input) {
+                self.status = format!(
+                    "{} failed: replacement did not reference its source image",
+                    command_label(command_id)
+                );
+                return Err(self.status.clone());
+            }
+            let channels = axis_len(after.as_ref(), AxisKind::Channel);
+            let slices = axis_len(after.as_ref(), AxisKind::Z);
+            let frames = axis_len(after.as_ref(), AxisKind::Time);
+            let z = self.tabs[index].z.min(slices.saturating_sub(1));
+            let t = self.tabs[index].t.min(frames.saturating_sub(1));
+            let channel = self.tabs[index].channel.min(channels.saturating_sub(1));
+            let display_ranges = default_display_ranges(after.as_ref(), z, t);
+            let display_index = if dataset_is_true_rgb(after.as_ref()) || display_ranges.len() <= 1
+            {
+                0
+            } else {
+                channel.min(display_ranges.len().saturating_sub(1))
+            };
+            let (display_min, display_max) = display_ranges
+                .get(display_index)
+                .copied()
+                .unwrap_or((0.0, 255.0));
+            let rendered = match render_dataset_plane(
+                after.as_ref(),
+                z,
+                t,
+                channel,
+                self.tabs[index].lut,
+                self.tabs[index].lut_inverted,
+                display_min,
+                display_max,
+            ) {
+                Ok(rendered) => rendered,
+                Err(error) => {
+                    self.status = format!("Render failed: {error}");
+                    return Err(self.status.clone());
+                }
+            };
+            let tab = &mut self.tabs[index];
+            tab.undo.push(before);
+            tab.redo.clear();
+            tab.dataset = after;
+            tab.revision = tab.revision.saturating_add(1);
+            tab.render_image = rendered.image;
+            tab.width = rendered.width;
+            tab.height = rendered.height;
+            tab.channels = channels;
+            tab.slices = slices;
+            tab.frames = frames;
+            tab.z = z;
+            tab.t = t;
+            tab.channel = channel;
+            tab.display_ranges = display_ranges;
+            tab.dirty = true;
+        }
+
+        let image_title = self.tabs[index].title.clone();
+        let label = command_label(command_id);
+        self.status = status.unwrap_or_else(|| format!("{label} complete"));
+        self.last_repeatable_command = Some((command_id.to_string(), repeat_params.clone()));
+        self.record_command(command_id, Some(&repeat_params));
+        if let Some(measurements) = measurements {
+            let added = self.append_measurement_values(measurements.values, &image_title, &label);
+            self.status = format!(
+                "{} · {added} new row(s), {} total",
+                self.status,
+                self.results.len()
+            );
+        }
+        if self.results_window_pending {
+            self.open_results_window(cx);
+        }
+        Ok(self.status.clone())
     }
 
     fn run_operation_with_params(&mut self, command_id: &str, overrides: Option<Value>) {
@@ -2616,6 +3129,9 @@ impl ImageJApp {
         if let Some(overrides) = overrides {
             overlay_json_objects(&mut params, overrides);
         }
+        if let Some(values) = params.as_object_mut() {
+            values.remove(PROCESS_STACK_PARAMETER);
+        }
         self.progress = Some(0.15);
         let current = self.tabs[index].dataset.clone();
         let plane_input = if command_id == "analyze.analyze_particles" {
@@ -2638,6 +3154,7 @@ impl ImageJApp {
                     self.tabs[index].undo.push(current);
                     self.tabs[index].redo.clear();
                     self.tabs[index].dataset = Arc::new(output.dataset);
+                    self.tabs[index].revision = self.tabs[index].revision.saturating_add(1);
                     self.tabs[index].reset_display_ranges();
                     self.tabs[index].dirty = true;
                     self.tabs[index].channels =
@@ -2718,7 +3235,7 @@ impl ImageJApp {
             "edit.selection.all" => self.select_all(),
             "edit.clear" => self.fill_selection(false),
             "edit.fill" => self.fill_selection(true),
-            "edit.invert" => self.run_operation(command_id),
+            "edit.invert" => self.run_operation(command_id, cx),
             "image.show_info" | "image.properties" => self.show_image_info(),
             "image.adjust.brightness" => self.open_brightness_contrast_dialog(cx),
             "image.adjust.window_level" => self.open_window_level_dialog(cx),
@@ -2844,7 +3361,7 @@ impl ImageJApp {
             }
             "process.repeat_command" => {
                 if let Some((command, params)) = self.last_repeatable_command.clone() {
-                    self.run_operation_with_params(&command, Some(params));
+                    self.start_operation(&command, Some(params), cx);
                 } else {
                     self.status = "No command to repeat".into();
                 }
@@ -2880,7 +3397,7 @@ impl ImageJApp {
                     self.select_tool(tool);
                 }
             }
-            _ => self.begin_operation(command_id),
+            _ => self.begin_operation(command_id, cx),
         }
         if self.dialog.is_some() {
             let app = cx.entity().downgrade();
@@ -2953,6 +3470,7 @@ impl ImageJApp {
         self.tabs[index].undo.push(current);
         self.tabs[index].redo.clear();
         self.tabs[index].dataset = Arc::new(output);
+        self.tabs[index].revision = self.tabs[index].revision.saturating_add(1);
         self.tabs[index].dirty = true;
         if let Err(error) = self.tabs[index].refresh_render_image() {
             self.status = error;
@@ -3178,6 +3696,7 @@ impl ImageJApp {
                 self.tabs[index].undo.push(current);
                 self.tabs[index].redo.clear();
                 self.tabs[index].dataset = Arc::new(dataset);
+                self.tabs[index].revision = self.tabs[index].revision.saturating_add(1);
                 self.tabs[index].reset_display_ranges();
                 self.tabs[index].dirty = false;
                 if let Err(error) = self.tabs[index].refresh_render_image() {
@@ -3197,6 +3716,7 @@ impl ImageJApp {
         self.next_tab_id = self.next_tab_id.saturating_add(1);
         let mut duplicate = source;
         duplicate.id = self.next_tab_id;
+        duplicate.revision = 0;
         duplicate.internal_label = format!("viewer-{}", duplicate.id);
         duplicate.title = title.unwrap_or_else(|| format!("{} copy", duplicate.title));
         duplicate.path = None;
@@ -3250,6 +3770,7 @@ impl ImageJApp {
         self.tabs[index].undo.push(current);
         self.tabs[index].redo.clear();
         self.tabs[index].dataset = Arc::new(cleared);
+        self.tabs[index].revision = self.tabs[index].revision.saturating_add(1);
         self.tabs[index].dirty = true;
         if let Err(error) = self.tabs[index].refresh_render_image() {
             self.status = error;
@@ -3303,6 +3824,7 @@ impl ImageJApp {
             self.tabs[index].undo.push(current);
             self.tabs[index].redo.clear();
             self.tabs[index].dataset = Arc::new(pasted);
+            self.tabs[index].revision = self.tabs[index].revision.saturating_add(1);
             self.tabs[index].dirty = true;
             self.tabs[index].roi = Some(RoiSelection {
                 tool: ToolId::Rect,
@@ -5144,6 +5666,10 @@ impl ImageJApp {
     }
 
     fn run_macro_source(&mut self, name: &str, source: &str, cx: &mut Context<Self>) {
+        if self.macro_run.is_some() {
+            self.status = "Wait for the current macro to finish before starting another".into();
+            return;
+        }
         let catalog = command_registry::command_catalog();
         let invocations = match macros::parse_macro_source(source, &catalog) {
             Ok(invocations) => invocations,
@@ -5156,29 +5682,88 @@ impl ImageJApp {
                 return;
             }
         };
-        let mut lines = Vec::new();
-        let mut executed = 0usize;
-        for invocation in invocations {
-            let label = invocation.command_id.clone();
-            match self.execute_macro_invocation(invocation, cx) {
-                Ok(message) => {
-                    executed += 1;
-                    lines.push(format!("✓ {} — {message}", command_label(&label)));
+        self.macro_run = Some(MacroRunState {
+            name: name.to_string(),
+            pending: invocations.into(),
+            lines: Vec::new(),
+            executed: 0,
+            awaiting_job_id: None,
+        });
+        self.continue_macro_run(cx);
+    }
+
+    fn continue_macro_run(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let invocation = {
+                let Some(run) = self.macro_run.as_mut() else {
+                    return;
+                };
+                if run.awaiting_job_id.is_some() {
+                    return;
                 }
-                Err(error) => lines.push(format!("× {} — {error}", command_label(&label))),
+                run.pending.pop_front()
+            };
+            let Some(invocation) = invocation else {
+                self.finish_macro_run(cx);
+                return;
+            };
+            let command_id = invocation.command_id.clone();
+            if operation_for_command(&command_id).is_some()
+                && command_id != "analyze.analyze_particles"
+            {
+                let expected_job_id = self.next_operation_job_id;
+                self.start_operation(&command_id, invocation.params, cx);
+                if self.next_operation_job_id != expected_job_id {
+                    if let Some(run) = self.macro_run.as_mut() {
+                        run.awaiting_job_id = Some(expected_job_id);
+                    }
+                    return;
+                }
+                self.record_macro_step(&command_id, Err(self.status.clone()));
+                continue;
             }
+            let outcome = self.execute_macro_invocation(invocation, cx);
+            self.record_macro_step(&command_id, outcome);
         }
+    }
+
+    fn record_macro_step(&mut self, command_id: &str, outcome: Result<String, String>) {
+        let Some(run) = self.macro_run.as_mut() else {
+            return;
+        };
+        match outcome {
+            Ok(message) => {
+                run.executed += 1;
+                run.lines
+                    .push(format!("✓ {} — {message}", command_label(command_id)));
+            }
+            Err(error) => run
+                .lines
+                .push(format!("× {} — {error}", command_label(command_id))),
+        }
+    }
+
+    fn finish_macro_run(&mut self, cx: &mut Context<Self>) {
+        let Some(mut run) = self.macro_run.take() else {
+            return;
+        };
         if self.results_window_pending {
             self.open_results_window(cx);
         }
-        if lines.is_empty() {
-            lines.push("No executable statements found".into());
+        if run.lines.is_empty() {
+            run.lines.push("No executable statements found".into());
         }
         self.dialog = Some(DialogState::ImageInfo {
-            title: format!("Macro — {name}"),
-            lines,
+            title: format!("Macro — {}", run.name),
+            lines: run.lines,
         });
-        self.status = format!("Macro finished: {executed} command(s) executed");
+        self.status = format!("Macro finished: {} command(s) executed", run.executed);
+        let app = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            if let Some(app) = app.upgrade() {
+                let _ = app.update(cx, |app, cx| app.open_dialog_window(cx));
+            }
+        });
     }
 
     fn execute_macro_invocation(
@@ -5496,11 +6081,17 @@ impl ImageJApp {
                     .ok_or_else(|| format!("unsupported tool command: {command}"))?;
                 self.select_tool(tool);
             }
-            command if operation_for_command(command).is_some() => {
-                self.run_operation_with_params(command, Some(params));
+            "analyze.analyze_particles" => {
+                self.run_operation_with_params(&command_id, Some(params));
                 if self.status.contains(" failed:") {
                     return Err(self.status.clone());
                 }
+            }
+            command if operation_for_command(command).is_some() => {
+                return Err(
+                    "operation-backed macro commands must run through the sequential job queue"
+                        .into(),
+                );
             }
             _ => return Err(format!("unsupported macro command: {command_id}")),
         }
@@ -5900,7 +6491,17 @@ impl ImageJApp {
                 }
             })
             .unwrap_or_else(|| "—".into());
-        let progress = self.progress.unwrap_or(0.0).clamp(0.0, 1.0);
+        let displayed_operation = tab_id
+            .or(self.active_tab)
+            .and_then(|id| self.active_operations.get(&id));
+        let displayed_status = displayed_operation
+            .map(|operation| operation.message.as_str())
+            .unwrap_or(&self.status);
+        let progress = displayed_operation
+            .map(|operation| operation.progress)
+            .or(self.progress)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         div()
             .h(px(STATUS_HEIGHT))
             .w_full()
@@ -5914,7 +6515,7 @@ impl ImageJApp {
             .pl_2()
             .text_size(px(14.0))
             .text_color(rgb(TEXT))
-            .child(format!("{}{}", self.status, pointer))
+            .child(format!("{displayed_status}{pointer}"))
             .child(
                 div()
                     .h_full()
@@ -6803,10 +7404,13 @@ impl ImageJApp {
                 this.cycle_tab(-1, cx);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &Escape, _, cx| {
+            .on_action(cx.listener(|this, _: &Escape, window, cx| {
                 this.close_menu_popup(cx);
                 if this.dialog.is_some() {
                     this.cancel_dialog(cx);
+                } else {
+                    this.activate_session_for_window(window);
+                    this.cancel_active_operation();
                 }
                 cx.notify();
             }))
@@ -7419,6 +8023,55 @@ fn selection_bounds(tab: &ImageTab) -> (usize, usize, usize, usize) {
         return (0, 0, tab.width, tab.height);
     };
     roi_bounds(selection, tab.width, tab.height)
+}
+
+fn rasterize_processing_area(
+    selection: Option<&RoiSelection>,
+    image_width: usize,
+    image_height: usize,
+) -> Result<Option<RasterizedAreaMask>, String> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let minimum_points = match selection.tool {
+        ToolId::Rect | ToolId::Oval => 2,
+        ToolId::Poly | ToolId::Free => 3,
+        ToolId::Line
+        | ToolId::Angle
+        | ToolId::Point
+        | ToolId::Wand
+        | ToolId::Text
+        | ToolId::Zoom
+        | ToolId::Hand
+        | ToolId::Dropper
+        | ToolId::More => {
+            return Err(format!(
+                "{} is not an area selection and cannot mask image processing",
+                selection.tool.label()
+            ));
+        }
+    };
+    if image_width == 0 || image_height == 0 || selection.points.len() < minimum_points {
+        return Err("The active area selection is incomplete".into());
+    }
+
+    let (left, top, width, height) = roi_bounds(selection, image_width, image_height);
+    let mut members = Vec::with_capacity(width.saturating_mul(height));
+    for y in top..top.saturating_add(height) {
+        for x in left..left.saturating_add(width) {
+            members.push(u8::from(roi_contains_pixel(selection, x, y)));
+        }
+    }
+    if !members.contains(&1) {
+        return Err("The active area selection contains no image pixels".into());
+    }
+    Ok(Some(RasterizedAreaMask {
+        left,
+        top,
+        width,
+        height,
+        members,
+    }))
 }
 
 fn roi_bounds(
@@ -9071,6 +9724,50 @@ mod tests {
     }
 
     #[test]
+    fn processing_area_rasterizes_exact_area_membership() {
+        let rectangle = RoiSelection {
+            tool: ToolId::Rect,
+            points: vec![(1.0, 1.0), (3.0, 3.0)],
+        };
+        let mask = rasterize_processing_area(Some(&rectangle), 5, 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mask,
+            RasterizedAreaMask {
+                left: 1,
+                top: 1,
+                width: 2,
+                height: 2,
+                members: vec![1, 1, 1, 1],
+            }
+        );
+
+        let oval = RoiSelection {
+            tool: ToolId::Oval,
+            points: vec![(0.0, 0.0), (4.0, 4.0)],
+        };
+        let mask = rasterize_processing_area(Some(&oval), 4, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!((mask.left, mask.top, mask.width, mask.height), (0, 0, 4, 4));
+        assert_eq!(mask.members[0], 0);
+        assert_eq!(mask.members[5], 1);
+        assert_eq!(mask.members[15], 0);
+    }
+
+    #[test]
+    fn processing_area_rejects_non_area_tools() {
+        let line = RoiSelection {
+            tool: ToolId::Line,
+            points: vec![(0.0, 0.0), (3.0, 3.0)],
+        };
+        let error = rasterize_processing_area(Some(&line), 4, 4).unwrap_err();
+        assert!(error.contains("not an area selection"));
+        assert_eq!(rasterize_processing_area(None, 4, 4).unwrap(), None);
+    }
+
+    #[test]
     fn failed_viewer_rollback_removes_only_failed_session_and_does_not_reuse_its_id() {
         let mut first = measurement_test_tab(1, 1, vec![1.0]);
         first.id = 41;
@@ -9381,6 +10078,102 @@ mod tests {
             "morphology.erode"
         );
         assert!(operation_for_command("help.about").is_none());
+    }
+
+    #[test]
+    fn operation_scope_selection_supports_restricted_plugin_capabilities() {
+        let descriptor = |scopes| OperationDescriptor {
+            schema: crate::commands::OpSchema {
+                name: "test.scope".into(),
+                description: "scope test".into(),
+                params: Vec::new(),
+            },
+            scopes,
+            area_mask: crate::runtime::AreaMaskSupport::Unsupported,
+        };
+
+        let active_and_stack = descriptor(vec![
+            OperationScope::ActivePlane,
+            OperationScope::ZStack,
+            OperationScope::AllPlanes,
+        ]);
+        assert_eq!(
+            choose_operation_scope(&active_and_stack, false),
+            Some(OperationScope::ActivePlane)
+        );
+        assert_eq!(
+            choose_operation_scope(&active_and_stack, true),
+            Some(OperationScope::ZStack)
+        );
+
+        let stack_only = descriptor(vec![OperationScope::ZStack]);
+        assert_eq!(
+            choose_operation_scope(&stack_only, false),
+            Some(OperationScope::ZStack)
+        );
+        assert_eq!(
+            choose_operation_scope(&stack_only, true),
+            Some(OperationScope::ZStack)
+        );
+
+        let all_planes_only = descriptor(vec![OperationScope::AllPlanes]);
+        assert_eq!(
+            choose_operation_scope(&all_planes_only, false),
+            Some(OperationScope::AllPlanes)
+        );
+        assert_eq!(choose_operation_scope(&all_planes_only, true), None);
+    }
+
+    #[test]
+    fn recorded_macro_scope_replays_as_active_plane_or_z_stack() {
+        let catalog = command_registry::command_catalog();
+        let descriptor = OpsService::default().describe("gaussian.blur").unwrap();
+
+        let active = macros::parse_macro_source(r#"run("Smooth");"#, &catalog).unwrap();
+        let mut active_params = active[0].params.clone().unwrap_or_else(|| json!({}));
+        assert!(!take_process_stack_parameter(&mut active_params));
+        assert_eq!(
+            choose_operation_scope(&descriptor, false),
+            Some(OperationScope::ActivePlane)
+        );
+
+        let recorded = macros::macro_record_line_for_command(
+            "process.smooth",
+            Some(&json!({ "__image_rs_process_stack": true })),
+            &catalog,
+        )
+        .unwrap();
+        let stack = macros::parse_macro_source(&recorded, &catalog).unwrap();
+        let mut stack_params = stack[0].params.clone().unwrap();
+        assert!(take_process_stack_parameter(&mut stack_params));
+        assert_eq!(
+            choose_operation_scope(&descriptor, true),
+            Some(OperationScope::ZStack)
+        );
+    }
+
+    #[test]
+    fn operation_job_identity_rejects_aba_progress_updates() {
+        let input = measurement_test_tab(1, 1, vec![1.0]).dataset;
+        let operation = ActiveOperation {
+            job_id: 12,
+            revision: 4,
+            input: input.clone(),
+            cancellation: CancellationToken::default(),
+            progress: 0.5,
+            message: "running".into(),
+        };
+
+        assert!(active_operation_matches(&operation, 12, 4, &input));
+        assert!(!active_operation_matches(&operation, 13, 4, &input));
+        assert!(!active_operation_matches(&operation, 12, 5, &input));
+        let equal_but_distinct = Arc::new(input.as_ref().clone());
+        assert!(!active_operation_matches(
+            &operation,
+            12,
+            4,
+            &equal_but_distinct
+        ));
     }
 
     #[test]
